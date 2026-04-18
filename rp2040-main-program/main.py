@@ -15,7 +15,7 @@ from boot_post import SystemPOST
 Program_ver = 1.3
 is_es_ver = 1 
 Author_Name = "MisakaXing" 
-
+BAT_OFFSET = 0.174 #根据你用万用表测出来的值修改这个
 # ==========================================
 # 1. 硬件初始化
 # ==========================================
@@ -92,8 +92,20 @@ def get_max_days(y, m):
     return 30 if m in [4, 6, 9, 11] else 31
 
 def get_battery_info():
-    bat_en.value(0); time.sleep_ms(5); raw = bat_adc.read_u16(); bat_en.value(1)
-    volts = (raw / 65535) * 3.3 * 2
+    # 1. 瞬间拉低，接通分压电路
+    bat_en.value(0)
+    time.sleep_ms(5) # 等待电压稳定
+    
+    # 2. 读取安全的减半电压
+    raw = bat_adc.read_u16()
+    
+    # 3. 测完立刻拉高，切断电路，保护 ADC 引脚
+    bat_en.value(1)
+    
+    # 4. 计算真实电压并加上校准值
+    raw_volts = (raw / 65535) * 3.3 * 2
+    volts = raw_volts + BAT_OFFSET
+    
     percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
 
