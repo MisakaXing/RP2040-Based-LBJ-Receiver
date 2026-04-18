@@ -12,10 +12,10 @@ from boot_post import SystemPOST
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 1.2
+Program_ver = 1.3
 is_es_ver = 1 
 Author_Name = "MisakaXing" 
-CONFIG_FILE = "config.json"
+
 # ==========================================
 # 1. 硬件初始化
 # ==========================================
@@ -49,20 +49,20 @@ if boot_status == "HALT":
 MAX_HIST = 2000
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
+CONFIG_FILE = "config.json"
 
 system_state = "DASHBOARD" 
 has_received = False
 menu_index = 0
-menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "SAFE EJECT SD", "ABOUT DEV", "EXIT"]
+# ★ 菜单新增：FORMAT SD
+menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "SAFE EJECT SD", "ABOUT DEV", "EXIT"]
 cfg_buzzer = True
 
-# ★ 极速寻址记忆数组
 hist_ptr = -1
 total_count = 0
 history_offsets = [] 
 last_interaction = time.ticks_ms()
 
-# ★ UI 局部刷新记忆变量
 last_minute = -1 
 last_sd_status_drawn = ""
 last_hw_str_drawn = ""
@@ -82,29 +82,10 @@ last_is_full = True
 LBL_TRAIN, LBL_SPEED, LBL_ROUTE, LBL_KM, LBL_LOCO = b'\xb3\xb5:', b'\xcb\xd9:', b'\xcf\xdf:', b'\xb1\xea:', b'\xbb\xfa:'
 
 # ==========================================
-# 3. 核心工具与 SD/Flash 函数
+# 3. 核心工具与存储函数
 # ==========================================
 def beep(duration=0.02):
     if cfg_buzzer: buzzer.value(1); time.sleep(duration); buzzer.value(0)
-
-def load_config():
-    global cfg_buzzer, menu_items
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.loads(f.read())
-            # 如果文件里有 buzzer 这个键，就读取它，否则默认给 True
-            cfg_buzzer = config.get("buzzer", True) 
-            # 同步更新菜单上的文字
-            menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
-    except Exception:
-        pass # 如果第一次开机没有这个文件，就静默使用默认值
-    
-def save_config():
-    try:
-        with open(CONFIG_FILE, 'w') as f:
-            f.write(json.dumps({"buzzer": cfg_buzzer}))
-    except Exception:
-        pass
 
 def get_max_days(y, m):
     if m == 2: return 29 if y % 4 == 0 else 28
@@ -116,7 +97,21 @@ def get_battery_info():
     percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
 
-# ★ 极速寻址：开机初始化目录
+def load_config():
+    global cfg_buzzer, menu_items
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.loads(f.read())
+            cfg_buzzer = config.get("buzzer", True) 
+            menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
+    except: pass 
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(json.dumps({"buzzer": cfg_buzzer}))
+    except: pass
+
 def init_history():
     global total_count, history_offsets
     history_offsets = []
@@ -132,7 +127,6 @@ def init_history():
         total_count = 0
         history_offsets = []
 
-# ★ 极速寻址：追加并记录新目录
 def save_history(data):
     global total_count, history_offsets
     if total_count >= MAX_HIST: return 
@@ -146,7 +140,6 @@ def save_history(data):
         total_count += 1
     except: pass
 
-# ★ 极速寻址：瞬间读取
 def load_history_entry(idx):
     if idx < 0 or idx >= len(history_offsets): return None
     try:
@@ -156,12 +149,10 @@ def load_history_entry(idx):
             return json.loads(line)
     except: return None
 
-# 极速旁路 SD 检测
 def check_sd():
     global current_sd_status, sd_eject_mode, last_sd_status_drawn
     try:
         tft_cs.value(1) 
-        
         if sd_eject_mode:
             current_sd_status = "SAFE TO REMOVE"
         elif 'sd' in os.listdir('/'):
@@ -311,8 +302,8 @@ def draw_menu(full=True, old_idx=-1):
 def draw_menu_item(i, is_selected):
     color = YELLOW if is_selected else WHITE
     prefix = b'> ' if is_selected else b'  '
-    tft.fill_rect(40, 50 + i*20, 240, 16, 0x2104) 
-    tft.draw_gbk(prefix + menu_items[i].encode(), 40, 55 + i*20, color, 0x2104)
+    tft.fill_rect(40, 60 + i*16, 240, 16, 0x2104) # 把间距从20压缩到16，防止菜单项太多超出屏幕
+    tft.draw_gbk(prefix + menu_items[i].encode(), 40, 60 + i*16, color, 0x2104)
 
 def draw_set_date():
     tft.fill_rect(0, 26, 320, 164, 0x2104)
@@ -337,7 +328,14 @@ def draw_jump_id():
 def draw_confirm_format():
     tft.fill_rect(0, 26, 320, 164, 0x5000)
     tft.draw_gbk(b'!!! WARNING !!!', 85, 50, WHITE, 0x5000, scale=2)
-    tft.draw_gbk(b'DELETE ALL DATA?', 65, 90, YELLOW, 0x5000)
+    tft.draw_gbk(b'DELETE ALL FLASH DATA?', 40, 90, YELLOW, 0x5000)
+    tft.draw_gbk(b'[OK] TO CONFIRM  [MENU] TO CANCEL', 15, 140, WHITE, 0x5000)
+
+# ★ 新增：SD 卡格式化警告页面
+def draw_confirm_format_sd():
+    tft.fill_rect(0, 26, 320, 164, 0x5000)
+    tft.draw_gbk(b'!!! SD WARNING !!!', 65, 50, WHITE, 0x5000, scale=2)
+    tft.draw_gbk(b'ERASE ALL SD CARD DATA?', 35, 90, YELLOW, 0x5000)
     tft.draw_gbk(b'[OK] TO CONFIRM  [MENU] TO CANCEL', 15, 140, WHITE, 0x5000)
 
 def draw_about():
@@ -355,7 +353,7 @@ def draw_about():
     auth_str = "Author: " + Author_Name
     tft.draw_gbk(auth_str.encode(), 40, 120, YELLOW, 0x2104)
     
-    tft.draw_gbk(b'HW Rev: v1.1-ES', 40, 145, WHITE, 0x2104)
+    tft.draw_gbk(b'HW Rev: Pico-W-SPI-v1.1', 40, 145, WHITE, 0x2104)
     tft.draw_gbk(b'Press OK to Return', 40, 175, GRAY, 0x2104)
 
 def draw_popup(msg, color=RED):
@@ -390,7 +388,7 @@ def on_lbj_data_received(data):
 # ==========================================
 # 6. 主循环与界面分发
 # ==========================================
-load_config()
+load_config() 
 init_history()
 check_sd() 
 
@@ -443,7 +441,8 @@ while True:
 
     if not btn_menu.value():
         last_interaction = now; beep()
-        if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "SET_DATE", "JUMP_ID"]:
+        # ★ 记得要把 CONFIRM_FORMAT_SD 也加入按 MENU 可以取消的列表
+        if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID"]:
             system_state = "MENU"; draw_menu(full=True) 
         else: 
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
@@ -501,19 +500,33 @@ while True:
             else: draw_idle_screen()
             
         elif system_state == "MENU":
+            # 0. BUZZER
             if menu_index == 0: 
-                cfg_buzzer = not cfg_buzzer; menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"; save_config(); draw_menu(full=True)
+                cfg_buzzer = not cfg_buzzer; menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
+                save_config(); draw_menu(full=True)
+            # 1. SET DATE
             elif menu_index == 1: 
                 try:
                     raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
                     edit_d, edit_m, edit_y = [(r >> 4) * 10 + (r & 0x0F) for r in raw_d]
                 except: pass
                 edit_step = 0; system_state = "SET_DATE"; draw_set_date()
+            # 2. JUMP TO ID
             elif menu_index == 2: 
                 edit_step = 0; edit_id = [0,0,0,0]; system_state = "JUMP_ID"; draw_jump_id()
+            # 3. FORMAT FLASH
             elif menu_index == 3: 
                 system_state = "CONFIRM_FORMAT"; draw_confirm_format()
+            # 4. ★ 新增：FORMAT SD
             elif menu_index == 4: 
+                if current_sd_status == "SD NO INSERT":
+                    draw_popup(b'NO SD CARD!', color=RED)
+                    time.sleep(1)
+                    draw_menu(full=True)
+                else:
+                    system_state = "CONFIRM_FORMAT_SD"; draw_confirm_format_sd()
+            # 5. SAFE EJECT SD
+            elif menu_index == 5: 
                 draw_popup(b'UNMOUNTING...', color=YELLOW)
                 try: os.umount("/sd")
                 except: pass
@@ -523,9 +536,11 @@ while True:
                 system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
                 if has_received: display_train_data(last_basic, last_ext, last_is_full)
                 else: draw_idle_screen()
-            elif menu_index == 5: 
-                system_state = "ABOUT"; draw_about()
+            # 6. ABOUT
             elif menu_index == 6: 
+                system_state = "ABOUT"; draw_about()
+            # 7. EXIT
+            elif menu_index == 7: 
                 system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
                 if has_received: display_train_data(last_basic, last_ext, last_is_full)
                 else: draw_idle_screen()
@@ -551,6 +566,30 @@ while True:
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN); open(HIST_FILE, 'w').close()
             total_count = 0; hist_ptr = -1; history_offsets.clear(); time.sleep(1)
+            system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+
+        # ★ 新增：执行 SD 卡原生格式化
+        elif system_state == "CONFIRM_FORMAT_SD":
+            draw_popup(b'FORMATTING SD...', color=YELLOW)
+            try:
+                # 1. 强行卸载
+                if 'sd' in os.listdir('/'): 
+                    try: os.umount("/sd")
+                    except: pass
+                # 2. 挂载物理层，使用 400kHz 极限低速照顾古董卡
+                tft_cs.value(1)
+                spi1.init(baudrate=400000) 
+                sd = sdcard.SDCard(spi1, sd_cs)
+                # 3. 强行原生格式化
+                os.VfsFat.mkfs(sd) 
+                # 4. 重新挂载
+                os.mount(os.VfsFat(sd), "/sd")
+                draw_popup(b'SD FORMAT OK!', color=GREEN)
+            except Exception as e:
+                draw_popup(b'FORMAT FAIL!', color=RED)
+            
+            spi1.init(baudrate=40000000) 
+            time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
             
         time.sleep_ms(60)
