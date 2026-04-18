@@ -1,8 +1,6 @@
-import os
 import sys
+import os
 import re
-import time
-import json
 import threading
 import tempfile
 import subprocess
@@ -35,7 +33,7 @@ class PicoUpdaterApp(ctk.CTk):
         self.is_working = False
 
         self.setup_ui()
-        self.refresh_ports()
+        self.refresh_ports() # 启动时自动扫描并识别
 
     def setup_ui(self):
         # 顶部标题
@@ -94,21 +92,38 @@ class PicoUpdaterApp(ctk.CTk):
         self.port_menu.configure(state=state)
 
     def refresh_ports(self):
+        """自动刷新并精准识别树莓派 Pico"""
+        # 树莓派 Pico (MicroPython) 的标准 VID
+        PICO_VID = 0x2E8A
+        
         ports = serial.tools.list_ports.comports()
         port_list = [port.device for port in ports]
+        
+        auto_detected_port = None
+
+        # 遍历寻找 Pico
+        for port in ports:
+            if port.vid == PICO_VID:
+                auto_detected_port = port.device
+                break 
+
         if not port_list:
             port_list = ["未检测到设备"]
             self.port_var.set(port_list[0])
+            self.log("刷新完成：当前未连接任何串口设备。")
         else:
-            # 尝试智能选择最后一个或包含 USB 的端口
-            self.port_var.set(port_list[-1])
+            self.port_menu.configure(values=port_list)
             
-        self.port_menu.configure(values=port_list)
-        self.log("已刷新串口列表。")
+            if auto_detected_port:
+                self.port_var.set(auto_detected_port)
+                self.log(f"✅ 已自动识别并选中 Pico 设备: {auto_detected_port}")
+            else:
+                self.port_var.set(port_list[0])
+                self.log("已刷新串口列表，但未发现标准 Pico 设备，请手动确认。")
 
-    def run_mpremote(self, port, args_list):
-        """调用 mpremote 执行硬件操作"""
-        # 核心修复：使用 sys.executable 替代硬编码的 "python"，确保跨平台兼容且环境一致
+    def run_mpremote(self, port, args_list, timeout_sec=60):
+        """调用 mpremote 执行硬件操作 (支持大文件长超时)"""
+        # 使用 sys.executable 确保跨平台环境兼容 (解决 macOS 下的 python 命令找不到问题)
         cmd = [sys.executable, "-m", "mpremote", "connect", port] + args_list
         try:
             # 隐藏命令行窗口 (Windows 特有属性，Mac/Linux忽略)
@@ -117,10 +132,10 @@ class PicoUpdaterApp(ctk.CTk):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, startupinfo=startupinfo)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, startupinfo=startupinfo)
             return True, result.stdout
         except subprocess.TimeoutExpired:
-            return False, "命令执行超时 (可能 Pico 处于死循环中，请尝试重新插拔)"
+            return False, "命令执行超时 (可能 Pico 处于死循环，或文件传输时间过长)"
         except Exception as e:
             return False, str(e)
 
@@ -154,7 +169,21 @@ class PicoUpdaterApp(ctk.CTk):
 
     def _update_worker(self, port):
         try:
-            # 1. 获取远程版本
+            # ================= 0. 连通性预检 =================
+            self.log(f"正在测试 Pico ({port}) 连接状态...")
+            # 发送极其简单的命令，10秒没回应说明串口被占用或死机
+            success, output = self.run_mpremote(port, ["exec", "print('PICO_OK')"], timeout_sec=10)
+            if not success or "PICO_OK" not in output:
+                self.log("\n❌ 严重错误: 无法与 Pico 建立通信！")
+                self.log("可能的原因：")
+                self.log("1. 串口正被其他软件 (如 Thonny/串口助手) 占用。")
+                self.log("2. Pico 当前程序陷入了无法被打断的死循环。")
+                self.log(">> 请关闭占用软件，或尝试重新拔插 Pico 后再重试。")
+                self.after(0, lambda: messagebox.showerror("连接失败", "无法与 Pico 通信，请确保串口未被占用！"))
+                return
+            self.log("✅ Pico 串口通信正常！")
+
+            # ================= 1. 获取远程版本 =================
             self.log("正在连接 GitHub 获取远程版本...")
             self.after(0, self.progress_bar.set, 0.1)
             resp = requests.get(self.main_py_url, timeout=10)
@@ -166,10 +195,10 @@ class PicoUpdaterApp(ctk.CTk):
                 self.log("获取远程文件失败，请检查网络！")
                 return
 
-            # 2. 获取本地版本
-            self.log(f"正在连接 Pico ({port}) 读取本地版本...")
+            # ================= 2. 获取本地版本 =================
+            self.log("正在读取本地版本...")
             self.after(0, self.progress_bar.set, 0.2)
-            success, output = self.run_mpremote(port, ["cat", "main.py"])
+            success, output = self.run_mpremote(port, ["cat", "main.py"], timeout_sec=15)
             
             if success and "Program_ver" in output:
                 self.local_version = self.extract_version(output)
@@ -177,11 +206,9 @@ class PicoUpdaterApp(ctk.CTk):
                 self.local_version = 0.0 # 本地没文件或解析失败
                 
             self.after(0, lambda: self.local_ver_label.configure(text=f"本地版本: {self.local_version}"))
-            self.log(f"成功获取本地版本: {self.local_version}")
-
             self.after(0, self.progress_bar.set, 0.3)
 
-            # 3. 比较版本
+            # ================= 3. 比较版本 =================
             if self.local_version >= self.remote_version and self.local_version != 0.0:
                 self.log("\n✅ 当前已是最新版本，无需更新！")
                 self.after(0, self.progress_bar.set, 1.0)
@@ -189,7 +216,7 @@ class PicoUpdaterApp(ctk.CTk):
 
             self.log("\n⚠️ 检测到新版本或本地程序缺失，开始执行更新操作...")
 
-            # 4. 获取 GitHub 目录中的所有文件
+            # ================= 4. 获取文件列表 =================
             self.log("正在解析远程仓库文件列表...")
             api_resp = requests.get(self.api_url, timeout=10)
             if api_resp.status_code != 200:
@@ -199,9 +226,8 @@ class PicoUpdaterApp(ctk.CTk):
             files_data = api_resp.json()
             downloadable_files = [f for f in files_data if f.get('type') == 'file']
             
-            # 创建临时文件夹来存储下载的代码
             with tempfile.TemporaryDirectory() as temp_dir:
-                # 5. 下载文件到临时目录
+                # ================= 5. 下载文件到临时目录 =================
                 total_files = len(downloadable_files)
                 for i, file_info in enumerate(downloadable_files):
                     file_name = file_info['name']
@@ -212,35 +238,35 @@ class PicoUpdaterApp(ctk.CTk):
                     with open(os.path.join(temp_dir, file_name), 'wb') as f:
                         f.write(file_resp.content)
                         
-                    # 更新进度条 (0.3 到 0.6之间)
                     self.after(0, self.progress_bar.set, 0.3 + 0.3 * ((i+1)/total_files))
 
-                # 6. 删除 Pico 中现有的所有内容 (使用 python -c 通过 mpremote 在板子上执行删除脚本)
+                # ================= 6. 清空 Pico =================
                 self.log("正在清空 Pico 中的旧文件...")
                 wipe_script = "import os; [os.remove(f) for f in os.listdir() if not (os.stat(f)[0] & 0x4000)]"
-                success, output = self.run_mpremote(port, ["exec", wipe_script])
+                success, output = self.run_mpremote(port, ["exec", wipe_script], timeout_sec=20)
                 if not success:
                     self.log(f"清空旧文件时出现警告 (可能原本就是空的): {output}")
                 
                 self.after(0, self.progress_bar.set, 0.7)
 
-                # 7. 将新文件写入 Pico
+                # ================= 7. 写入新文件 =================
                 for i, file_info in enumerate(downloadable_files):
                     file_name = file_info['name']
                     local_path = os.path.join(temp_dir, file_name)
                     self.log(f"正在写入到 Pico: {file_name} ...")
                     
+                    # 写入操作使用默认的 60 秒超时，防止字库等大文件中断
                     success, output = self.run_mpremote(port, ["fs", "cp", local_path, f":{file_name}"])
                     if not success:
-                        self.log(f"❌ 写入 {file_name} 失败: {output}")
+                        self.log(f"\n❌ 写入 {file_name} 失败: {output}")
+                        self.after(0, lambda: messagebox.showerror("写入失败", f"写入文件 {file_name} 时发生错误！"))
                         return
                     
-                    # 更新进度条 (0.7 到 0.95之间)
                     self.after(0, self.progress_bar.set, 0.7 + 0.25 * ((i+1)/total_files))
 
-            # 8. 软重启 Pico
+            # ================= 8. 软重启 Pico =================
             self.log("正在重启 Pico 生效固件...")
-            self.run_mpremote(port, ["exec", "import machine; machine.reset()"])
+            self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
             
             self.after(0, self.progress_bar.set, 1.0)
             self.log("\n🎉 更新完成！Pico 已加载最新程序。")
