@@ -67,6 +67,7 @@ last_minute = -1
 last_sd_status_drawn = ""
 last_hw_str_drawn = ""
 sd_eject_mode = False
+sd_obj = None
 
 edit_y, edit_m, edit_d = 24, 1, 1
 edit_id = [0, 0, 0, 0] 
@@ -161,15 +162,20 @@ def load_history_entry(idx):
             return json.loads(line)
     except: return None
 
+
 def check_sd():
-    global current_sd_status, sd_eject_mode, last_sd_status_drawn
+    global current_sd_status, sd_eject_mode, last_sd_status_drawn, sd_obj
     try:
         tft_cs.value(1) 
         if sd_eject_mode:
             current_sd_status = "SAFE TO REMOVE"
         elif 'sd' in os.listdir('/'):
             try:
-                os.listdir('/sd') 
+                # ★ 极速物理探测：直接向底层发送读取第0扇区指令（仅耗时1~2毫秒）
+                if sd_obj:
+                    spi1.init(baudrate=5000000)
+                    sd_obj.readblocks(0, bytearray(512))
+                
                 s = os.statvfs("/sd")
                 total_kb = (s[0] * s[2]) / 1024
                 free_kb = (s[0] * s[3]) / 1024
@@ -178,24 +184,26 @@ def check_sd():
                 elif total_kb > 1048576: current_sd_status = f"SD:{used_kb/1048576:.1f}/{total_kb/1048576:.1f}G"
                 else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
             except:
+                # 只要底层报错，说明卡被物理拔出，立刻清理残余挂载
                 try: os.umount("/sd")
                 except: pass
+                sd_obj = None # 清空对象
                 current_sd_status = "SD NO INSERT"
         else:
             spi1.init(baudrate=1000000) 
             try:
-                sd = sdcard.SDCard(spi1, sd_cs)
-                os.mount(os.VfsFat(sd), "/sd")
+                sd_obj = sdcard.SDCard(spi1, sd_cs)
+                os.mount(os.VfsFat(sd_obj), "/sd")
                 current_sd_status = "SD INIT..." 
             except Exception as e:
+                sd_obj = None
                 err = str(e).lower()
                 if '19' in err: current_sd_status = "SD NEED FORMAT"
                 else: current_sd_status = "SD NO INSERT"
-            spi1.init(baudrate=40000000) 
-
     except Exception:
         current_sd_status = "SD NO INSERT"
     finally:
+        spi1.init(baudrate=40000000) 
         if system_state == "DASHBOARD" and current_sd_status != last_sd_status_drawn:
             tft.fill_rect(0, 0, 130, 24, 0x01CF) 
             tft.draw_gbk(current_sd_status.encode(), 5, 4, WHITE, 0x01CF)
@@ -346,8 +354,8 @@ def draw_confirm_format():
 # ★ 新增：SD 卡格式化警告页面
 def draw_confirm_format_sd():
     tft.fill_rect(0, 26, 320, 164, 0x5000)
-    tft.draw_gbk(b'!!! SD WARNING !!!', 65, 50, WHITE, 0x5000, scale=2)
-    tft.draw_gbk(b'ERASE ALL SD CARD DATA?', 35, 90, YELLOW, 0x5000)
+    tft.draw_gbk(b'!!! SD WARNING !!!', 15, 50, WHITE, 0x5000, scale=2)
+    tft.draw_gbk(b'ERASE ALL SD CARD DATA?', 65, 90, YELLOW, 0x5000)
     tft.draw_gbk(b'[OK] TO CONFIRM  [MENU] TO CANCEL', 15, 140, WHITE, 0x5000)
 
 def draw_about():
@@ -542,6 +550,7 @@ while True:
                 draw_popup(b'UNMOUNTING...', color=YELLOW)
                 try: os.umount("/sd")
                 except: pass
+                sd_obj = None
                 sd_eject_mode = True
                 current_sd_status = "SAFE TO REMOVE"
                 time.sleep(1)
@@ -580,7 +589,7 @@ while True:
             total_count = 0; hist_ptr = -1; history_offsets.clear(); time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
-        # ★ 新增：执行 SD 卡原生格式化
+       # ★ 新增：执行 SD 卡原生极速格式化
         elif system_state == "CONFIRM_FORMAT_SD":
             draw_popup(b'FORMATTING SD...', color=YELLOW)
             try:
@@ -588,20 +597,24 @@ while True:
                 if 'sd' in os.listdir('/'): 
                     try: os.umount("/sd")
                     except: pass
-                # 2. 挂载物理层，使用 400kHz 极限低速照顾古董卡
                 tft_cs.value(1)
-                spi1.init(baudrate=400000) 
-                sd = sdcard.SDCard(spi1, sd_cs)
-                # 3. 强行原生格式化
-                os.VfsFat.mkfs(sd) 
+                
+                # 2. 用 1MHz 的标准速度进行初始安全握手
+                spi1.init(baudrate=1000000) 
+                sd_obj = sdcard.SDCard(spi1, sd_cs)
+                
+                # 3. ★ 握手成功后，狂飙到 10MHz 进行极速擦写！
+                spi1.init(baudrate=10000000) 
+                os.VfsFat.mkfs(sd_obj) 
+                
                 # 4. 重新挂载
-                os.mount(os.VfsFat(sd), "/sd")
+                os.mount(os.VfsFat(sd_obj), "/sd")
                 draw_popup(b'SD FORMAT OK!', color=GREEN)
             except Exception as e:
+                sd_obj = None # 如果格式化失败，销毁对象
                 draw_popup(b'FORMAT FAIL!', color=RED)
             
+            # 切回屏幕专属的 40MHz 极限速度
             spi1.init(baudrate=40000000) 
             time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
-            
-        time.sleep_ms(60)
