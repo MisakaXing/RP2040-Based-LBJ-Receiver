@@ -12,7 +12,7 @@ from boot_post import SystemPOST
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 1.3
+Program_ver = 1.4
 is_es_ver = 1 
 Author_Name = "MisakaXing" 
 BAT_OFFSET = 0.174 #根据你用万用表测出来的值修改这个
