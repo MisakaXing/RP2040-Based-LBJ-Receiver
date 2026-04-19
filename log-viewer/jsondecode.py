@@ -198,7 +198,7 @@ class TrainLogApp(ctk.CTk):
         self.export_pico_btn.configure(state="disabled", text="导出中，请稍候...")
         self.read_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
-        
+            
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
@@ -209,12 +209,14 @@ class TrainLogApp(ctk.CTk):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
+            # ★ 修复1：将 text=True 改为 explicitly 指定 encoding='utf-8'，解决 Windows GBK 报错
+            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=30, startupinfo=startupinfo)
             output = result.stdout
             
             if result.returncode != 0:
                  err_msg = result.stderr if result.stderr else output
-                 self.after(0, lambda: messagebox.showerror("读取失败", f"无法读取文件，可能 Pico 被其他软件占用或文件为空。\n\n{err_msg}"))
+                 # ★ 修复2：绑定局部变量，防止 lambda 延迟执行时找不到变量
+                 self.after(0, lambda err=err_msg: messagebox.showerror("读取失败", f"无法读取文件，可能 Pico 被占用或文件为空。\n\n{err}"))
                  return
 
             lines = output.split('\n')
@@ -223,7 +225,9 @@ class TrainLogApp(ctk.CTk):
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被 Thonny 等软件占用！"))
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("错误", f"发生意外错误: {e}"))
+            # ★ 修复2：提前将异常转化为字符串并绑定
+            error_text = str(e)
+            self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
             self.after(0, lambda: self.read_pico_btn.configure(state="normal", text="📥 从 Pico 提取历史数据"))
             self.after(0, lambda: self.export_pico_btn.configure(state="normal"))
@@ -237,22 +241,27 @@ class TrainLogApp(ctk.CTk):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45, startupinfo=startupinfo)
+            # ★ 修复1：同样加上 encoding='utf-8'
+            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=45, startupinfo=startupinfo)
             
             if result.returncode == 0:
-                 self.after(0, lambda: messagebox.showinfo("成功", f"日志文件已成功导出至：\n{save_path}"))
+                 self.after(0, lambda path=save_path: messagebox.showinfo("成功", f"日志文件已成功导出至：\n{path}"))
             else:
                  err_msg = result.stderr if result.stderr else result.stdout
-                 self.after(0, lambda: messagebox.showerror("导出失败", f"无法导出文件，请确保串口未被占用。\n\n{err_msg}"))
+                 self.after(0, lambda err=err_msg: messagebox.showerror("导出失败", f"无法导出文件，请确保串口未被占用。\n\n{err}"))
                  
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能太大或设备已断开连接。"))
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("错误", f"发生意外错误: {e}"))
+            # ★ 修复2：提前转化字符串
+            error_text = str(e)
+            self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
             self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="💾 导出日志到电脑"))
             self.after(0, lambda: self.read_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
+
+    
 
     def _process_memory_lines(self, lines):
         self.log_data.clear()
