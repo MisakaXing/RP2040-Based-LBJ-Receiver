@@ -12,7 +12,7 @@ from boot_post import SystemPOST
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 1.5
+Program_ver = 1.6
 is_es_ver = 1 
 Author_Name = "MisakaXing" 
 BAT_OFFSET = 0.174 #根据你用万用表测出来的值修改这个
@@ -382,7 +382,7 @@ def draw_about():
     auth_str = "Author: " + Author_Name
     tft.draw_gbk(auth_str.encode(), 40, 120, YELLOW, 0x2104)
     
-    tft.draw_gbk(b'HW Rev: Pico-W-SPI-v1.1', 40, 145, WHITE, 0x2104)
+    tft.draw_gbk(b'HW Rev: RP2040-Receiver-PCB-v1.1', 40, 145, WHITE, 0x2104)
     tft.draw_gbk(b'Press OK to Return', 40, 175, GRAY, 0x2104)
 
 def draw_popup(msg, color=RED):
@@ -546,26 +546,42 @@ while True:
             # 3. FORMAT FLASH
             elif menu_index == 3: 
                 system_state = "CONFIRM_FORMAT"; draw_confirm_format()
-            # 4. ★ 新增：FORMAT SD
+            # 4. FORMAT SD 格式化菜单
             elif menu_index == 4: 
-                if current_sd_status == "SD NO INSERT":
+                # ★ 强效拦截：检查状态是否包含 NO INSERT，或者底层物理对象是否为空
+                if "NO INSERT" in current_sd_status or sd_obj is None:
                     draw_popup(b'NO SD CARD!', color=RED)
                     time.sleep(1)
                     draw_menu(full=True)
                 else:
-                    system_state = "CONFIRM_FORMAT_SD"; draw_confirm_format_sd()
-            # 5. SAFE EJECT SD
+                    system_state = "CONFIRM_FORMAT_SD"
+                    draw_confirm_format_sd()
+                    
+            # 5. SAFE EJECT SD 安全弹出菜单
             elif menu_index == 5: 
-                draw_popup(b'UNMOUNTING...', color=YELLOW)
-                try: os.umount("/sd")
-                except: pass
-                sd_obj = None
-                sd_eject_mode = True
-                current_sd_status = "SAFE TO REMOVE"
-                time.sleep(1)
-                system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
-                if has_received: display_train_data(last_basic, last_ext, last_is_full)
-                else: draw_idle_screen()
+                # ★ 强效拦截：没插卡就直接报错并留在菜单，别瞎弹出了
+                if "NO INSERT" in current_sd_status or sd_obj is None:
+                    draw_popup(b'NO SD CARD!', color=RED)
+                    time.sleep(1)
+                    draw_menu(full=True)
+                else:
+                    draw_popup(b'UNMOUNTING...', color=YELLOW)
+                    try: 
+                        os.umount("/sd")
+                    except: pass
+                    sd_obj = None # 销毁底层对象
+                    sd_eject_mode = True
+                    current_sd_status = "SAFE TO REMOVE"
+                    time.sleep(1)
+                    
+                    # 退回主界面
+                    system_state = "DASHBOARD"
+                    draw_ui_skeleton()
+                    draw_hardware_bar(force=True)
+                    if has_received: 
+                        display_train_data(last_basic, last_ext, last_is_full)
+                    else: 
+                        draw_idle_screen()
             # 6. ABOUT
             elif menu_index == 6: 
                 system_state = "ABOUT"; draw_about()
