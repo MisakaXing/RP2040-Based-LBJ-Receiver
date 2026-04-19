@@ -1,7 +1,22 @@
+import sys
+import os
+
+# ================= ★ PyInstaller 幽灵窗口终极修复 ★ =================
+# 必须放在所有图形化库导入的最前面！
+# 拦截我们自定义的内部暗号 "mpremote_internal"
+if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
+    # 剥离暗号，伪造标准的 mpremote 命令行参数
+    sys.argv = [sys.argv[0]] + sys.argv[2:]
+    from mpremote.main import main
+    try:
+        main() # 直接调用 mpremote 的核心引擎
+    except SystemExit as e:
+        sys.exit(e.code)
+    sys.exit(0) # 拿完数据立刻退出，绝对不加载图形界面
+# =================================================================
+
 import json
 import re
-import os
-import sys
 import threading
 import subprocess
 import tkinter as tk
@@ -18,7 +33,7 @@ class TrainLogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("列车运行日志解析系统")
+        self.title("列车运行日志解析系统 (最终完美版)")
         self.geometry("1100x750")
         self.minsize(900, 650)
         
@@ -31,7 +46,7 @@ class TrainLogApp(ctk.CTk):
         # 1. 左侧侧边栏 (控制台与过滤器)
         self.sidebar_frame = ctk.CTkFrame(self, width=260, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(8, weight=1) # 把弹簧撑开的空间移到第8行
+        self.sidebar_frame.grid_rowconfigure(8, weight=1)
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="列车数据过滤器", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
@@ -52,7 +67,7 @@ class TrainLogApp(ctk.CTk):
         self.reset_btn = ctk.CTkButton(self.sidebar_frame, text="重置", fg_color="gray", command=self.reset_filter)
         self.reset_btn.grid(row=5, column=0, padx=20, pady=0, sticky="ew")
 
-        # ================= ★ 新增：地图源自由切换 =================
+        # 地图源自由切换
         self.map_source_label = ctk.CTkLabel(self.sidebar_frame, text="--- 地图源设置 ---", text_color="gray")
         self.map_source_label.grid(row=6, column=0, padx=20, pady=(15, 5))
 
@@ -61,12 +76,11 @@ class TrainLogApp(ctk.CTk):
             self.sidebar_frame, 
             variable=self.map_source_var, 
             values=["高德地图 (极速)", "OpenStreetMap (默认)", "CartoDB (海外极速)"],
-            command=self.change_map_source # 绑定切换事件
+            command=self.change_map_source 
         )
         self.map_source_menu.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="ew")
-        # ==========================================================
 
-        # ================= Pico 串口直连区域 =================
+        # Pico 串口直连区域
         self.pico_label = ctk.CTkLabel(self.sidebar_frame, text="--- Pico 串口直连 ---", text_color="gray")
         self.pico_label.grid(row=9, column=0, padx=20, pady=(10, 5))
 
@@ -88,8 +102,8 @@ class TrainLogApp(ctk.CTk):
 
         self.export_pico_btn = ctk.CTkButton(self.sidebar_frame, text="💾 导出日志到电脑", fg_color="#d97706", hover_color="#b45309", command=self.start_pico_export)
         self.export_pico_btn.grid(row=12, column=0, padx=20, pady=(0, 15), sticky="ew")
-        # ==========================================================
 
+        # 本地文件读取
         self.local_label = ctk.CTkLabel(self.sidebar_frame, text="--- 本地文件读取 ---", text_color="gray")
         self.local_label.grid(row=13, column=0, padx=20, pady=(0, 5))
 
@@ -114,7 +128,6 @@ class TrainLogApp(ctk.CTk):
         self.map_frame.grid_columnconfigure(0, weight=1)
         self.map_frame.grid_rowconfigure(0, weight=1)
 
-        # ★ 初始化地图控件并设置默认的高德源
         self.map_widget = tkintermapview.TkinterMapView(self.map_frame, corner_radius=10)
         self.map_widget.set_tile_server("https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7", max_zoom=19)
         self.map_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
@@ -129,18 +142,14 @@ class TrainLogApp(ctk.CTk):
 
         self.refresh_ports(show_prompt=False)
 
-    # ================= 新增：地图源切换逻辑 =================
     def change_map_source(self, choice):
-        """用户在下拉菜单选择不同地图源时触发"""
         if "高德" in choice:
             self.map_widget.set_tile_server("https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7", max_zoom=19)
         elif "OpenStreetMap" in choice:
             self.map_widget.set_tile_server("https://a.tile.openstreetmap.org/{z}/{x}/{y}.png", max_zoom=19)
         elif "CartoDB" in choice:
             self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png", max_zoom=19)
-    # =======================================================
 
-    # ================= Pico 串口读取相关逻辑 =================
     def refresh_ports(self, show_prompt=False):
         PICO_VID = 0x2E8A
         ports = serial.tools.list_ports.comports()
@@ -198,24 +207,28 @@ class TrainLogApp(ctk.CTk):
         self.export_pico_btn.configure(state="disabled", text="导出中，请稍候...")
         self.read_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
-            
+        
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
-        cmd = [sys.executable, "-m", "mpremote", "connect", port, "cat", "history.jsonl"]
+        # 动态判断运行环境
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, "mpremote_internal", "connect", port, "cat", "history.jsonl"]
+        else:
+            cmd = [sys.executable, "-m", "mpremote", "connect", port, "cat", "history.jsonl"]
+            
         try:
             startupinfo = None
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # ★ 修复1：将 text=True 改为 explicitly 指定 encoding='utf-8'，解决 Windows GBK 报错
+            # 使用 utf-8 强制编码
             result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=30, startupinfo=startupinfo)
             output = result.stdout
             
             if result.returncode != 0:
                  err_msg = result.stderr if result.stderr else output
-                 # ★ 修复2：绑定局部变量，防止 lambda 延迟执行时找不到变量
                  self.after(0, lambda err=err_msg: messagebox.showerror("读取失败", f"无法读取文件，可能 Pico 被占用或文件为空。\n\n{err}"))
                  return
 
@@ -225,7 +238,6 @@ class TrainLogApp(ctk.CTk):
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被 Thonny 等软件占用！"))
         except Exception as e:
-            # ★ 修复2：提前将异常转化为字符串并绑定
             error_text = str(e)
             self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
@@ -234,14 +246,17 @@ class TrainLogApp(ctk.CTk):
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
     def _export_worker(self, port, save_path):
-        cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, "mpremote_internal", "connect", port, "cp", ":history.jsonl", save_path]
+        else:
+            cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
+            
         try:
             startupinfo = None
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # ★ 修复1：同样加上 encoding='utf-8'
             result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=45, startupinfo=startupinfo)
             
             if result.returncode == 0:
@@ -253,15 +268,12 @@ class TrainLogApp(ctk.CTk):
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能太大或设备已断开连接。"))
         except Exception as e:
-            # ★ 修复2：提前转化字符串
             error_text = str(e)
             self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
             self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="💾 导出日志到电脑"))
             self.after(0, lambda: self.read_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
-
-    
 
     def _process_memory_lines(self, lines):
         self.log_data.clear()
@@ -284,8 +296,6 @@ class TrainLogApp(ctk.CTk):
         else:
             messagebox.showwarning("提示", "Pico 连接成功，但未在 history.jsonl 中找到有效的历史数据。")
 
-    # ================= 数据表格及解析逻辑 =================
-    
     def setup_treeview(self):
         style = ttk.Style()
         style.theme_use("default")
