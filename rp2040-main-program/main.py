@@ -12,7 +12,7 @@ from boot_post import SystemPOST
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 1.4
+Program_ver = 1.5
 is_es_ver = 1 
 Author_Name = "MisakaXing" 
 BAT_OFFSET = 0.174 #根据你用万用表测出来的值修改这个
@@ -146,12 +146,21 @@ def save_history(data):
     try:
         t_str = rtc.get_time_str(True)
         record = {"t": t_str, "d": data}
+        json_str = json.dumps(record) 
+        
         with open(HIST_FILE, 'a') as f:
-            offset = f.tell() 
-            f.write(json.dumps(record) + '\n')
+            # ★ 核心魔法修复：强行把文件指针移到最末尾 (0表示偏移量, 2表示从文件尾部算起)
+            f.seek(0, 2) 
+            offset = f.tell() # 这次它绝对不敢说谎了，必须返回真实的末尾字节数！
+            
+            f.write(json_str + '\n')
             history_offsets.append(offset) 
+            
         total_count += 1
-    except: pass
+    except Exception as e:
+        err_msg = str(e).replace(' ', '') 
+        if len(err_msg) > 16: err_msg = err_msg[:16] 
+        draw_popup(b'LOG ERR: ' + err_msg.encode(), color=RED)
 
 def load_history_entry(idx):
     if idx < 0 or idx >= len(history_offsets): return None
@@ -347,9 +356,9 @@ def draw_jump_id():
 
 def draw_confirm_format():
     tft.fill_rect(0, 26, 320, 164, 0x5000)
-    tft.draw_gbk(b'!!! WARNING !!!', 85, 50, WHITE, 0x5000, scale=2)
-    tft.draw_gbk(b'DELETE ALL FLASH DATA?', 40, 90, YELLOW, 0x5000)
-    tft.draw_gbk(b'[OK] TO CONFIRM  [MENU] TO CANCEL', 15, 140, WHITE, 0x5000)
+    tft.draw_gbk(b'!!! WARNING !!!', 35, 50, WHITE, 0x5000, scale=2)
+    tft.draw_gbk(b'DELETE ALL FLASH DATA?', 60, 90, YELLOW, 0x5000)
+    tft.draw_gbk(b'[OK] TO CONFIRM  [MENU] TO CANCEL', 30, 140, WHITE, 0x5000)
 
 # ★ 新增：SD 卡格式化警告页面
 def draw_confirm_format_sd():
