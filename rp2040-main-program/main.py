@@ -12,9 +12,10 @@ from boot_post import SystemPOST
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 1.6
+Program_ver = 1.7
 is_es_ver = 1 
-Author_Name = "MisakaXing" 
+Author_Name = "MisakaXing"
+Serial_Number = "N/A"
 BAT_OFFSET = 0.174 #根据你用万用表测出来的值修改这个
 # ==========================================
 # 1. 硬件初始化
@@ -381,8 +382,8 @@ def draw_about():
     
     auth_str = "Author: " + Author_Name
     tft.draw_gbk(auth_str.encode(), 40, 120, YELLOW, 0x2104)
-    
-    tft.draw_gbk(b'HW Rev: RP2040-Receiver-PCB-v1.1', 40, 145, WHITE, 0x2104)
+    sn_str = "Serial Number: " + Serial_Number
+    tft.draw_gbk(sn_str.encode(), 40, 145, WHITE, 0x2104)
     tft.draw_gbk(b'Press OK to Return', 40, 175, GRAY, 0x2104)
 
 def draw_popup(msg, color=RED):
