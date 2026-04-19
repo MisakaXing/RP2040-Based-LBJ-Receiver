@@ -18,7 +18,7 @@ class TrainLogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("列车运行日志解析系统 (Pico 串口增强版)")
+        self.title("列车运行日志解析系统")
         self.geometry("1100x750")
         self.minsize(900, 650)
         
@@ -31,7 +31,7 @@ class TrainLogApp(ctk.CTk):
         # 1. 左侧侧边栏 (控制台与过滤器)
         self.sidebar_frame = ctk.CTkFrame(self, width=260, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(6, weight=1) # 中间留空撑开
+        self.sidebar_frame.grid_rowconfigure(8, weight=1) # 把弹簧撑开的空间移到第8行
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="列车数据过滤器", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
@@ -52,18 +52,31 @@ class TrainLogApp(ctk.CTk):
         self.reset_btn = ctk.CTkButton(self.sidebar_frame, text="重置", fg_color="gray", command=self.reset_filter)
         self.reset_btn.grid(row=5, column=0, padx=20, pady=0, sticky="ew")
 
+        # ================= ★ 新增：地图源自由切换 =================
+        self.map_source_label = ctk.CTkLabel(self.sidebar_frame, text="--- 地图源设置 ---", text_color="gray")
+        self.map_source_label.grid(row=6, column=0, padx=20, pady=(15, 5))
+
+        self.map_source_var = ctk.StringVar(value="高德地图 (极速)")
+        self.map_source_menu = ctk.CTkOptionMenu(
+            self.sidebar_frame, 
+            variable=self.map_source_var, 
+            values=["高德地图 (极速)", "OpenStreetMap (默认)", "CartoDB (海外极速)"],
+            command=self.change_map_source # 绑定切换事件
+        )
+        self.map_source_menu.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="ew")
+        # ==========================================================
+
         # ================= Pico 串口直连区域 =================
         self.pico_label = ctk.CTkLabel(self.sidebar_frame, text="--- Pico 串口直连 ---", text_color="gray")
-        self.pico_label.grid(row=7, column=0, padx=20, pady=(10, 5))
+        self.pico_label.grid(row=9, column=0, padx=20, pady=(10, 5))
 
         self.port_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        self.port_frame.grid(row=8, column=0, padx=20, pady=5, sticky="ew")
+        self.port_frame.grid(row=10, column=0, padx=20, pady=5, sticky="ew")
 
         self.port_var = ctk.StringVar(value="请选择端口...")
         self.port_menu = ctk.CTkOptionMenu(self.port_frame, variable=self.port_var, values=["请选择端口..."], width=130)
         self.port_menu.pack(side="left", fill="x", expand=True)
 
-        # 稍微放大刷新按钮的面积，减少误触拖拽导致的点击失效
         self.refresh_port_btn = ctk.CTkButton(
             self.port_frame, text="🔄", width=45, height=30, 
             command=lambda: self.refresh_ports(show_prompt=True)
@@ -71,18 +84,17 @@ class TrainLogApp(ctk.CTk):
         self.refresh_port_btn.pack(side="right", padx=(5, 0))
 
         self.read_pico_btn = ctk.CTkButton(self.sidebar_frame, text="📥 从 Pico 提取历史数据", fg_color="#2b8a3e", hover_color="#237032", command=self.start_pico_read)
-        self.read_pico_btn.grid(row=9, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.read_pico_btn.grid(row=11, column=0, padx=20, pady=(5, 10), sticky="ew")
 
-        # ★ 新增：导出日志按钮
         self.export_pico_btn = ctk.CTkButton(self.sidebar_frame, text="💾 导出日志到电脑", fg_color="#d97706", hover_color="#b45309", command=self.start_pico_export)
-        self.export_pico_btn.grid(row=10, column=0, padx=20, pady=(0, 15), sticky="ew")
+        self.export_pico_btn.grid(row=12, column=0, padx=20, pady=(0, 15), sticky="ew")
         # ==========================================================
 
         self.local_label = ctk.CTkLabel(self.sidebar_frame, text="--- 本地文件读取 ---", text_color="gray")
-        self.local_label.grid(row=11, column=0, padx=20, pady=(0, 5))
+        self.local_label.grid(row=13, column=0, padx=20, pady=(0, 5))
 
         self.load_btn = ctk.CTkButton(self.sidebar_frame, text="📂 导入 JSON 日志文件", command=self.load_json_file)
-        self.load_btn.grid(row=12, column=0, padx=20, pady=(5, 20), sticky="ew")
+        self.load_btn.grid(row=14, column=0, padx=20, pady=(5, 20), sticky="ew")
 
         # 2. 右侧主内容区
         self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
@@ -102,7 +114,9 @@ class TrainLogApp(ctk.CTk):
         self.map_frame.grid_columnconfigure(0, weight=1)
         self.map_frame.grid_rowconfigure(0, weight=1)
 
+        # ★ 初始化地图控件并设置默认的高德源
         self.map_widget = tkintermapview.TkinterMapView(self.map_frame, corner_radius=10)
+        self.map_widget.set_tile_server("https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7", max_zoom=19)
         self.map_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         self.map_widget.set_position(39.9, 116.3) 
         self.map_widget.set_zoom(10)
@@ -113,12 +127,21 @@ class TrainLogApp(ctk.CTk):
         self.detail_text.insert("0.0", "选择列表中的列车日志以查看详情和GPS定位...")
         self.detail_text.configure(state="disabled")
 
-        # 启动时静默刷新一次串口（不弹窗）
         self.refresh_ports(show_prompt=False)
+
+    # ================= 新增：地图源切换逻辑 =================
+    def change_map_source(self, choice):
+        """用户在下拉菜单选择不同地图源时触发"""
+        if "高德" in choice:
+            self.map_widget.set_tile_server("https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7", max_zoom=19)
+        elif "OpenStreetMap" in choice:
+            self.map_widget.set_tile_server("https://a.tile.openstreetmap.org/{z}/{x}/{y}.png", max_zoom=19)
+        elif "CartoDB" in choice:
+            self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png", max_zoom=19)
+    # =======================================================
 
     # ================= Pico 串口读取相关逻辑 =================
     def refresh_ports(self, show_prompt=False):
-        """扫描并自动识别 Pico。增加了 show_prompt 参数用于控制是否弹窗"""
         PICO_VID = 0x2E8A
         ports = serial.tools.list_ports.comports()
         port_list = [p.device for p in ports]
@@ -151,16 +174,13 @@ class TrainLogApp(ctk.CTk):
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
             return
 
-        # 禁用按钮防止重复点击
         self.read_pico_btn.configure(state="disabled", text="读取中，请稍候...")
         self.export_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
         
-        # 使用线程防止卡死界面
         threading.Thread(target=self._pico_worker, args=(port,), daemon=True).start()
 
     def start_pico_export(self):
-        """★ 新增：导出文件到电脑"""
         port = self.port_var.get()
         if not port or "未检测" in port or "请选择" in port:
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
@@ -173,14 +193,12 @@ class TrainLogApp(ctk.CTk):
             filetypes=[("JSON Lines", "*.jsonl"), ("Text Files", "*.txt"), ("All Files", "*.*")]
         )
         if not save_path:
-            return # 用户取消了保存
+            return 
             
-        # 禁用按钮防止重复点击
         self.export_pico_btn.configure(state="disabled", text="导出中，请稍候...")
         self.read_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
         
-        # 使用线程执行导出
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
@@ -212,8 +230,6 @@ class TrainLogApp(ctk.CTk):
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
     def _export_worker(self, port, save_path):
-        """★ 新增：底层执行导出的线程"""
-        # 注意 mpremote 的 cp 指令，设备端的文件需要加冒号前缀
         cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
         try:
             startupinfo = None
@@ -239,7 +255,6 @@ class TrainLogApp(ctk.CTk):
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
     def _process_memory_lines(self, lines):
-        """处理通过串口拉取过来的文本数组"""
         self.log_data.clear()
         valid_count = 0
         for line in lines:
@@ -260,7 +275,7 @@ class TrainLogApp(ctk.CTk):
         else:
             messagebox.showwarning("提示", "Pico 连接成功，但未在 history.jsonl 中找到有效的历史数据。")
 
-    # ================= 原有逻辑保持不变 =================
+    # ================= 数据表格及解析逻辑 =================
     
     def setup_treeview(self):
         style = ttk.Style()
