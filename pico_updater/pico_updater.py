@@ -49,7 +49,7 @@ class PicoUpdaterApp(ctk.CTk):
         self.port_menu = ctk.CTkOptionMenu(self.conn_frame, variable=self.port_var, values=["请选择端口..."])
         self.port_menu.pack(side="left", padx=10, fill="x", expand=True)
         
-        self.refresh_btn = ctk.CTkButton(self.conn_frame, text="🔄 刷新", width=60, command=self.refresh_ports)
+        self.refresh_btn = ctk.CTkButton(self.conn_frame, text="刷新", width=60, command=self.refresh_ports)
         self.refresh_btn.pack(side="right", padx=10)
 
         # 版本信息区域
@@ -116,7 +116,7 @@ class PicoUpdaterApp(ctk.CTk):
             
             if auto_detected_port:
                 self.port_var.set(auto_detected_port)
-                self.log(f"✅ 已自动识别并选中 Pico 设备: {auto_detected_port}")
+                self.log(f"已自动识别并选中 Pico 设备: {auto_detected_port}")
             else:
                 self.port_var.set(port_list[0])
                 self.log("已刷新串口列表，但未发现标准 Pico 设备，请手动确认。")
@@ -149,7 +149,7 @@ class PicoUpdaterApp(ctk.CTk):
                 pass
         return 0.0
 
-    # ================= 核心工作流 (在子线程运行) =================
+    # ================= 核心工作流 =================
     
     def start_update_process(self):
         port = self.port_var.get()
@@ -157,6 +157,17 @@ class PicoUpdaterApp(ctk.CTk):
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
             return
             
+        # ================= ★ 新增：更新前高危操作警告护盾 ★ =================
+        confirm = messagebox.askyesno(
+            "严重警告",
+            "执行同步更新将会彻底清空 Pico 中的旧文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续执行更新吗？",
+            icon="warning"
+        )
+        if not confirm:
+            self.log("用户已取消更新操作。")
+            return
+        # ======================================================================
+
         if self.is_working: return
         self.set_ui_state(True)
         self.log_textbox.configure(state="normal")
@@ -174,14 +185,14 @@ class PicoUpdaterApp(ctk.CTk):
             # 发送极其简单的命令，10秒没回应说明串口被占用或死机
             success, output = self.run_mpremote(port, ["exec", "print('PICO_OK')"], timeout_sec=10)
             if not success or "PICO_OK" not in output:
-                self.log("\n❌ 严重错误: 无法与 Pico 建立通信！")
+                self.log("\n严重错误: 无法与 Pico 建立通信！")
                 self.log("可能的原因：")
                 self.log("1. 串口正被其他软件 (如 Thonny/串口助手) 占用。")
                 self.log("2. Pico 当前程序陷入了无法被打断的死循环。")
                 self.log(">> 请关闭占用软件，或尝试重新拔插 Pico 后再重试。")
                 self.after(0, lambda: messagebox.showerror("连接失败", "无法与 Pico 通信，请确保串口未被占用！"))
                 return
-            self.log("✅ Pico 串口通信正常！")
+            self.log("Pico 串口通信正常！")
 
             # ================= 1. 获取远程版本 =================
             self.log("正在连接 GitHub 获取远程版本...")
@@ -210,11 +221,11 @@ class PicoUpdaterApp(ctk.CTk):
 
             # ================= 3. 比较版本 =================
             if self.local_version >= self.remote_version and self.local_version != 0.0:
-                self.log("\n✅ 当前已是最新版本，无需更新！")
+                self.log("\n当前已是最新版本，无需更新！")
                 self.after(0, self.progress_bar.set, 1.0)
                 return
 
-            self.log("\n⚠️ 检测到新版本或本地程序缺失，开始执行更新操作...")
+            self.log("\n准备开始执行更新操作...")
 
             # ================= 4. 获取文件列表 =================
             self.log("正在解析远程仓库文件列表...")
@@ -258,7 +269,7 @@ class PicoUpdaterApp(ctk.CTk):
                     # 写入操作使用默认的 60 秒超时，防止字库等大文件中断
                     success, output = self.run_mpremote(port, ["fs", "cp", local_path, f":{file_name}"])
                     if not success:
-                        self.log(f"\n❌ 写入 {file_name} 失败: {output}")
+                        self.log(f"\n写入 {file_name} 失败: {output}")
                         self.after(0, lambda: messagebox.showerror("写入失败", f"写入文件 {file_name} 时发生错误！"))
                         return
                     
@@ -269,11 +280,11 @@ class PicoUpdaterApp(ctk.CTk):
             self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
             
             self.after(0, self.progress_bar.set, 1.0)
-            self.log("\n🎉 更新完成！Pico 已加载最新程序。")
+            self.log("\n更新完成！Pico 已加载最新程序。")
             self.after(0, lambda: messagebox.showinfo("完成", "更新操作已成功完成！"))
             
         except Exception as e:
-            self.log(f"\n❌ 更新过程中发生严重错误: {str(e)}")
+            self.log(f"\n更新过程中发生严重错误: {str(e)}")
             
         finally:
             self.after(0, self.set_ui_state, False)
