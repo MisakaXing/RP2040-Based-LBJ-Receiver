@@ -5,8 +5,8 @@ import json
 
 @rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_LEFT, autopush=True, push_thresh=8)
 def pocsag_rx():
-    wait(1, gpio, 20)
     wait(0, gpio, 20)
+    wait(1, gpio, 20)
     in_(pins, 1)
 
 class LBJReceiver:
@@ -28,6 +28,10 @@ class LBJReceiver:
         self.bit_count = 0
         self.current_cw = 0
         
+        # ★ 新增：解耦架构核心！原始数据缓冲队列
+        self.raw_queue = [] 
+        self.last_sync_time = time.ticks_ms()
+        
         self.POCSAG_SYNC  = 0x7CD215D8
         self.POCSAG_IDLE  = 0x7A89C197
         self.BCH_POLY     = 0x769
@@ -35,7 +39,14 @@ class LBJReceiver:
         self._load_loco_types()
         self._init_radio(spi_id, sck, mosi, miso, cs, rst)
         self._init_pio(data_pin)
-        
+        time.sleep_ms(100)  
+        self._w(0x01, 0x01) # 切回 Standby，清空开机瞬间锁定到的环境杂音
+        time.sleep_ms(5)
+        self._w(0x01, 0x05) # 重新切入 RX 监听模式
+        while self.sm.rx_fifo() > 0: 
+            self.sm.get()   # 抽干 PIO 里开机电涌产生的乱码
+            
+        self.last_sync_time = time.ticks_ms() # 重置看门狗
     def set_callback(self, callback_func):
         self.callback = callback_func
 
@@ -56,9 +67,7 @@ class LBJReceiver:
         self.rst_pin.value(0); time.sleep_ms(10); self.rst_pin.value(1); time.sleep_ms(10)
         self._setup_pocsag(821237500, ppm_offset=6.0, bps=1200)
 
-    # --- 新增的 SPI 读取与 RSSI 测算 ---
     def _r(self, r):
-        """ 读取 SPI 寄存器 """
         self.cs_pin.value(0)
         self.spi.write(bytearray([r & 0x7F]))
         res = self.spi.read(1)[0]
@@ -66,12 +75,10 @@ class LBJReceiver:
         return res
 
     def get_rssi(self):
-        """ 获取当前信号强度 (FSK 模式下 0x11 寄存器值为 -RSSI/2) """
         try:
             val = self._r(0x11)
             return f"-{val // 2}dBm"
-        except:
-            return "N/A"
+        except: return "N/A"
 
     def _w(self, r, v):
         self.cs_pin.value(0)
@@ -93,12 +100,15 @@ class LBJReceiver:
         self._w(0x07, (frf >> 8) & 0xFF)
         self._w(0x08, frf & 0xFF)
 
-        self._w(0x12, 0x15); self._w(0x0C, 0x23); self._w(0x0D, 0x40)
+        self._w(0x12, 0x15) 
+        self._w(0x0C, 0x23) 
+        self._w(0x0D, 0x50) 
         self._w(0x31, 0x00); self._w(0x40, 0x00); self._w(0x01, 0x05)
 
     def _init_pio(self, data_pin):
         self.sm = rp2.StateMachine(0, pocsag_rx, freq=2000000, in_base=machine.Pin(data_pin))
         self.sm.active(1)
+        while self.sm.rx_fifo() > 0: self.sm.get()
 
     def _calc_syndrome(self, cw):
         reg = (cw >> 1) & 0x7FFFFFFF
@@ -121,8 +131,7 @@ class LBJReceiver:
             for i in range(1, 32):
                 for j in range(i + 1, 32):
                     test_cw = cw ^ (1 << i) ^ (1 << j)
-                    if self._calc_syndrome(test_cw) == 0:
-                        return test_cw, 2
+                    if self._calc_syndrome(test_cw) == 0: return test_cw, 2
         return cw, -1
 
     def _bcd_to_hex(self, s):
@@ -138,7 +147,6 @@ class LBJReceiver:
                 cleaned_parts.append(parts[i] + parts[i+1]); i += 2
             else:
                 cleaned_parts.append(parts[i]); i += 1
-                
         if len(cleaned_parts) >= 3:
             try: km = round(float(cleaned_parts[2]) / 10.0, 1)
             except: km = cleaned_parts[2]
@@ -155,7 +163,6 @@ class LBJReceiver:
                 type_str = str(int(loco_raw[0:3]))
                 loco_display = f"{self.loco_types[type_str]}-{loco_raw[4:8]}" if type_str in self.loco_types else f"未知({type_str})-{loco_raw[4:8]}"
             except: loco_display = loco_raw 
-            
             route_hex = self._bcd_to_hex(s[14:30]) 
             return {
                 "loco_type": loco_display, "loco_raw": loco_raw, "cab_end": s[12:14],
@@ -176,8 +183,7 @@ class LBJReceiver:
             coord_digits = sum(1 for c in coord_part if c.isdigit())
             score = (loco_digits * 3) + coord_digits
             if loco_digits >= 6 or (loco_digits >= 4 and coord_digits >= 4):
-                if score > best_score:
-                    best_score, best_idx = score, i
+                if score > best_score: best_score, best_idx = score, i
         return best_idx
 
     def _parse_train_data(self, msg):
@@ -216,32 +222,40 @@ class LBJReceiver:
                 self._emit(merged)
                 self.pending_msg = None
                 return
-
         if self.pending_msg:
             self._emit(self.pending_msg)
             self.pending_msg = None
-
         if msg.get("type") in ["basic_only", "extended_only"]:
             self.pending_msg = msg
             self.pending_time = now
         else:
             self._emit(msg)
 
+    # ★ 核心修复 3：不再原地解析，只扔进缓冲队列！
     def _flush_message(self):
         if self.numeric_output:
-            try:
-                parsed = self._parse_train_data(self.numeric_output)
-                if parsed.get("type") != "empty":
-                    parsed["ric"] = self.current_address
-                    self._handle_parsed_msg(parsed)
-            except Exception as e:
-                self._emit({"type": "error", "ric": self.current_address, "raw": self.numeric_output, "error": str(e)})
+            self.raw_queue.append((self.current_address, self.numeric_output))
         self.numeric_output = ""
         self.current_address = ""
         self.error_strike = 0
 
     def tick(self):
-        if self.sm.rx_fifo() > 0:
+        now = time.ticks_ms()
+        
+        # 1. 射频自愈看门狗
+        if time.ticks_diff(now, self.last_sync_time) > 30000:
+            self._w(0x01, 0x01) 
+            time.sleep_ms(2)
+            self._w(0x01, 0x05) 
+            while self.sm.rx_fifo() > 0: self.sm.get()
+            self.sync_window = 0
+            self.synced = False
+            self.last_sync_time = now
+
+        # ========================================================
+        # ★ 核心修复 1：把 if 换成了 while，瞬间榨干 PIO 缓存，绝不溢出丢包！
+        # ========================================================
+        while self.sm.rx_fifo() > 0:
             byte = (self.sm.get() ^ 0xFF) & 0xFF 
             for i in range(7, -1, -1):
                 bit = (byte >> i) & 1
@@ -250,6 +264,7 @@ class LBJReceiver:
                     if self.sync_window == self.POCSAG_SYNC:
                         self.synced = True
                         self.bit_count = self.current_cw = 0
+                        self.last_sync_time = time.ticks_ms() 
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1
@@ -283,10 +298,23 @@ class LBJReceiver:
                                                 nibble_rev = ((nibble & 1) << 3) | ((nibble & 2) << 1) | ((nibble & 4) >> 1) | ((nibble & 8) >> 3)
                                                 self.numeric_output += self.BCD_MAP[nibble_rev]
                         self.bit_count = self.current_cw = 0
-        else:
-            now = time.ticks_ms()
-            if time.ticks_diff(now, self.last_timeout_check) > 100:
-                if self.pending_msg and time.ticks_diff(now, self.pending_time) > 2000:
-                    self._emit(self.pending_msg)
-                    self.pending_msg = None
-                self.last_timeout_check = now
+
+        # ========================================================
+        # ★ 核心修复 2：异步处理队列里的数据，只有等底层射频缓存全空了，才允许 CPU 解析大段 JSON！
+        # ========================================================
+        if len(self.raw_queue) > 0 and self.sm.rx_fifo() == 0:
+            addr, raw = self.raw_queue.pop(0)
+            try:
+                parsed = self._parse_train_data(raw)
+                if parsed.get("type") != "empty":
+                    parsed["ric"] = addr
+                    self._handle_parsed_msg(parsed)
+            except Exception as e:
+                self._emit({"type": "error", "ric": addr, "raw": raw, "error": str(e)})
+
+        # 2. 尾巴报文合并超时触发
+        if time.ticks_diff(now, self.last_timeout_check) > 100:
+            if self.pending_msg and time.ticks_diff(now, self.pending_time) > 2000:
+                self._emit(self.pending_msg)
+                self.pending_msg = None
+            self.last_timeout_check = now
