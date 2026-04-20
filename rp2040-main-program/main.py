@@ -2,6 +2,7 @@ import time
 import json
 import machine
 import os
+import gc
 import sdcard
 import _thread  # ★ 引入双核
 from machine import Pin, ADC, I2C
@@ -13,7 +14,7 @@ machine.freq(200000000)#超频一下，133mhz不够用
 # ==========================================
 # ★ 全局设置区
 # ==========================================
-Program_ver = 2.0
+Program_ver = 2.1
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -426,6 +427,7 @@ while True:
     # 【取件并画图】如果信箱里有数据，核心 0 才会慢慢拿出来画图
     if len(ui_queue) > 0:
         process_ui_data(ui_queue.pop(0))
+        gc.collect()
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
