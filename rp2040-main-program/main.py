@@ -4,31 +4,35 @@ import machine
 import os
 import gc
 import sdcard
-import _thread  # ★ 引入双核
+import _thread  
 from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST 
-machine.freq(200000000)#超频一下，133mhz不够用
+
 # ==========================================
-# ★ 全局设置区
+# ★ 系统性能配置与时钟加固
 # ==========================================
-Program_ver = 2.1
+machine.freq(200000000) 
+time.sleep_ms(200) 
+
+Program_ver = 2.2
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
 
-# ★★★ 核心修复：跨核通讯信箱 ★★★
 ui_queue = [] 
 
 # ==========================================
-# 1. 硬件初始化
+# 1. 硬件 IO 初始化 
 # ==========================================
 tft_cs = Pin(9, Pin.OUT, value=1) 
-spi1 = machine.SPI(1, baudrate=60000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
+spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
 tft = ILI9341(spi1, cs=9, dc=12, rst=13)
+tft.fill(BLACK) 
+spi1.init(baudrate=60000000) 
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
@@ -41,13 +45,8 @@ rtc = DS3231(i2c0)
 btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3, 4, 5)]
 sensor_temp = machine.ADC(4)
 
-post = SystemPOST(tft, tft_cs)
-boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver)
-if boot_status == "HALT":
-    while True: pass 
-
 # ==========================================
-# 2. 系统状态机与变量
+# 2. 系统全局变量
 # ==========================================
 MAX_HIST = 2000
 HIST_FILE = "history.jsonl"
@@ -57,7 +56,7 @@ CONFIG_FILE = "config.json"
 system_state = "DASHBOARD" 
 has_received = False
 menu_index = 0
-menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "SAFE EJECT SD", "ABOUT DEV", "EXIT"]
+menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", "EXIT"]
 cfg_buzzer = True
 
 hist_ptr = -1
@@ -68,8 +67,14 @@ last_interaction = time.ticks_ms()
 last_minute = -1 
 last_sd_status_drawn = ""
 last_hw_str_drawn = ""
-sd_eject_mode = False
+last_mem_print = 0
+last_sd_ping = 0
+last_sd_err_time = 0 # ★ 新增：记录临时状态产生的时间
+
+# --- SD卡静态状态机 ---
+sd_active = False    
 sd_obj = None
+current_sd_status = "SD NO INSERT" # ★ 统一初始化为 NO INSERT
 
 edit_y, edit_m, edit_d = 24, 1, 1
 edit_id = [0, 0, 0, 0] 
@@ -77,7 +82,6 @@ edit_step = 0
 
 current_status = b'READY'
 current_status_color = GREEN
-current_sd_status = "SD INIT..." 
 
 last_basic, last_ext = {}, {}
 last_is_full = True
@@ -85,7 +89,7 @@ last_is_full = True
 LBL_TRAIN, LBL_SPEED, LBL_ROUTE, LBL_KM, LBL_LOCO = b'\xb3\xb5:', b'\xcb\xd9:', b'\xcf\xdf:', b'\xb1\xea:', b'\xbb\xfa:'
 
 # ==========================================
-# 3. 核心工具与存储函数
+# 3. 核心功能函数
 # ==========================================
 def beep(duration=0.02):
     if cfg_buzzer: buzzer.value(1); time.sleep(duration); buzzer.value(0)
@@ -129,8 +133,7 @@ def init_history():
                 history_offsets.append(offset)
         total_count = len(history_offsets)
     except: 
-        total_count = 0
-        history_offsets = []
+        total_count = 0; history_offsets = []
 
 def save_history(data):
     global total_count, history_offsets
@@ -140,81 +143,75 @@ def save_history(data):
         record = {"t": t_str, "d": data}
         json_str = json.dumps(record) 
         with open(HIST_FILE, 'a') as f:
-            f.seek(0, 2) 
-            offset = f.tell() 
+            f.seek(0, 2); offset = f.tell() 
             f.write(json_str + '\n')
             history_offsets.append(offset) 
         total_count += 1
-    except Exception as e:
-        err_msg = str(e).replace(' ', '') 
-        if len(err_msg) > 16: err_msg = err_msg[:16] 
-        draw_popup(b'LOG ERR: ' + err_msg.encode(), color=RED)
+    except: pass
 
 def load_history_entry(idx):
     if idx < 0 or idx >= len(history_offsets): return None
     try:
         with open(HIST_FILE, 'r') as f:
-            f.seek(history_offsets[idx]) 
-            line = f.readline()
+            f.seek(history_offsets[idx]); line = f.readline()
             return json.loads(line)
     except: return None
 
-def check_sd():
-    global current_sd_status, sd_eject_mode, last_sd_status_drawn, sd_obj
-    try:
-        tft_cs.value(1) 
-        if sd_eject_mode:
-            current_sd_status = "SAFE TO REMOVE"
-        elif 'sd' in os.listdir('/'):
-            try:
-                if sd_obj:
-                    spi1.init(baudrate=5000000)
-                    sd_obj.readblocks(0, bytearray(512))
-                s = os.statvfs("/sd")
-                total_kb = (s[0] * s[2]) / 1024
-                free_kb = (s[0] * s[3]) / 1024
-                used_kb = total_kb - free_kb
-                if free_kb < 1024: current_sd_status = "SD FULL"
-                elif total_kb > 1048576: current_sd_status = f"SD:{used_kb/1048576:.1f}/{total_kb/1048576:.1f}G"
-                else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
-            except:
-                try: os.umount("/sd")
-                except: pass
-                sd_obj = None 
-                current_sd_status = "SD NO INSERT"
-        else:
-            spi1.init(baudrate=1000000) 
-            try:
-                sd_obj = sdcard.SDCard(spi1, sd_cs)
-                os.mount(os.VfsFat(sd_obj), "/sd")
-                current_sd_status = "SD INIT..." 
-            except Exception as e:
-                sd_obj = None
-                err = str(e).lower()
-                if '19' in err: current_sd_status = "SD NEED FORMAT"
-                else: current_sd_status = "SD NO INSERT"
-    except Exception:
-        current_sd_status = "SD NO INSERT"
-    finally:
-        spi1.init(baudrate=40000000) 
-        if system_state == "DASHBOARD" and current_sd_status != last_sd_status_drawn:
-            tft.fill_rect(0, 0, 130, 24, 0x01CF) 
-            tft.draw_gbk(current_sd_status.encode(), 5, 4, WHITE, 0x01CF)
-            last_sd_status_drawn = current_sd_status
-
-def log_to_sd(data):
-    if "SD:" not in current_sd_status: return 
+def check_sd_startup():
+    global current_sd_status, sd_active, sd_obj, menu_items
     try:
         tft_cs.value(1)
+        spi1.init(baudrate=1000000) 
+        sd_obj = sdcard.SDCard(spi1, sd_cs)
+        os.mount(os.VfsFat(sd_obj), "/sd")
+        s = os.statvfs("/sd")
+        total_kb = (s[0] * s[2]) / 1024
+        free_kb = (s[0] * s[3]) / 1024
+        used_kb = total_kb - free_kb
+        if total_kb > 1048576: current_sd_status = f"SD:{used_kb/1048576:.1f}/{total_kb/1048576:.1f}G"
+        else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
+        sd_active = True
+    except:
+        sd_active = False; sd_obj = None; current_sd_status = "SD NO INSERT"
+    finally:
+        menu_items[5] = "EJECT SD" if sd_active else "MOUNT SD"
+        spi1.init(baudrate=60000000)
+
+def ping_sd_hardware():
+    if not sd_active or sd_obj is None: return
+    try:
+        test_buf = bytearray(512)
         spi1.init(baudrate=5000000)
+        sd_obj.readblocks(0, test_buf) 
+        spi1.init(baudrate=60000000)
+    except:
+        disable_sd_forever("SD REMOVED")
+
+def disable_sd_forever(reason):
+    global sd_active, current_sd_status, sd_obj, menu_items, last_sd_err_time
+    try: os.umount("/sd")
+    except: pass
+    sd_active = False
+    sd_obj = None
+    current_sd_status = reason
+    last_sd_err_time = time.ticks_ms() # ★ 核心：记录出错/弹出时间
+    menu_items[5] = "MOUNT SD"
+    if system_state == "DASHBOARD": update_top_bar()
+    elif system_state == "MENU": draw_menu(full=True)
+
+def log_to_sd(data):
+    if not sd_active: return 
+    try:
+        tft_cs.value(1); spi1.init(baudrate=5000000)
         with open(SD_LOG_FILE, 'a') as f:
             f.write(json.dumps({"t": rtc.get_time_str(True), "d": data}) + '\n')
-    except Exception: pass
+    except:
+        disable_sd_forever("SD WRITE ERR")
     finally:
-        spi1.init(baudrate=40000000)
+        spi1.init(baudrate=60000000)
 
 # ==========================================
-# 4. UI 绘制逻辑 
+# 4. UI 绘制函数
 # ==========================================
 def draw_ui_skeleton():
     tft.fill(BLACK)
@@ -354,23 +351,16 @@ def draw_popup(msg, color=RED):
     tft.draw_gbk(msg, 75, 100, WHITE, color)
 
 # ==========================================
-# ★ 5. 核心 1 的回调：只塞信箱，绝对不准碰 UI！
+# ★ 5. 核心 1 的回调
 # ==========================================
 def light_callback(data):
-    # 这个函数跑在核心 1 上，耗时 0.01 毫秒
     ui_queue.append(data)
 
-# ==========================================
-# ★ 6. 核心 1 的死循环任务
-# ==========================================
 def radio_core_task():
     while True:
         receiver.tick()
         time.sleep_ms(1)
 
-# ==========================================
-# ★ 7. 核心 0 处理信箱数据 (画 UI + 写 SD 卡)
-# ==========================================
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color
     try:
@@ -395,15 +385,20 @@ def process_ui_data(data):
 
 
 # ==========================================
-# 8. 启动与核心分发
+# 6. 启动自检与核心分发
 # ==========================================
 load_config() 
 init_history()
-check_sd() 
+check_sd_startup() 
+
+post = SystemPOST(tft, tft_cs)
+boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver)
+if boot_status == "HALT":
+    while True: pass 
 
 receiver = LBJReceiver()
-receiver.set_callback(light_callback) # 绑定轻量级信箱回调
-_thread.start_new_thread(radio_core_task, ()) # 启动核心 1 狂飙射频
+receiver.set_callback(light_callback) 
+_thread.start_new_thread(radio_core_task, ()) 
 
 if boot_status == "RTC_SYNC":
     system_state = "SET_DATE"; edit_step = 0
@@ -419,15 +414,22 @@ last_sec = time.ticks_ms()
 heartbeat = False
 
 # ==========================================
-# ★ 核心 0 (主线程) 专属循环：绝对霸占 SPI1
+# ★ 7. 核心 0 主循环
 # ==========================================
 while True:
     now = time.ticks_ms()
     
-    # 【取件并画图】如果信箱里有数据，核心 0 才会慢慢拿出来画图
     if len(ui_queue) > 0:
+        while len(ui_queue) > 1:
+            fast_data = ui_queue.pop(0)
+            if "train_data" in fast_data.get("type", ""):
+                save_history(fast_data); log_to_sd(fast_data)
         process_ui_data(ui_queue.pop(0))
         gc.collect()
+
+    if sd_active and time.ticks_diff(now, last_sd_ping) > 5000:
+        ping_sd_hardware()
+        last_sd_ping = now
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
@@ -442,9 +444,13 @@ while True:
                     last_minute = now_min
             except: pass
             
-        if int(now / 1000) % 2 == 0: 
-            check_sd()
-            if system_state == "DASHBOARD" and not has_received: 
+            # ★ 核心修复：状态复位机制
+            # 如果没卡，且屏幕不是"SD NO INSERT"，并且距离出事已经过了3秒
+            if not sd_active and current_sd_status != "SD NO INSERT" and time.ticks_diff(now, last_sd_err_time) > 3000:
+                current_sd_status = "SD NO INSERT"
+                update_top_bar() # 悄悄更新顶栏
+                
+            if not has_received: 
                 draw_hardware_bar(force=False) 
         last_sec = now
 
@@ -453,7 +459,9 @@ while True:
         if has_received: display_train_data(last_basic, last_ext, last_is_full)
         else: draw_idle_screen()
 
-    # --- UI 按钮交互逻辑 ---
+    # ==========================================
+    # ★ 按钮交互逻辑
+    # ==========================================
     if not btn_menu.value():
         last_interaction = now; beep()
         if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID"]:
@@ -524,20 +532,26 @@ while True:
             elif menu_index == 3: 
                 system_state = "CONFIRM_FORMAT"; draw_confirm_format()
             elif menu_index == 4: 
-                if "NO INSERT" in current_sd_status or sd_obj is None:
+                if not sd_active:
                     draw_popup(b'NO SD CARD!', color=RED); time.sleep(1); draw_menu(full=True)
                 else: system_state = "CONFIRM_FORMAT_SD"; draw_confirm_format_sd()
+            
             elif menu_index == 5: 
-                if "NO INSERT" in current_sd_status or sd_obj is None:
-                    draw_popup(b'NO SD CARD!', color=RED); time.sleep(1); draw_menu(full=True)
-                else:
+                if sd_active:
                     draw_popup(b'UNMOUNTING...', color=YELLOW)
-                    try: os.umount("/sd")
-                    except: pass
-                    sd_obj = None; sd_eject_mode = True; current_sd_status = "SAFE TO REMOVE"; time.sleep(1)
-                    system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
-                    if has_received: display_train_data(last_basic, last_ext, last_is_full)
-                    else: draw_idle_screen()
+                    disable_sd_forever("SD REMOVED") # 直接复用核心函数
+                    draw_popup(b'SAFE TO REMOVE', color=CYAN); time.sleep(2)
+                else:
+                    draw_popup(b'MOUNTING SD...', color=YELLOW)
+                    check_sd_startup() 
+                    if sd_active: draw_popup(b'MOUNT OK!', color=GREEN)
+                    else: draw_popup(b'MOUNT FAIL!', color=RED)
+                    time.sleep(1)
+                
+                system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
+                if has_received: display_train_data(last_basic, last_ext, last_is_full)
+                else: draw_idle_screen()
+            
             elif menu_index == 6: system_state = "ABOUT"; draw_about()
             elif menu_index == 7: 
                 system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
@@ -577,6 +591,9 @@ while True:
                 draw_popup(b'SD FORMAT OK!', color=GREEN)
             except Exception as e:
                 sd_obj = None; draw_popup(b'FORMAT FAIL!', color=RED)
-            spi1.init(baudrate=40000000) 
+                disable_sd_forever("FORMAT FAIL") 
+            spi1.init(baudrate=60000000) 
             time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+
+    time.sleep_ms(1)
