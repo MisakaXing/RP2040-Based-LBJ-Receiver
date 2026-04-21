@@ -17,13 +17,15 @@ if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
 
 import json
 import re
+import time
 import threading
 import subprocess
+import serial
+import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
 import tkintermapview
-import serial.tools.list_ports
 
 # 配置主题
 ctk.set_appearance_mode("System")
@@ -33,7 +35,7 @@ class TrainLogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("列车运行日志解析系统 (最终完美版)")
+        self.title("列车运行日志解析系统 (终极融合版)")
         self.geometry("1100x750")
         self.minsize(900, 650)
         
@@ -43,7 +45,7 @@ class TrainLogApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # 1. 左侧侧边栏 (控制台与过滤器)
+        # ==================== 1. 左侧侧边栏 ====================
         self.sidebar_frame = ctk.CTkFrame(self, width=260, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
         self.sidebar_frame.grid_rowconfigure(8, weight=1)
@@ -51,7 +53,7 @@ class TrainLogApp(ctk.CTk):
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="列车数据过滤器", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        # 筛选控件
+        # --- 筛选控件 ---
         self.train_no_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="搜索车次 (如: D70)")
         self.train_no_entry.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
 
@@ -67,7 +69,7 @@ class TrainLogApp(ctk.CTk):
         self.reset_btn = ctk.CTkButton(self.sidebar_frame, text="重置", fg_color="gray", command=self.reset_filter)
         self.reset_btn.grid(row=5, column=0, padx=20, pady=0, sticky="ew")
 
-        # 地图源自由切换
+        # --- 地图源设置 ---
         self.map_source_label = ctk.CTkLabel(self.sidebar_frame, text="--- 地图源设置 ---", text_color="gray")
         self.map_source_label.grid(row=6, column=0, padx=20, pady=(15, 5))
 
@@ -80,7 +82,7 @@ class TrainLogApp(ctk.CTk):
         )
         self.map_source_menu.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="ew")
 
-        # Pico 串口直连区域
+        # --- Pico 串口直连区域 ---
         self.pico_label = ctk.CTkLabel(self.sidebar_frame, text="--- Pico 串口直连 ---", text_color="gray")
         self.pico_label.grid(row=9, column=0, padx=20, pady=(10, 5))
 
@@ -103,14 +105,14 @@ class TrainLogApp(ctk.CTk):
         self.export_pico_btn = ctk.CTkButton(self.sidebar_frame, text="💾 导出日志到电脑", fg_color="#d97706", hover_color="#b45309", command=self.start_pico_export)
         self.export_pico_btn.grid(row=12, column=0, padx=20, pady=(0, 15), sticky="ew")
 
-        # 本地文件读取
+        # --- 本地文件读取 ---
         self.local_label = ctk.CTkLabel(self.sidebar_frame, text="--- 本地文件读取 ---", text_color="gray")
         self.local_label.grid(row=13, column=0, padx=20, pady=(0, 5))
 
         self.load_btn = ctk.CTkButton(self.sidebar_frame, text="📂 导入 JSON 日志文件", command=self.load_json_file)
         self.load_btn.grid(row=14, column=0, padx=20, pady=(5, 20), sticky="ew")
 
-        # 2. 右侧主内容区
+        # ==================== 2. 右侧主内容区 ====================
         self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -142,6 +144,7 @@ class TrainLogApp(ctk.CTk):
 
         self.refresh_ports(show_prompt=False)
 
+    # ==================== 核心逻辑与功能函数 ====================
     def change_map_source(self, choice):
         if "高德" in choice:
             self.map_widget.set_tile_server("https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=7", max_zoom=19)
@@ -164,18 +167,33 @@ class TrainLogApp(ctk.CTk):
         if not port_list:
             self.port_menu.configure(values=["未检测到设备"])
             self.port_var.set("未检测到设备")
-            if show_prompt:
-                messagebox.showwarning("提示", "未检测到任何串口设备，请检查数据线连接！")
+            if show_prompt: messagebox.showwarning("提示", "未检测到任何串口设备，请检查数据线连接！")
         else:
             self.port_menu.configure(values=port_list)
             if auto_port:
                 self.port_var.set(auto_port)
-                if show_prompt:
-                    messagebox.showinfo("成功", f"扫描完成！\n已自动识别并选中 Pico 设备：{auto_port}")
+                if show_prompt: messagebox.showinfo("成功", f"扫描完成！\n已自动识别并选中 Pico 设备：{auto_port}")
             else:
                 self.port_var.set(port_list[0])
-                if show_prompt:
-                    messagebox.showwarning("提示", "已刷新列表，但未发现标准 Pico 设备。\n请展开下拉菜单手动选择正确的端口！")
+                if show_prompt: messagebox.showwarning("提示", "已刷新列表，但未发现标准 Pico 设备。\n请展开下拉菜单手动选择正确的端口！")
+
+    # ★ 核心机制：软中断与复活
+    def _interrupt_pico(self, port):
+        """发送 Ctrl+C 强行打断死循环"""
+        try:
+            with serial.Serial(port, 115200, timeout=1) as ser:
+                ser.write(b'\x03\x03') 
+                time.sleep(0.5) 
+        except Exception as e:
+            print(f"串口打断尝试失败: {e}")
+
+    def _reboot_pico(self, port):
+        """发送 Ctrl+D 触发软重启恢复工作"""
+        try:
+            with serial.Serial(port, 115200, timeout=1) as ser:
+                ser.write(b'\x04')
+        except Exception:
+            pass
 
     def start_pico_read(self):
         port = self.port_var.get()
@@ -201,8 +219,7 @@ class TrainLogApp(ctk.CTk):
             title="保存 Pico 日志文件",
             filetypes=[("JSON Lines", "*.jsonl"), ("Text Files", "*.txt"), ("All Files", "*.*")]
         )
-        if not save_path:
-            return 
+        if not save_path: return 
             
         self.export_pico_btn.configure(state="disabled", text="导出中，请稍候...")
         self.read_pico_btn.configure(state="disabled")
@@ -211,7 +228,11 @@ class TrainLogApp(ctk.CTk):
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
-        # 动态判断运行环境
+        # 1. 强行打断 Pico，让出串口
+        self.after(0, lambda: self.read_pico_btn.configure(text="正在中断设备..."))
+        self._interrupt_pico(port)
+        self.after(0, lambda: self.read_pico_btn.configure(text="正在读取数据..."))
+
         if getattr(sys, 'frozen', False):
             cmd = [sys.executable, "mpremote_internal", "connect", port, "cat", "history.jsonl"]
         else:
@@ -223,13 +244,12 @@ class TrainLogApp(ctk.CTk):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # 使用 utf-8 强制编码
             result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=30, startupinfo=startupinfo)
             output = result.stdout
             
             if result.returncode != 0:
                  err_msg = result.stderr if result.stderr else output
-                 self.after(0, lambda err=err_msg: messagebox.showerror("读取失败", f"无法读取文件，可能 Pico 被占用或文件为空。\n\n{err}"))
+                 self.after(0, lambda err=err_msg: messagebox.showerror("读取失败", f"无法读取文件，可能设备忙。\n\n{err}"))
                  return
 
             lines = output.split('\n')
@@ -238,14 +258,22 @@ class TrainLogApp(ctk.CTk):
         except subprocess.TimeoutExpired:
             self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被 Thonny 等软件占用！"))
         except Exception as e:
-            error_text = str(e)
-            self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
+            self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
+            # 2. 复活设备
+            self.after(0, lambda: self.read_pico_btn.configure(text="正在恢复设备..."))
+            self._reboot_pico(port)
+            
             self.after(0, lambda: self.read_pico_btn.configure(state="normal", text="📥 从 Pico 提取历史数据"))
             self.after(0, lambda: self.export_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
     def _export_worker(self, port, save_path):
+        # 1. 强行打断 Pico
+        self.after(0, lambda: self.export_pico_btn.configure(text="正在中断设备..."))
+        self._interrupt_pico(port)
+        self.after(0, lambda: self.export_pico_btn.configure(text="正在导出文件..."))
+
         if getattr(sys, 'frozen', False):
             cmd = [sys.executable, "mpremote_internal", "connect", port, "cp", ":history.jsonl", save_path]
         else:
@@ -260,17 +288,20 @@ class TrainLogApp(ctk.CTk):
             result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=45, startupinfo=startupinfo)
             
             if result.returncode == 0:
-                 self.after(0, lambda path=save_path: messagebox.showinfo("成功", f"日志文件已成功导出至：\n{path}"))
+                 self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已导出至：\n{p}"))
             else:
                  err_msg = result.stderr if result.stderr else result.stdout
-                 self.after(0, lambda err=err_msg: messagebox.showerror("导出失败", f"无法导出文件，请确保串口未被占用。\n\n{err}"))
+                 self.after(0, lambda err=err_msg: messagebox.showerror("导出失败", f"导出失败。\n\n{err}"))
                  
         except subprocess.TimeoutExpired:
-            self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能太大或设备已断开连接。"))
+            self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能过大或连接断开。"))
         except Exception as e:
-            error_text = str(e)
-            self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
+            self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
+            # 2. 复活设备
+            self.after(0, lambda: self.export_pico_btn.configure(text="正在恢复设备..."))
+            self._reboot_pico(port)
+            
             self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="💾 导出日志到电脑"))
             self.after(0, lambda: self.read_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
@@ -294,7 +325,7 @@ class TrainLogApp(ctk.CTk):
         if valid_count > 0:
             messagebox.showinfo("成功", f"成功提取并解析了 {valid_count} 条记录！")
         else:
-            messagebox.showwarning("提示", "Pico 连接成功，但未在 history.jsonl 中找到有效的历史数据。")
+            messagebox.showwarning("提示", "未找到有效的 JSON 历史数据。")
 
     def setup_treeview(self):
         style = ttk.Style()
@@ -340,7 +371,6 @@ class TrainLogApp(ctk.CTk):
     def load_json_file(self):
         filepath = filedialog.askopenfilename(filetypes=[("JSON Lines", "*.json *.jsonl *.txt"), ("All Files", "*.*")])
         if not filepath: return
-        
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
