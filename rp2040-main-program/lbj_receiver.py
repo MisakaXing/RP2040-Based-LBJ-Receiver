@@ -174,16 +174,28 @@ class LBJReceiver:
     def _find_lbj_block(self, msg):
         best_score, best_idx = -1, -1
         if len(msg) < 12: return -1
+        
         for i in range(len(msg) - 11):
             block = msg[i:i+47]
             loco_part = block[4:12]
             if ' ' in loco_part: continue
+            
+            # 提取端号部分 (通常是 31, 32 等两位数字)
+            cab_part = block[12:14] if len(block) >= 14 else ""
             coord_part = block[30:47] if len(block) >= 47 else block[30:]
+            
             loco_digits = sum(1 for c in loco_part if c.isdigit())
+            cab_digits = sum(1 for c in cab_part if c.isdigit())
             coord_digits = sum(1 for c in coord_part if c.isdigit())
-            score = (loco_digits * 3) + coord_digits
+            
+            # ★ 核心修复：绝对权重碾压机制
+            # 就算坐标区多出几个随机数字，也绝对无法动摇正确对齐的机车号和端号
+            score = (loco_digits * 20) + (cab_digits * 5) + coord_digits
+            
             if loco_digits >= 6 or (loco_digits >= 4 and coord_digits >= 4):
-                if score > best_score: best_score, best_idx = score, i
+                if score > best_score: 
+                    best_score, best_idx = score, i
+                    
         return best_idx
 
     def _parse_train_data(self, msg):
