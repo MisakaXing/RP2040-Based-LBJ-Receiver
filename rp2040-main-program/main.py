@@ -17,7 +17,7 @@ from boot_post import SystemPOST
 machine.freq(200000000) 
 time.sleep_ms(200) 
 
-Program_ver = 2.5
+Program_ver = 2.6
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -25,7 +25,7 @@ BAT_OFFSET = 0.174
 
 ui_queue = [] 
 last_hw_update = 0  # 记录硬件栏上次刷新的时间
-last_rssi_str = "N/A" # ★ 新增：用于缓存从 JSON 传来的最新一趟车的 RSSI
+last_rssi_str = "N/A" # 用于缓存从 JSON 传来的最新一趟车的 RSSI
 
 # ==========================================
 # 1. 硬件 IO 初始化 
@@ -84,7 +84,6 @@ last_minute = -1
 last_sd_status_drawn = ""
 last_hw_str_drawn = ""
 last_mem_print = 0
-last_sd_ping = 0
 last_sd_err_time = 0
 
 sd_active = False    
@@ -259,12 +258,10 @@ def draw_hardware_bar(force=False):
     global last_hw_update, last_rssi_str
     now = time.ticks_ms()
     
-    # 30秒更新一次电压和温度。若是来车了(force=True)就立刻刷新
     if not force and time.ticks_diff(now, last_hw_update) < 30000:
         return
     
     v, p = get_battery_info()
-    # ★ 彻底脱离 SPI 硬件调用，只显示缓存中这趟列车带过来的 RSSI
     r = last_rssi_str
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
     
@@ -434,7 +431,7 @@ def draw_popup(msg, color=RED):
 # ★ 5. 核心 1 的回调
 # ==========================================
 def light_callback(data):
-    print(f"\n[LBJ Console] 接收到数据: {data}")
+    # Core 1 极简闭环，只负责进队，禁止一切 print 打印阻塞
     ui_queue.append(data)
 
 def radio_core_task():
@@ -444,6 +441,14 @@ def radio_core_task():
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
+    
+    # ★ 完美的 Core 0 控制台打印输出，既不会丢字，又是标准 JSON 格式
+    try:
+        json_str = json.dumps(data) 
+        print(f"\n[LBJ Console] 接收到数据: {json_str}")
+    except:
+        print(f"\n[LBJ Console] 接收到数据: {data}")
+
     try:
         msg_type = data.get("type")
         time.sleep_ms(1) 
@@ -458,7 +463,6 @@ def process_ui_data(data):
         elif "train_data" in msg_type or "only" in msg_type:
             beep(0.05); has_received = True
             
-            # ★ 核心改动：从 JSON 中提纯提取刚才在接收瞬间锁定的真实 RSSI，并存入内存
             if "rssi" in data:
                 last_rssi_str = str(data["rssi"])
                 
@@ -476,7 +480,6 @@ def process_ui_data(data):
                 
                 update_top_bar()
                 display_train_data(last_basic, last_ext, last_is_full)
-                # ★ 来车时，强制使底栏触发更新，因为 force=True，会立刻把新缓存的 last_rssi_str 画在屏幕上
                 draw_hardware_bar(force=True) 
     except: pass
 
@@ -516,20 +519,22 @@ heartbeat = False
 while True:
     now = time.ticks_ms()
     
+    # ==========================================
+    # ★ 完美 FIFO 缓冲与视觉停留机制
+    # ==========================================
     if len(ui_queue) > 0:
-        while len(ui_queue) > 1:
-            fast_data = ui_queue.pop(0)
-            if "train_data" in fast_data.get("type", ""):
-                save_history(fast_data)
-                log_to_sd(fast_data)
-                
+        # 1. 严格逐个处理，抛弃了之前的“丢帧”逻辑
         process_ui_data(ui_queue.pop(0))
         
+        # 2. 如果身后还有积压的车次，强制停留 800ms，确保人眼能看清当前画面
+        if len(ui_queue) > 0:
+            time.sleep_ms(800)
+        
+        # 3. 内存回收护航
         if gc.mem_free() < 20000:
             time.sleep_ms(1)
             gc.collect()
             time.sleep_ms(1)
-
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
@@ -549,7 +554,6 @@ while True:
                 update_top_bar() 
                 
             if not has_received: 
-                # 平时 30 秒才会低频无感更新一次电压温度
                 draw_hardware_bar(force=False) 
         last_sec = now
 
