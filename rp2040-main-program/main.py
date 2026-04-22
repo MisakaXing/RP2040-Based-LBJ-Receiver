@@ -17,7 +17,7 @@ from boot_post import SystemPOST
 machine.freq(200000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 2.7
+Program_ver = 2.8
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -442,6 +442,7 @@ def radio_core_task():
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
+    json_str = json.dumps(data)
     # ★ 完美的 Core 0 控制台打印输出，既不会丢字，又是标准 JSON 格式
     if DEBUG_MODE:
         try:
