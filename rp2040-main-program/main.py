@@ -10,19 +10,18 @@ from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST 
-
 # ==========================================
 # ★ 系统性能配置与时钟加固
 # ==========================================
 machine.freq(200000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 2.8
+Program_ver = 2.7
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
-DEBUG_MODE = False
+DEBUG_MODE = True
 ui_queue = [] 
 last_hw_update = 0  # 记录硬件栏上次刷新的时间
 last_rssi_str = "N/A" # 用于缓存从 JSON 传来的最新一趟车的 RSSI
