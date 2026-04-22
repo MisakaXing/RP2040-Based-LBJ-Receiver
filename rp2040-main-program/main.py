@@ -17,7 +17,7 @@ from boot_post import SystemPOST
 machine.freq(200000000) 
 time.sleep_ms(200) 
 
-Program_ver = 2.4
+Program_ver = 2.5
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -530,11 +530,6 @@ while True:
             gc.collect()
             time.sleep_ms(1)
 
-    # ⚠ 注意：你保留的这个5秒Ping，可能会由于 SD 卡极度阻塞造成瞬间漏车（如前文所述）
-    # 但根据你的要求“其他都不要动”，我将其帮你注释掉了。需要的话可以取消注释。
-    if sd_active and time.ticks_diff(now, last_sd_ping) > 5000:
-        ping_sd_hardware()
-        last_sd_ping = now
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
