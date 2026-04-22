@@ -16,13 +16,13 @@ from boot_post import SystemPOST
 # ==========================================
 machine.freq(200000000) 
 time.sleep_ms(200) 
-
-Program_ver = 2.6
+last_gc = 0
+Program_ver = 2.7
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
-
+DEBUG_MODE = False
 ui_queue = [] 
 last_hw_update = 0  # 记录硬件栏上次刷新的时间
 last_rssi_str = "N/A" # 用于缓存从 JSON 传来的最新一趟车的 RSSI
@@ -304,7 +304,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         sc = 2 if is_history else 3
         y_start = 55 if is_history else 35
         y_step = 40 if is_history else 50
-        
+        time.sleep_ms(3)
         tft.draw_gbk(LBL_TRAIN + full_train.encode(), 20, y_start, CYAN, bg_color, scale=sc)
         time.sleep_ms(1) 
         tft.draw_gbk(LBL_SPEED + speed.encode() + b' K/H', 20, y_start+y_step, YELLOW, bg_color, scale=sc)
@@ -312,6 +312,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         tft.draw_gbk(LBL_KM + km.encode() + b' K', 20, y_start+y_step*2, GREEN, bg_color, scale=sc)
         time.sleep_ms(1) 
     else:
+        time.sleep_ms(3)
         tft.draw_gbk(LBL_TRAIN + full_train.encode(), 5, 35+y_offset, CYAN, bg_color, scale=2)
         time.sleep_ms(1) 
         
@@ -441,13 +442,15 @@ def radio_core_task():
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
-    
     # ★ 完美的 Core 0 控制台打印输出，既不会丢字，又是标准 JSON 格式
-    try:
-        json_str = json.dumps(data) 
-        print(f"\n[LBJ Console] 接收到数据: {json_str}")
-    except:
-        print(f"\n[LBJ Console] 接收到数据: {data}")
+    if DEBUG_MODE:
+        try:
+            json_str = json.dumps(data) 
+            print(f"\n[LBJ Console] 接收到数据: {json_str}")
+        except:
+            print(f"\n[LBJ Console] 接收到数据: {data}")
+    else:
+        time.sleep_ms(60)
 
     try:
         msg_type = data.get("type")
@@ -518,7 +521,9 @@ heartbeat = False
 # ==========================================
 while True:
     now = time.ticks_ms()
-    
+    if time.ticks_diff(now, last_gc) > 100:   # 每 100ms 一次，平衡性能和清理力度
+        gc.collect()
+        last_gc = now
     # ==========================================
     # ★ 完美 FIFO 缓冲与视觉停留机制
     # ==========================================
@@ -528,7 +533,7 @@ while True:
         
         # 2. 如果身后还有积压的车次，强制停留 800ms，确保人眼能看清当前画面
         if len(ui_queue) > 0:
-            time.sleep_ms(800)
+            time.sleep_ms(1)
         
         # 3. 内存回收护航
         if gc.mem_free() < 20000:
@@ -700,3 +705,6 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
+
+
+

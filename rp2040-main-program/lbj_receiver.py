@@ -3,7 +3,8 @@ import time
 import rp2
 import json
 
-@rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_LEFT, autopush=True, push_thresh=8)
+# ★ 核心修复 1：将 push_thresh 改为 32，硬件 FIFO 深度扩大 4 倍，可缓冲高达 106ms 的电波！
+@rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_LEFT, autopush=True, push_thresh=32)
 def pocsag_rx():
     wait(0, gpio, 20)
     wait(1, gpio, 20)
@@ -31,7 +32,6 @@ class LBJReceiver:
         self.raw_queue = [] 
         self.last_sync_time = time.ticks_ms()
         
-        # ★ 新增：用于在同步瞬间锁定 RSSI，以及给 UI 静态读取的缓存变量
         self.current_rssi = "N/A"
         self.rssi_val = "N/A" 
         
@@ -230,7 +230,6 @@ class LBJReceiver:
                 merged = {
                     "type": "train_data_merged", 
                     "ric": msg["ric"],
-                    # ★ 确保合并包保留精准的 RSSI
                     "rssi": msg.get("rssi", "N/A"), 
                     "raw": self.pending_msg["raw"] + " | " + msg["raw"],
                     "basic": self.pending_msg["basic"] if p_type == "basic_only" else msg["basic"],
@@ -250,7 +249,6 @@ class LBJReceiver:
 
     def _flush_message(self):
         if self.numeric_output:
-            # ★ 核心修复：把被捕获的精准 RSSI 一并压入队列打包！
             self.raw_queue.append((self.current_address, self.numeric_output, self.current_rssi))
         self.numeric_output = ""
         self.current_address = ""
@@ -259,7 +257,6 @@ class LBJReceiver:
     def tick(self):
         now = time.ticks_ms()
         
-        # 1. 射频自愈看门狗
         if time.ticks_diff(now, self.last_sync_time) > 30000:
             self._w(0x01, 0x01) 
             time.sleep_ms(2)
@@ -269,24 +266,20 @@ class LBJReceiver:
             self.synced = False
             self.last_sync_time = now
 
+        # ★ 核心修复 2：按 32 位（4字节）批量拉取数据，大幅度降低 Python 的遍历负载
         while self.sm.rx_fifo() > 0:
-            byte = (self.sm.get() ^ 0xFF) & 0xFF 
-            for i in range(7, -1, -1):
-                bit = (byte >> i) & 1
+            word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF 
+            # 一次性处理 32 个 bit，即便循环中途被中断，FIFO 也是安全的
+            for i in range(31, -1, -1):
+                bit = (word >> i) & 1
                 if not self.synced:
                     self.sync_window = ((self.sync_window << 1) | bit) & 0xFFFFFFFF
                     if self.sync_window == self.POCSAG_SYNC:
                         self.synced = True
                         self.bit_count = self.current_cw = 0
                         self.last_sync_time = time.ticks_ms() 
-                        
-                        # ========================================================
-                        # ★ 终极瞬态捕获：收到同步码（Preamble结束）的瞬间立刻抓取信号！
-                        # 此时发射机 PA 全开，AGC 稳定，衰落极小，是最真实无暇的信号强度。
-                        # ========================================================
                         self.current_rssi = self.get_rssi()
-                        self.rssi_val = self.current_rssi # 给 main.py 的后台底栏供电
-                        
+                        self.rssi_val = self.current_rssi 
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1
@@ -321,20 +314,18 @@ class LBJReceiver:
                                                 self.numeric_output += self.BCD_MAP[nibble_rev]
                         self.bit_count = self.current_cw = 0
 
-        # ★ 修改解包处，将 pkt_rssi 也取出来
-        if len(self.raw_queue) > 0 and self.sm.rx_fifo() == 0:
+        # ★ 核心修复 3：解绑了与 self.sm.rx_fifo() == 0 的强依赖，因为硬件缓存已经足够深，有数据直接解析，再也不怕拥堵
+        if len(self.raw_queue) > 0:
             addr, raw, pkt_rssi = self.raw_queue.pop(0)
             try:
                 parsed = self._parse_train_data(raw)
                 if parsed.get("type") != "empty":
                     parsed["ric"] = addr
-                    # ★ 直接把同步瞬间抓到的巅峰 RSSI 合并进 JSON 字典里
                     parsed["rssi"] = pkt_rssi 
                     self._handle_parsed_msg(parsed)
             except Exception as e:
                 self._emit({"type": "error", "ric": addr, "raw": raw, "error": str(e)})
 
-        # 2. 尾巴报文合并超时触发
         if time.ticks_diff(now, self.last_timeout_check) > 100:
             if self.pending_msg and time.ticks_diff(now, self.pending_time) > 2000:
                 self._emit(self.pending_msg)
