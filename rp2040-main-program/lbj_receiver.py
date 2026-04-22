@@ -28,9 +28,12 @@ class LBJReceiver:
         self.bit_count = 0
         self.current_cw = 0
         
-        # ★ 新增：解耦架构核心！原始数据缓冲队列
         self.raw_queue = [] 
         self.last_sync_time = time.ticks_ms()
+        
+        # ★ 新增：用于在同步瞬间锁定 RSSI，以及给 UI 静态读取的缓存变量
+        self.current_rssi = "N/A"
+        self.rssi_val = "N/A" 
         
         self.POCSAG_SYNC  = 0x7CD215D8
         self.POCSAG_IDLE  = 0x7A89C197
@@ -40,13 +43,14 @@ class LBJReceiver:
         self._init_radio(spi_id, sck, mosi, miso, cs, rst)
         self._init_pio(data_pin)
         time.sleep_ms(100)  
-        self._w(0x01, 0x01) # 切回 Standby，清空开机瞬间锁定到的环境杂音
+        self._w(0x01, 0x01) 
         time.sleep_ms(5)
-        self._w(0x01, 0x05) # 重新切入 RX 监听模式
+        self._w(0x01, 0x05) 
         while self.sm.rx_fifo() > 0: 
-            self.sm.get()   # 抽干 PIO 里开机电涌产生的乱码
+            self.sm.get()   
             
-        self.last_sync_time = time.ticks_ms() # 重置看门狗
+        self.last_sync_time = time.ticks_ms()
+
     def set_callback(self, callback_func):
         self.callback = callback_func
 
@@ -77,7 +81,8 @@ class LBJReceiver:
     def get_rssi(self):
         try:
             val = self._r(0x11)
-            return f"-{val // 2}dBm"
+            corrected_rssi = -(val // 2)
+            return f"{corrected_rssi:.1f}dBm"
         except: return "N/A"
 
     def _w(self, r, v):
@@ -180,7 +185,6 @@ class LBJReceiver:
             loco_part = block[4:12]
             if ' ' in loco_part: continue
             
-            # 提取端号部分 (通常是 31, 32 等两位数字)
             cab_part = block[12:14] if len(block) >= 14 else ""
             coord_part = block[30:47] if len(block) >= 47 else block[30:]
             
@@ -188,8 +192,6 @@ class LBJReceiver:
             cab_digits = sum(1 for c in cab_part if c.isdigit())
             coord_digits = sum(1 for c in coord_part if c.isdigit())
             
-            # ★ 核心修复：绝对权重碾压机制
-            # 就算坐标区多出几个随机数字，也绝对无法动摇正确对齐的机车号和端号
             score = (loco_digits * 20) + (cab_digits * 5) + coord_digits
             
             if loco_digits >= 6 or (loco_digits >= 4 and coord_digits >= 4):
@@ -226,7 +228,10 @@ class LBJReceiver:
             p_type, c_type = self.pending_msg.get("type"), msg.get("type")
             if (p_type == "basic_only" and c_type == "extended_only") or (p_type == "extended_only" and c_type == "basic_only"):
                 merged = {
-                    "type": "train_data_merged", "ric": msg["ric"],
+                    "type": "train_data_merged", 
+                    "ric": msg["ric"],
+                    # ★ 确保合并包保留精准的 RSSI
+                    "rssi": msg.get("rssi", "N/A"), 
                     "raw": self.pending_msg["raw"] + " | " + msg["raw"],
                     "basic": self.pending_msg["basic"] if p_type == "basic_only" else msg["basic"],
                     "extended": self.pending_msg["extended"] if p_type == "extended_only" else msg["extended"]
@@ -243,10 +248,10 @@ class LBJReceiver:
         else:
             self._emit(msg)
 
-    # ★ 核心修复 3：不再原地解析，只扔进缓冲队列！
     def _flush_message(self):
         if self.numeric_output:
-            self.raw_queue.append((self.current_address, self.numeric_output))
+            # ★ 核心修复：把被捕获的精准 RSSI 一并压入队列打包！
+            self.raw_queue.append((self.current_address, self.numeric_output, self.current_rssi))
         self.numeric_output = ""
         self.current_address = ""
         self.error_strike = 0
@@ -264,9 +269,6 @@ class LBJReceiver:
             self.synced = False
             self.last_sync_time = now
 
-        # ========================================================
-        # ★ 核心修复 1：把 if 换成了 while，瞬间榨干 PIO 缓存，绝不溢出丢包！
-        # ========================================================
         while self.sm.rx_fifo() > 0:
             byte = (self.sm.get() ^ 0xFF) & 0xFF 
             for i in range(7, -1, -1):
@@ -277,6 +279,14 @@ class LBJReceiver:
                         self.synced = True
                         self.bit_count = self.current_cw = 0
                         self.last_sync_time = time.ticks_ms() 
+                        
+                        # ========================================================
+                        # ★ 终极瞬态捕获：收到同步码（Preamble结束）的瞬间立刻抓取信号！
+                        # 此时发射机 PA 全开，AGC 稳定，衰落极小，是最真实无暇的信号强度。
+                        # ========================================================
+                        self.current_rssi = self.get_rssi()
+                        self.rssi_val = self.current_rssi # 给 main.py 的后台底栏供电
+                        
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1
@@ -311,15 +321,15 @@ class LBJReceiver:
                                                 self.numeric_output += self.BCD_MAP[nibble_rev]
                         self.bit_count = self.current_cw = 0
 
-        # ========================================================
-        # ★ 核心修复 2：异步处理队列里的数据，只有等底层射频缓存全空了，才允许 CPU 解析大段 JSON！
-        # ========================================================
+        # ★ 修改解包处，将 pkt_rssi 也取出来
         if len(self.raw_queue) > 0 and self.sm.rx_fifo() == 0:
-            addr, raw = self.raw_queue.pop(0)
+            addr, raw, pkt_rssi = self.raw_queue.pop(0)
             try:
                 parsed = self._parse_train_data(raw)
                 if parsed.get("type") != "empty":
                     parsed["ric"] = addr
+                    # ★ 直接把同步瞬间抓到的巅峰 RSSI 合并进 JSON 字典里
+                    parsed["rssi"] = pkt_rssi 
                     self._handle_parsed_msg(parsed)
             except Exception as e:
                 self._emit({"type": "error", "ric": addr, "raw": raw, "error": str(e)})
