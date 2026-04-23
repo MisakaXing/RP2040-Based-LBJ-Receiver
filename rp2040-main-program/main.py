@@ -709,7 +709,7 @@ while True:
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
                 # ★ 局部刷新
                 save_config(); draw_menu_item(7, True)
-                time.sleep(10)
+                time.sleep_ms(10)
                 
         elif system_state == "SET_DATE":
             edit_step += 1
