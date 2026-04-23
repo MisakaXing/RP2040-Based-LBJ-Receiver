@@ -10,21 +10,24 @@ from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST 
+
 # ==========================================
 # ★ 系统性能配置与时钟加固
 # ==========================================
+pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(200000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 2.7
+Program_ver = 2.8
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
-DEBUG_MODE = True
+DEBUG_MODE = False
 ui_queue = [] 
 last_hw_update = 0  # 记录硬件栏上次刷新的时间
 last_rssi_str = "N/A" # 用于缓存从 JSON 传来的最新一趟车的 RSSI
+screen_is_on = True # 息屏状态标志
 
 # ==========================================
 # 1. 硬件 IO 初始化 
@@ -71,8 +74,13 @@ CONFIG_FILE = "config.json"
 system_state = "DASHBOARD" 
 has_received = False
 menu_index = 0
-menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", "EXIT"]
+
+cfg_scr_idx = 3 # 默认 3 (never)
+SCR_OFF_OPTS = ["30s", "1min", "5min", "never"]
+SCR_OFF_MS = [30000, 60000, 300000, -1]
 cfg_buzzer = True
+
+menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"]
 
 hist_ptr = -1
 total_count = 0
@@ -121,17 +129,19 @@ def get_battery_info():
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
 
 def load_config():
-    global cfg_buzzer, menu_items
+    global cfg_buzzer, cfg_scr_idx, menu_items
     try:
         with open(CONFIG_FILE, 'r') as f:
             config = json.loads(f.read())
             cfg_buzzer = config.get("buzzer", True) 
+            cfg_scr_idx = config.get("scr_idx", 3)
             menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
+            menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
     except: pass 
 
 def save_config():
     try:
-        with open(CONFIG_FILE, 'w') as f: f.write(json.dumps({"buzzer": cfg_buzzer}))
+        with open(CONFIG_FILE, 'w') as f: f.write(json.dumps({"buzzer": cfg_buzzer, "scr_idx": cfg_scr_idx}))
     except: pass
 
 def init_history():
@@ -367,26 +377,41 @@ def draw_menu_item(i, is_selected):
     tft.fill_rect(40, 60 + i*16, 240, 16, 0x2104)
     tft.draw_gbk(prefix + menu_items[i].encode(), 40, 60 + i*16, color, 0x2104)
 
-def draw_set_date():
-    safe_fill_rect(0, 26, 320, 164, 0x2104)
-    tft.draw_gbk(b'--- SET DATE ---', 95, 40, CYAN, 0x2104)
+# ★ 局部刷新逻辑：full=False 时仅擦除并重绘数字部分
+def draw_set_date(full=True):
+    if full:
+        safe_fill_rect(0, 26, 320, 164, 0x2104)
+        tft.draw_gbk(b'--- SET DATE ---', 95, 40, CYAN, 0x2104)
+        tft.draw_gbk(b'-', 134, 90, WHITE, 0x2104, scale=2)
+        tft.draw_gbk(b'-', 182, 90, WHITE, 0x2104, scale=2)
+        tft.draw_gbk(b'[UP/DOWN]\xb5\xf7\xd5\xfb  [OK]\xc8\xb7\xc8\xcf', 20, 155, GRAY, 0x2104, scale=1)
+        time.sleep_ms(1)
+        
     cols = [YELLOW if edit_step == i else WHITE for i in range(3)]
+    
+    # 局部擦除底色
+    tft.fill_rect(70, 90, 64, 32, 0x2104)
+    tft.fill_rect(150, 90, 32, 32, 0x2104)
+    tft.fill_rect(198, 90, 32, 32, 0x2104)
+    
     tft.draw_gbk(f"20{edit_y:02}".encode(), 70, 90, cols[0], 0x2104, scale=2)
-    tft.draw_gbk(b'-', 134, 90, WHITE, 0x2104, scale=2)
     tft.draw_gbk(f"{edit_m:02}".encode(), 150, 90, cols[1], 0x2104, scale=2)
-    tft.draw_gbk(b'-', 182, 90, WHITE, 0x2104, scale=2)
     tft.draw_gbk(f"{edit_d:02}".encode(), 198, 90, cols[2], 0x2104, scale=2)
-    tft.draw_gbk(b'[UP/DOWN]\xb5\xf7\xd5\xfb  [OK]\xc8\xb7\xc8\xcf', 20, 155, GRAY, 0x2104, scale=1)
     time.sleep_ms(1)
 
-def draw_jump_id():
-    safe_fill_rect(0, 26, 320, 164, 0x2104)
-    tft.draw_gbk(b'--- JUMP TO ID ---', 85, 40, CYAN, 0x2104)
-    tft.draw_gbk(b'RANGE: 0001 -', 60, 75, GRAY, 0x2104)
-    tft.draw_gbk(str(total_count).encode(), 170, 75, GREEN, 0x2104)
-    time.sleep_ms(1)
+# ★ 局部刷新逻辑：full=False 时仅擦除并重绘数字部分
+def draw_jump_id(full=True):
+    if full:
+        safe_fill_rect(0, 26, 320, 164, 0x2104)
+        tft.draw_gbk(b'--- JUMP TO ID ---', 85, 40, CYAN, 0x2104)
+        tft.draw_gbk(b'RANGE: 0001 -', 60, 75, GRAY, 0x2104)
+        tft.draw_gbk(str(total_count).encode(), 170, 75, GREEN, 0x2104)
+        time.sleep_ms(1)
+        
     for i in range(4):
         color = YELLOW if edit_step == i else WHITE
+        # 局部擦除单个字符的矩形区域
+        tft.fill_rect(110 + i*25, 110, 16, 32, 0x2104)
         tft.draw_gbk(str(edit_id[i]).encode(), 110 + i*25, 110, color, 0x2104, scale=2)
         time.sleep_ms(1) 
 
@@ -441,8 +466,8 @@ def radio_core_task():
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
+    global screen_is_on, last_interaction
     json_str = json.dumps(data)
-    # ★ 完美的 Core 0 控制台打印输出，既不会丢字，又是标准 JSON 格式
     if DEBUG_MODE:
         try:
             json_str = json.dumps(data) 
@@ -465,6 +490,12 @@ def process_ui_data(data):
                     update_top_bar()
         elif "train_data" in msg_type or "only" in msg_type:
             beep(0.05); has_received = True
+            
+            # 来信号自动唤醒屏幕
+            if not screen_is_on:
+                pin_bl.value(0)
+                screen_is_on = True
+            last_interaction = time.ticks_ms()
             
             if "rssi" in data:
                 last_rssi_str = str(data["rssi"])
@@ -509,7 +540,7 @@ if boot_status == "RTC_SYNC":
         raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
         edit_d, edit_m, edit_y = [(r >> 4) * 10 + (r & 0x0F) for r in raw_d]
     except: pass
-    draw_ui_skeleton(); draw_set_date()    
+    draw_ui_skeleton(); draw_set_date(full=True)    
 else:
     draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
@@ -521,21 +552,21 @@ heartbeat = False
 # ==========================================
 while True:
     now = time.ticks_ms()
-    if time.ticks_diff(now, last_gc) > 100:   # 每 100ms 一次，平衡性能和清理力度
+    
+    # 自动息屏检测逻辑
+    if screen_is_on and cfg_scr_idx != 3: 
+        if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
+            pin_bl.value(1) 
+            screen_is_on = False
+            
+    if time.ticks_diff(now, last_gc) > 100:   
         gc.collect()
         last_gc = now
-    # ==========================================
-    # ★ 完美 FIFO 缓冲与视觉停留机制
-    # ==========================================
+
     if len(ui_queue) > 0:
-        # 1. 严格逐个处理，抛弃了之前的“丢帧”逻辑
         process_ui_data(ui_queue.pop(0))
-        
-        # 2. 如果身后还有积压的车次，强制停留 800ms，确保人眼能看清当前画面
         if len(ui_queue) > 0:
             time.sleep_ms(1)
-        
-        # 3. 内存回收护航
         if gc.mem_free() < 20000:
             time.sleep_ms(1)
             gc.collect()
@@ -570,6 +601,16 @@ while True:
     # ==========================================
     # ★ 按钮交互逻辑
     # ==========================================
+    # 息屏唤醒拦截
+    any_btn = not btn_menu.value() or not btn_up.value() or not btn_down.value() or not btn_ok.value()
+    if any_btn:
+        last_interaction = now
+        if not screen_is_on:
+            pin_bl.value(0) 
+            screen_is_on = True
+            time.sleep_ms(300) 
+            continue 
+            
     if not btn_menu.value():
         last_interaction = now; beep()
         if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID"]:
@@ -580,7 +621,7 @@ while True:
             else: draw_idle_screen()
         time.sleep_ms(60)
             
-    if not btn_up.value():
+    if not btn_down.value():
         last_interaction = now; beep()
         if system_state == "DASHBOARD" and total_count > 0:
             system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
@@ -594,12 +635,12 @@ while True:
             if edit_step == 0: edit_y = (edit_y+1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
             elif edit_step == 1: edit_m = edit_m%12+1; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
             else: edit_d = (edit_d%get_max_days(edit_y, edit_m))+1
-            draw_set_date()
+            draw_set_date(full=False)
         elif system_state == "JUMP_ID":
-            edit_id[edit_step] = (edit_id[edit_step]+1)%10; draw_jump_id()
+            edit_id[edit_step] = (edit_id[edit_step]+1)%10; draw_jump_id(full=False)
         time.sleep_ms(40)
 
-    if not btn_down.value():
+    if not btn_up.value():
         last_interaction = now; beep()
         if system_state == "DASHBOARD" and total_count > 0:
             system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
@@ -613,9 +654,9 @@ while True:
             if edit_step == 0: edit_y = (edit_y-1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
             elif edit_step == 1: edit_m = edit_m-1 if edit_m>1 else 12; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
             else: edit_d = edit_d-1 if edit_d>1 else get_max_days(edit_y, edit_m)
-            draw_set_date()
+            draw_set_date(full=False)
         elif system_state == "JUMP_ID":
-            edit_id[edit_step] = (edit_id[edit_step]-1)%10; draw_jump_id()
+            edit_id[edit_step] = (edit_id[edit_step]-1)%10; draw_jump_id(full=False)
         time.sleep_ms(40)
 
     if not btn_ok.value():
@@ -628,15 +669,17 @@ while True:
         elif system_state == "MENU":
             if menu_index == 0: 
                 cfg_buzzer = not cfg_buzzer; menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
-                save_config(); draw_menu(full=True)
+                # ★ 局部刷新
+                save_config(); draw_menu_item(0, True)
+                time.sleep_ms(10)
             elif menu_index == 1: 
                 try:
                     raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
                     edit_d, edit_m, edit_y = [(r >> 4) * 10 + (r & 0x0F) for r in raw_d]
                 except: pass
-                edit_step = 0; system_state = "SET_DATE"; draw_set_date()
+                edit_step = 0; system_state = "SET_DATE"; draw_set_date(full=True)
             elif menu_index == 2: 
-                edit_step = 0; edit_id = [0,0,0,0]; system_state = "JUMP_ID"; draw_jump_id()
+                edit_step = 0; edit_id = [0,0,0,0]; system_state = "JUMP_ID"; draw_jump_id(full=True)
             elif menu_index == 3: 
                 system_state = "CONFIRM_FORMAT"; draw_confirm_format()
             elif menu_index == 4: 
@@ -654,7 +697,7 @@ while True:
                     check_sd_startup() 
                     if sd_active: draw_popup(b'MOUNT OK!', color=GREEN)
                     else: draw_popup(b'MOUNT FAIL!', color=RED)
-                    time.sleep(1)
+                    time.sleep_ms(1)
                 
                 system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
                 if has_received: display_train_data(last_basic, last_ext, last_is_full)
@@ -662,15 +705,17 @@ while True:
             
             elif menu_index == 6: system_state = "ABOUT"; draw_about()
             elif menu_index == 7: 
-                system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
-                if has_received: display_train_data(last_basic, last_ext, last_is_full)
-                else: draw_idle_screen()
+                cfg_scr_idx = (cfg_scr_idx + 1) % 4
+                menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
+                # ★ 局部刷新
+                save_config(); draw_menu_item(7, True)
+                time.sleep(10)
                 
         elif system_state == "SET_DATE":
             edit_step += 1
             if edit_step > 2: 
                 rtc.set_date(edit_y, edit_m, edit_d); system_state = "MENU"; draw_menu(full=True) 
-            else: draw_set_date()
+            else: draw_set_date(full=False)
                 
         elif system_state == "JUMP_ID":
             edit_step += 1
@@ -679,8 +724,8 @@ while True:
                 if 0 <= target_id < total_count:
                     system_state = "HISTORY"; hist_ptr = target_id; entry = load_history_entry(hist_ptr)
                     display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                else: draw_popup(b'INDEX ERROR!'); time.sleep(1); draw_jump_id(); edit_step = 0
-            else: draw_jump_id()
+                else: draw_popup(b'INDEX ERROR!'); time.sleep(1); draw_jump_id(full=True); edit_step = 0
+            else: draw_jump_id(full=False)
             
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN); open(HIST_FILE, 'w').close()
@@ -705,6 +750,3 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
-
-
-

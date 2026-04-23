@@ -84,9 +84,15 @@ class PicoUpdaterApp(ctk.CTk):
         self.progress_bar.pack(fill="x", padx=40, pady=5)
         self.progress_bar.set(0)
 
-        # 动作按钮
-        self.action_btn = ctk.CTkButton(self, text="检查更新并同步", font=ctk.CTkFont(size=16, weight="bold"), height=40, command=self.start_update_process)
-        self.action_btn.pack(pady=(10, 20), padx=40, fill="x")
+        # ★ 动作按钮区域 (将常规更新和强制更新并排)
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.pack(pady=(10, 20), padx=40, fill="x")
+
+        self.action_btn = ctk.CTkButton(self.btn_frame, text="检查更新并同步", font=ctk.CTkFont(size=16, weight="bold"), height=40, command=lambda: self.start_update_process(force=False))
+        self.action_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.force_action_btn = ctk.CTkButton(self.btn_frame, text="强制重新刷入", fg_color="#b91c1c", hover_color="#7f1d1d", font=ctk.CTkFont(size=16, weight="bold"), height=40, command=lambda: self.start_update_process(force=True))
+        self.force_action_btn.pack(side="right", fill="x", expand=True, padx=(5, 0))
 
     def log(self, text):
         self.after(0, self._append_log, text)
@@ -101,6 +107,7 @@ class PicoUpdaterApp(ctk.CTk):
         self.is_working = working
         state = "disabled" if working else "normal"
         self.action_btn.configure(state=state, text="正在处理中..." if working else "检查更新并同步")
+        self.force_action_btn.configure(state=state, text="正在处理中..." if working else "强制重新刷入")
         self.refresh_btn.configure(state=state)
         self.port_menu.configure(state=state)
 
@@ -161,19 +168,28 @@ class PicoUpdaterApp(ctk.CTk):
                 pass
         return 0.0
     
-    def start_update_process(self):
+    # ★ 新增 force 参数
+    def start_update_process(self, force=False):
         port = self.port_var.get()
         if not port or port == "未检测到设备" or port == "请选择端口...":
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
             return
             
-        confirm = messagebox.askyesno(
-            "⚠️ 严重警告",
-            "执行同步更新将会彻底清空 Pico 中的旧文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续执行更新吗？",
-            icon="warning"
-        )
+        if force:
+            confirm = messagebox.askyesno(
+                "⚡ 强制刷入警告",
+                "您选择了强制刷入！\n\n这将无视版本是否最新，强行格式化 Pico 并重新拉取所有文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续吗？",
+                icon="warning"
+            )
+        else:
+            confirm = messagebox.askyesno(
+                "⚠️ 严重警告",
+                "执行同步更新将会彻底清空 Pico 中的旧文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续执行更新吗？",
+                icon="warning"
+            )
+            
         if not confirm:
-            self.log("用户已取消更新操作。")
+            self.log("用户已取消操作。")
             return
 
         if self.is_working: return
@@ -183,9 +199,10 @@ class PicoUpdaterApp(ctk.CTk):
         self.log_textbox.configure(state="disabled")
         self.progress_bar.set(0)
         
-        threading.Thread(target=self._update_worker, args=(port,), daemon=True).start()
+        threading.Thread(target=self._update_worker, args=(port, force), daemon=True).start()
 
-    def _update_worker(self, port):
+    # ★ 核心逻辑增加 force 参数判断
+    def _update_worker(self, port, force):
         try:
             # ================= 0. 连通性预检 =================
             self.log(f"正在测试 Pico ({port}) 连接状态...")
@@ -205,7 +222,6 @@ class PicoUpdaterApp(ctk.CTk):
             resp = requests.get(self.main_py_url, timeout=10)
             if resp.status_code == 200:
                 self.remote_version = self.extract_version(resp.text)
-                # ★ 闭包修复：绑定版本号
                 self.after(0, lambda rv=self.remote_version: self.remote_ver_label.configure(text=f"远程版本: {rv}"))
                 self.log(f"成功获取远程版本: {self.remote_version}")
             else:
@@ -225,17 +241,18 @@ class PicoUpdaterApp(ctk.CTk):
             self.after(0, lambda lv=self.local_version: self.local_ver_label.configure(text=f"本地版本: {lv}"))
             self.after(0, self.progress_bar.set, 0.3)
 
-            # ================= 3. 比较版本 =================
-            if self.local_version >= self.remote_version and self.local_version != 0.0:
-                self.log("\n✅ 当前已是最新版本，无需更新！")
-                self.after(0, self.progress_bar.set, 1.0)
-                return
-
-            self.log("\n⚠️ 准备开始执行更新操作...")
+            # ================= 3. 比较版本 (若强制更新则跳过判断) =================
+            if not force:
+                if self.local_version >= self.remote_version and self.local_version != 0.0:
+                    self.log("\n✅ 当前已是最新版本，无需更新！")
+                    self.after(0, self.progress_bar.set, 1.0)
+                    return
+                self.log("\n⚠️ 准备开始执行更新操作...")
+            else:
+                self.log("\n⚡ 用户已选择强制刷入，跳过版本校验拦截...")
 
             # ================= 4. 获取文件列表 =================
             self.log("正在解析远程仓库文件列表...")
-            # 如果遇到 403 报错，可以在这里加上 Headers (Token)
             api_resp = requests.get(self.api_url, timeout=10)
             if api_resp.status_code != 200:
                 self.log(f"获取目录失败: HTTP {api_resp.status_code}")
@@ -276,7 +293,6 @@ class PicoUpdaterApp(ctk.CTk):
                     success, output = self.run_mpremote(port, ["fs", "cp", local_path, f":{file_name}"])
                     if not success:
                         self.log(f"\n❌ 写入 {file_name} 失败: {output}")
-                        # ★ 闭包修复：绑定文件名
                         self.after(0, lambda fn=file_name: messagebox.showerror("写入失败", f"写入文件 {fn} 时发生错误！"))
                         return
                     
@@ -287,12 +303,13 @@ class PicoUpdaterApp(ctk.CTk):
             self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
             
             self.after(0, self.progress_bar.set, 1.0)
-            self.log("\n🎉 更新完成！Pico 已加载最新程序。")
-            self.after(0, lambda: messagebox.showinfo("完成", "更新操作已成功完成！"))
+            msg_title = "强制刷入完成" if force else "完成"
+            self.log(f"\n🎉 {msg_title}！Pico 已加载最新程序。")
+            self.after(0, lambda mt=msg_title: messagebox.showinfo(mt, f"{mt} 操作已成功完成！"))
             
         except Exception as e:
             error_text = str(e)
-            self.log(f"\n❌ 更新过程中发生严重错误: {error_text}")
+            self.log(f"\n❌ 处理过程中发生严重错误: {error_text}")
             self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
             
         finally:
