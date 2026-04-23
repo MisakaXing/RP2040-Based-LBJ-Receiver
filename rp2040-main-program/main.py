@@ -671,7 +671,7 @@ while True:
                 cfg_buzzer = not cfg_buzzer; menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
                 # ★ 局部刷新
                 save_config(); draw_menu_item(0, True)
-                time.sleep_ms(10)
+                time.sleep_ms(100)
             elif menu_index == 1: 
                 try:
                     raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
@@ -709,7 +709,7 @@ while True:
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
                 # ★ 局部刷新
                 save_config(); draw_menu_item(7, True)
-                time.sleep_ms(10)
+                time.sleep_ms(100)
                 
         elif system_state == "SET_DATE":
             edit_step += 1
