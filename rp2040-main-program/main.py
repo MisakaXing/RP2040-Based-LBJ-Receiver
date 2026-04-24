@@ -5,7 +5,7 @@ import os
 import gc
 import sdcard
 import _thread  
-import array  # ★ 必须导入，用于内存优化
+import array  
 from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
@@ -16,7 +16,7 @@ from boot_post import SystemPOST
 # ★ 系统性能配置与时钟加固
 # ==========================================
 pin_bl = Pin(6, Pin.OUT, value=0)
-machine.freq(240000000) 
+machine.freq(240000000) #超频
 time.sleep_ms(200) 
 last_gc = 0
 Program_ver = 3.0
@@ -27,7 +27,7 @@ BAT_OFFSET = 0.174
 DEBUG_MODE = False
 
 ui_queue = [] 
-ui_lock = _thread.allocate_lock() # ★ 多线程互斥锁，防止双核抢队列导致崩溃
+ui_lock = _thread.allocate_lock() 
 
 last_hw_update = 0  
 last_rssi_str = "N/A" 
@@ -39,7 +39,7 @@ screen_is_on = True
 tft_cs = Pin(9, Pin.OUT, value=1) 
 spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
 tft = ILI9341(spi1, cs=9, dc=12, rst=13)
-spi1.init(baudrate=60000000) 
+spi1.init(baudrate=80000000) # 80MHz SPI 极限速度
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
@@ -89,7 +89,6 @@ menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD
 hist_ptr = -1
 total_count = 0
 
-# ★ 恢复内存优化：使用连续内存数组
 history_offsets = array.array('I') 
 last_interaction = time.ticks_ms()
 
@@ -113,10 +112,8 @@ current_status_color = GREEN
 last_basic, last_ext = {}, {}
 last_is_full = True
 
-# ★ 全局标记：判断是否刚处理完一趟车，需要打扫卫生
 need_post_train_gc = False 
-
-LBL_TRAIN, LBL_SPEED, LBL_ROUTE, LBL_KM, LBL_LOCO = b'\xb3\xb5:', b'\xcb\xd9:', b'\xcf\xdf:', b'\xb1\xea:', b'\xbb\xfa:'
+last_screen_layout = None
 
 # ==========================================
 # 3. 核心功能函数
@@ -211,7 +208,7 @@ def check_sd_startup():
         sd_active = False; sd_obj = None; current_sd_status = "SD NO INSERT"
     finally:
         menu_items[5] = "EJECT SD" if sd_active else "MOUNT SD"
-        spi1.init(baudrate=60000000)
+        spi1.init(baudrate=80000000)
 
 def disable_sd_forever(reason):
     global sd_active, current_sd_status, sd_obj, menu_items, last_sd_err_time
@@ -240,12 +237,14 @@ def log_to_sd(data):
     except:
         disable_sd_forever("SD WRITE ERR")
     finally:
-        spi1.init(baudrate=60000000)
+        spi1.init(baudrate=80000000)
 
 # ==========================================
-# ★ 4. UI 绘制函数
+# ★ 4. UI 绘制函数 (白色标签定点刷新版)
 # ==========================================
 def draw_ui_skeleton():
+    global last_screen_layout
+    last_screen_layout = None 
     safe_fill_rect(0, 0, 320, 240, BLACK) 
     tft.fill_rect(0, 190, 320, 1, GRAY)
     tft.draw_gbk(b"BAT:", 5, 218, GRAY, BLACK)
@@ -275,9 +274,7 @@ def update_top_bar():
 def draw_hardware_bar(force=False):
     global last_hw_update, last_rssi_str
     now = time.ticks_ms()
-    
-    if not force and time.ticks_diff(now, last_hw_update) < 30000:
-        return
+    if not force and time.ticks_diff(now, last_hw_update) < 30000: return
     
     v, p = get_battery_info()
     r = last_rssi_str
@@ -299,18 +296,27 @@ def draw_hardware_bar(force=False):
     time.sleep_ms(1)
 
 def draw_idle_screen():
+    global last_screen_layout
+    last_screen_layout = None 
     safe_fill_rect(0, 26, 320, 164, BLACK) 
     tft.draw_gbk(b'WAITING FOR SIGNAL', 15, 95, GRAY, BLACK, scale=2)
     time.sleep_ms(1) 
 
 def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_time="", hist_idx=0):
+    global last_screen_layout
+    
+    current_layout = f"{'HIST' if is_history else 'DASH'}_{'FULL' if is_full_mode else 'BASIC'}"
     bg_color = 0x1082 if is_history else BLACK 
-    safe_fill_rect(0, 26, 320, 164, bg_color) 
+    is_partial = (last_screen_layout == current_layout)
+
+    if not is_partial:
+        safe_fill_rect(0, 26, 320, 164, bg_color)
 
     if is_history:
+        if is_partial: tft.fill_rect(0, 30, 320, 16, bg_color) 
         header = f"HISTORY [{hist_idx+1}/{total_count}]  {hist_time}"
         tft.draw_gbk(header.encode(), 5, 30, YELLOW, bg_color, scale=1)
-        time.sleep_ms(1) 
+        if not is_partial: time.sleep_ms(1)
         y_offset = 20
     else: y_offset = 0
 
@@ -325,51 +331,73 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         sc = 2 if is_history else 3
         y_start = 55 if is_history else 35
         y_step = 40 if is_history else 50
-        time.sleep_ms(3)
-        tft.draw_gbk(LBL_TRAIN + full_train.encode(), 20, y_start, CYAN, bg_color, scale=sc)
-        time.sleep_ms(1) 
-        tft.draw_gbk(LBL_SPEED + speed.encode() + b' K/H', 20, y_start+y_step, YELLOW, bg_color, scale=sc)
-        time.sleep_ms(1) 
-        tft.draw_gbk(LBL_KM + km.encode() + b' K', 20, y_start+y_step*2, GREEN, bg_color, scale=sc)
-        time.sleep_ms(1) 
+        lbl_w = 48 if sc == 2 else 72  
+        h = 16 * sc
+        
+        if not is_partial:
+            # 标签改为全白 (WHITE)
+            tft.draw_gbk(b'\xb3\xb5:', 20, y_start, WHITE, bg_color, scale=sc) 
+            tft.draw_gbk(b'\xcb\xd9:', 20, y_start+y_step, WHITE, bg_color, scale=sc) 
+            tft.draw_gbk(b'\xb1\xea:', 20, y_start+y_step*2, WHITE, bg_color, scale=sc) 
+        else:
+            tft.fill_rect(20+lbl_w, y_start, 300-lbl_w, h, bg_color)
+            tft.fill_rect(20+lbl_w, y_start+y_step, 300-lbl_w, h, bg_color)
+            tft.fill_rect(20+lbl_w, y_start+y_step*2, 300-lbl_w, h, bg_color)
+
+        tft.draw_gbk(full_train.encode(), 20+lbl_w, y_start, CYAN, bg_color, scale=sc)
+        tft.draw_gbk(speed.encode() + b' K/H', 20+lbl_w, y_start+y_step, YELLOW, bg_color, scale=sc)
+        tft.draw_gbk(km.encode() + b' K', 20+lbl_w, y_start+y_step*2, GREEN, bg_color, scale=sc)
+
     else:
-        time.sleep_ms(3)
-        tft.draw_gbk(LBL_TRAIN + full_train.encode(), 5, 35+y_offset, CYAN, bg_color, scale=2)
-        time.sleep_ms(1) 
-        
-        tft.draw_gbk(LBL_SPEED + speed.encode() + b'K', 170, 35+y_offset, YELLOW, bg_color, scale=2)
-        time.sleep_ms(1) 
-        
+        y1 = 35 + y_offset
+        y2 = 80 + y_offset
+        y3 = 125 + y_offset
+
+        if not is_partial:
+            # 标签改为全白 (WHITE)
+            tft.draw_gbk(b'\xb3\xb5:', 5, y1, WHITE, bg_color, scale=2)   
+            tft.draw_gbk(b'\xcb\xd9:', 170, y1, WHITE, bg_color, scale=2) 
+            tft.draw_gbk(b'\xcf\xdf:', 5, y2, WHITE, bg_color, scale=2)   
+            tft.draw_gbk(b'\xbb\xfa:', 5, y3, WHITE, bg_color, scale=2)   
+        else:
+            tft.fill_rect(53, y1, 115, 32, bg_color) 
+            tft.fill_rect(218, y1, 102, 32, bg_color) 
+            tft.fill_rect(53, y2, 127, 32, bg_color) 
+            tft.fill_rect(180, y2, 140, 32, bg_color) 
+            tft.fill_rect(53, y3, 267, 32, bg_color) 
+
+        tft.draw_gbk(full_train.encode(), 53, y1, CYAN, bg_color, scale=2)
+        tft.draw_gbk(speed.encode() + b'K', 218, y1, YELLOW, bg_color, scale=2)
+
         route_hex = ext.get('route_hex', '')
         route_b = bytes.fromhex(route_hex)[:8] if route_hex else b'----'
-        tft.draw_gbk(LBL_ROUTE + route_b, 5, 80+y_offset, WHITE, bg_color, scale=2)
-        time.sleep_ms(1) 
-        
+        tft.draw_gbk(route_b, 53, y2, WHITE, bg_color, scale=2)
+
         digits = [c for c in str(train_no) if c.isdigit()]
         direction = b'\xc9\xcf' if digits and int(digits[-1]) % 2 == 0 else b'\xcf\xc2'
-        tft.draw_gbk(direction, 180, 80+y_offset, MAGENTA, bg_color, scale=2)
-        time.sleep_ms(1) 
-        
-        tft.draw_gbk(km.encode() + b'K', 220, 80+y_offset, GREEN, bg_color, scale=2)
-        time.sleep_ms(1) 
-        
+        tft.draw_gbk(direction, 180, y2, MAGENTA, bg_color, scale=2)
+
+        tft.draw_gbk(km.encode() + b'K', 220, y2, GREEN, bg_color, scale=2)
+
         loco = ext.get('loco_type', '----')
         cab = ext.get('cab_end', '')
         if cab == '31': loco += 'A'
         elif cab == '32': loco += 'B'
-        tft.draw_gbk(LBL_LOCO + loco.encode(), 5, 125+y_offset, WHITE, bg_color, scale=2)
-        time.sleep_ms(1) 
+        tft.draw_gbk(loco.encode(), 53, y3, WHITE, bg_color, scale=2)
 
     if not is_history: 
         lon = ext.get('lon', '---').replace('°', ' ')
         lat = ext.get('lat', '---').replace('°', ' ')
-        tft.fill_rect(0, 192, 320, 18, BLACK)
-        time.sleep_ms(1) 
+        tft.fill_rect(0, 192, 320, 18, BLACK) 
+        if not is_partial: time.sleep_ms(1) 
         tft.draw_gbk(b'GPS: ' + lon.encode() + b' / ' + lat.encode(), 5, 195, GRAY, BLACK, scale=1)
-        time.sleep_ms(1) 
+        
+    last_screen_layout = current_layout
 
 def draw_menu(full=True, old_idx=-1):
+    global last_screen_layout
     if full: 
+        last_screen_layout = None 
         safe_fill_rect(0, 26, 320, 164, 0x2104) 
         tft.draw_gbk(b'--- SYSTEM MENU ---', 80, 40, CYAN, 0x2104)
         time.sleep_ms(1) 
@@ -390,7 +418,9 @@ def draw_menu_item(i, is_selected):
     tft.draw_gbk(prefix + menu_items[i].encode(), 40, 60 + i*16, color, 0x2104)
 
 def draw_set_date(full=True):
+    global last_screen_layout
     if full:
+        last_screen_layout = None 
         safe_fill_rect(0, 26, 320, 164, 0x2104)
         tft.draw_gbk(b'--- SET DATE ---', 95, 40, CYAN, 0x2104)
         tft.draw_gbk(b'-', 134, 90, WHITE, 0x2104, scale=2)
@@ -410,7 +440,9 @@ def draw_set_date(full=True):
     time.sleep_ms(1)
 
 def draw_jump_id(full=True):
+    global last_screen_layout
     if full:
+        last_screen_layout = None 
         safe_fill_rect(0, 26, 320, 164, 0x2104)
         tft.draw_gbk(b'--- JUMP TO ID ---', 85, 40, CYAN, 0x2104)
         tft.draw_gbk(b'RANGE: 0001 -', 60, 75, GRAY, 0x2104)
@@ -424,6 +456,8 @@ def draw_jump_id(full=True):
         time.sleep_ms(1) 
 
 def draw_confirm_format():
+    global last_screen_layout
+    last_screen_layout = None 
     safe_fill_rect(0, 26, 320, 164, 0x5000)
     tft.draw_gbk(b'!!! WARNING !!!', 35, 50, WHITE, 0x5000, scale=2)
     time.sleep_ms(1)
@@ -432,6 +466,8 @@ def draw_confirm_format():
     time.sleep_ms(1)
 
 def draw_confirm_format_sd():
+    global last_screen_layout
+    last_screen_layout = None 
     safe_fill_rect(0, 26, 320, 164, 0x5000)
     tft.draw_gbk(b'!!! SD WARNING !!!', 15, 50, WHITE, 0x5000, scale=2)
     time.sleep_ms(1)
@@ -440,6 +476,8 @@ def draw_confirm_format_sd():
     time.sleep_ms(1)
 
 def draw_about():
+    global last_screen_layout
+    last_screen_layout = None 
     safe_fill_rect(0, 26, 320, 164, 0x2104)
     tft.draw_gbk(b'--- ABOUT DEVICE ---', 75, 40, CYAN, 0x2104)
     time.sleep_ms(1)
@@ -461,15 +499,13 @@ def draw_popup(msg, color=RED):
     time.sleep_ms(1)
 
 # ==========================================
-# ★ 5. 核心 1 的回调与安全闭环
+# ★ 5. 核心 1 子线程
 # ==========================================
 def light_callback(data):
     with ui_lock:
         ui_queue.append(data)
 
 def radio_core_task():
-    # ★ 终极防弹补丁：在子线程内部强行 import time
-    # 彻底杜绝软重启或内存波动导致的 NameError: 'time' isn't defined 崩溃！
     import time
     while True:
         try:
@@ -482,13 +518,7 @@ def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
     global screen_is_on, last_interaction, need_post_train_gc
     
-    if DEBUG_MODE:
-        try:
-            json_str = json.dumps(data) 
-            print(f"\n[LBJ Console] 接收到数据: {json_str}")
-        except:
-            print(f"\n[LBJ Console] 接收到数据: {data}")
-    else:
+    if not DEBUG_MODE:
         time.sleep_ms(60)
 
     try:
@@ -529,13 +559,11 @@ def process_ui_data(data):
                 display_train_data(last_basic, last_ext, last_is_full)
                 draw_hardware_bar(force=True) 
                 
-            # ★ 在这里打上标记，告诉主循环：这趟车画完了，可以找机会收垃圾了
             need_post_train_gc = True
     except: pass
 
-
 # ==========================================
-# 6. 启动自检与核心分发
+# 6. 启动初始化
 # ==========================================
 load_config() 
 init_history()
@@ -574,7 +602,6 @@ while True:
             pin_bl.value(1) 
             screen_is_on = False
             
-    # ★ 完美满足要求 1：只在处理完一趟车次后，并且确信电波已经安静 2 秒后，才执行一次 GC，绝不干扰正常接收
     if need_post_train_gc and time.ticks_diff(now, last_interaction) > 2000:
         gc.collect()
         need_post_train_gc = False
@@ -590,7 +617,6 @@ while True:
         except:
             pass 
             
-    # ★ 完美满足要求 2：内存极低时的紧急救命 GC，并保持了微小延时防止锁死总线
     if gc.mem_free() < 20000:
         time.sleep_ms(1)
         gc.collect()
@@ -622,9 +648,7 @@ while True:
         if has_received: display_train_data(last_basic, last_ext, last_is_full)
         else: draw_idle_screen()
 
-    # ==========================================
-    # ★ 按钮交互逻辑
-    # ==========================================
+    # 按钮逻辑
     any_btn = not btn_menu.value() or not btn_up.value() or not btn_down.value() or not btn_ok.value()
     if any_btn:
         last_interaction = now
@@ -708,23 +732,18 @@ while True:
                 if not sd_active:
                     draw_popup(b'NO SD CARD!', color=RED); time.sleep(1); draw_menu(full=True)
                 else: system_state = "CONFIRM_FORMAT_SD"; draw_confirm_format_sd()
-            
             elif menu_index == 5: 
                 if sd_active:
-                    draw_popup(b'UNMOUNTING...', color=YELLOW)
-                    disable_sd_forever("SD REMOVED") 
+                    draw_popup(b'UNMOUNTING...', color=YELLOW); disable_sd_forever("SD REMOVED") 
                     draw_popup(b'SAFE TO REMOVE', color=CYAN); time.sleep(2)
                 else:
-                    draw_popup(b'MOUNTING SD...', color=YELLOW)
-                    check_sd_startup() 
+                    draw_popup(b'MOUNTING SD...', color=YELLOW); check_sd_startup() 
                     if sd_active: draw_popup(b'MOUNT OK!', color=GREEN)
                     else: draw_popup(b'MOUNT FAIL!', color=RED)
                     time.sleep_ms(1)
-                
                 system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
                 if has_received: display_train_data(last_basic, last_ext, last_is_full)
                 else: draw_idle_screen()
-            
             elif menu_index == 6: system_state = "ABOUT"; draw_about()
             elif menu_index == 7: 
                 cfg_scr_idx = (cfg_scr_idx + 1) % 4
@@ -759,14 +778,12 @@ while True:
                 if 'sd' in os.listdir('/'): 
                     try: os.umount("/sd")
                     except: pass
-                tft_cs.value(1)
-                spi1.init(baudrate=1000000); sd_obj = sdcard.SDCard(spi1, sd_cs)
+                tft_cs.value(1); spi1.init(baudrate=1000000); sd_obj = sdcard.SDCard(spi1, sd_cs)
                 spi1.init(baudrate=10000000); os.VfsFat.mkfs(sd_obj); os.mount(os.VfsFat(sd_obj), "/sd")
                 draw_popup(b'SD FORMAT OK!', color=GREEN)
-            except Exception as e:
-                sd_obj = None; draw_popup(b'FORMAT FAIL!', color=RED)
-                disable_sd_forever("FORMAT FAIL") 
-            spi1.init(baudrate=60000000) 
+            except:
+                sd_obj = None; draw_popup(b'FORMAT FAIL!', color=RED); disable_sd_forever("FORMAT FAIL") 
+            spi1.init(baudrate=80000000) 
             time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
