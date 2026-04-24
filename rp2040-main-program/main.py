@@ -280,8 +280,12 @@ def draw_hardware_bar(force=False):
     r = last_rssi_str
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
     
+    # ★ 新增：提取电量数字，低于 20 则变红
+    raw_p = int(p.replace('%', ''))
+    bat_color = RED if raw_p < 20 else WHITE
+    
     tft.fill_rect(45, 218, 70, 16, BLACK)
-    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, WHITE, BLACK)
+    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) # 使用动态颜色
     
     tft.fill_rect(170, 218, 70, 16, BLACK)
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
