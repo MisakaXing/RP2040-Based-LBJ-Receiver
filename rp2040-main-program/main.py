@@ -19,7 +19,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(200000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.0
+Program_ver = 2.9
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -27,7 +27,7 @@ BAT_OFFSET = 0.174
 DEBUG_MODE = False
 
 ui_queue = [] 
-ui_lock = _thread.allocate_lock() # ★ 多线程互斥锁，防止双核抢队列导致崩溃
+ui_lock = _thread.allocate_lock() # ★ 新增：多线程互斥锁，防止双核抢队列导致崩溃
 
 last_hw_update = 0  
 last_rssi_str = "N/A" 
@@ -89,6 +89,7 @@ menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD
 hist_ptr = -1
 total_count = 0
 
+# ★ 恢复内存优化：使用连续内存数组，彻底消灭历史记录造成的碎片
 history_offsets = array.array('I') 
 last_interaction = time.ticks_ms()
 
@@ -279,11 +280,12 @@ def draw_hardware_bar(force=False):
     r = last_rssi_str
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
     
+    # ★ 新增：提取电量数字，低于 20 则变红
     raw_p = int(p.replace('%', ''))
     bat_color = RED if raw_p < 20 else WHITE
     
     tft.fill_rect(45, 218, 70, 16, BLACK)
-    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK)
+    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) # 使用动态颜色
     
     tft.fill_rect(170, 218, 70, 16, BLACK)
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
@@ -460,13 +462,14 @@ def draw_popup(msg, color=RED):
 # ★ 5. 核心 1 的回调与安全闭环
 # ==========================================
 def light_callback(data):
+    # ★ 修复：加锁保护，防止 Core 0 拿数据时 Core 1 写数据导致的列表崩溃
     with ui_lock:
         ui_queue.append(data)
 
 def radio_core_task():
-    import time
     while True:
         try:
+            # ★ 修复：恢复防弹衣！无论收音机遇到什么干扰乱码，绝对不允许主线程崩溃退出
             receiver.tick()
         except Exception:
             pass
@@ -523,10 +526,6 @@ def process_ui_data(data):
                 display_train_data(last_basic, last_ext, last_is_full)
                 draw_hardware_bar(force=True) 
     except: pass
-    
-    # ★ 精准微调 1：处理完一趟车、写完盘、画完图后，车已开走，电波最干净。
-    # 趁现在安全，立刻执行一次 GC 扫地，绝不留到平时去打扰副核！
-    gc.collect()
 
 
 # ==========================================
@@ -569,13 +568,14 @@ while True:
             pin_bl.value(1) 
             screen_is_on = False
             
-    # ★ 精准微调 2：平时待机绝不随意 GC（取消了原先霸道的 5000ms 定时收垃圾）。
-    # 只在极度缺内存（快要死机）的时候才勉强执行一次，把平时打断副核的概率降到无限趋近于 0。
-    if gc.mem_free() < 30000 and time.ticks_diff(now, last_gc) > 10000:
+    # ★ 修复：大幅降低内存强制清扫频率，从变态的 100ms 降为合理的 5000ms
+    # 之前疯狂大扫除导致 Core 1 总是被迫停机，引发错乱自尽
+    if time.ticks_diff(now, last_gc) > 5000:   
         gc.collect()
         last_gc = now
 
     ui_data_to_process = None
+    # ★ 修复：拿取数据时安全加锁
     with ui_lock:
         if len(ui_queue) > 0:
             ui_data_to_process = ui_queue.pop(0)
@@ -584,7 +584,12 @@ while True:
         try:
             process_ui_data(ui_data_to_process)
         except:
-            pass 
+            pass # 终极护盾
+            
+        if gc.mem_free() < 20000:
+            time.sleep_ms(1)
+            gc.collect()
+            time.sleep_ms(1)
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
@@ -740,6 +745,7 @@ while True:
             
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN); open(HIST_FILE, 'w').close()
+            # ★ 修复格式化后不清空数组的问题
             total_count = 0; hist_ptr = -1; history_offsets = array.array('I'); time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
