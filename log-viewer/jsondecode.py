@@ -195,6 +195,40 @@ class TrainLogApp(ctk.CTk):
         except Exception:
             pass
 
+    # ================= ★ 终极防崩溃版解码执行器 ★ =================
+    def _run_mpremote_safe(self, cmd, timeout_sec=30):
+        """抓取原始字节，宽容解码，彻底告别 UnicodeDecodeError"""
+        try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+            # 注意：去掉 encoding 参数，接收原始 bytes
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout_sec, startupinfo=startupinfo)
+            
+            stdout_bytes = result.stdout if result.stdout else b''
+            stderr_bytes = result.stderr if result.stderr else b''
+            
+            # 宽容解码策略：遇到坏字节直接忽略
+            try:
+                out_str = stdout_bytes.decode('utf-8', errors='ignore')
+            except:
+                out_str = stdout_bytes.decode('gbk', errors='ignore')
+                
+            try:
+                err_str = stderr_bytes.decode('utf-8', errors='ignore')
+            except:
+                err_str = stderr_bytes.decode('gbk', errors='ignore')
+                
+            return result.returncode, out_str, err_str
+            
+        except subprocess.TimeoutExpired:
+            return -1, "", "TIMEOUT"
+        except Exception as e:
+            return -2, "", str(e)
+    # =========================================================
+
     def start_pico_read(self):
         port = self.port_var.get()
         if not port or "未检测" in port or "请选择" in port:
@@ -239,24 +273,20 @@ class TrainLogApp(ctk.CTk):
             cmd = [sys.executable, "-m", "mpremote", "connect", port, "cat", "history.jsonl"]
             
         try:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            # 使用宽容解码包裹函数
+            returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=30)
             
-            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=30, startupinfo=startupinfo)
-            output = result.stdout
-            
-            if result.returncode != 0:
-                 err_msg = result.stderr if result.stderr else output
-                 self.after(0, lambda err=err_msg: messagebox.showerror("读取失败", f"无法读取文件，可能设备忙。\n\n{err}"))
-                 return
+            if returncode == -1: # Timeout
+                self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被占用且线缆连接正常！"))
+                return
+            elif returncode != 0:
+                final_err = err_msg if err_msg else output
+                self.after(0, lambda err=final_err: messagebox.showerror("读取失败", f"无法读取文件，可能设备忙或文件损坏。\n\n{err}"))
+                return
 
             lines = output.split('\n')
             self.after(0, self._process_memory_lines, lines)
             
-        except subprocess.TimeoutExpired:
-            self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被 Thonny 等软件占用！"))
         except Exception as e:
             self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
@@ -280,21 +310,17 @@ class TrainLogApp(ctk.CTk):
             cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
             
         try:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            # 使用宽容解码包裹函数
+            returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=45)
             
-            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=45, startupinfo=startupinfo)
-            
-            if result.returncode == 0:
-                 self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已导出至：\n{p}"))
+            if returncode == 0:
+                 self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已成功导出至：\n{p}"))
+            elif returncode == -1: # Timeout
+                 self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能过大或连接断开。"))
             else:
-                 err_msg = result.stderr if result.stderr else result.stdout
-                 self.after(0, lambda err=err_msg: messagebox.showerror("导出失败", f"导出失败。\n\n{err}"))
+                 final_err = err_msg if err_msg else output
+                 self.after(0, lambda err=final_err: messagebox.showerror("导出失败", f"导出失败。\n\n{err}"))
                  
-        except subprocess.TimeoutExpired:
-            self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能过大或连接断开。"))
         except Exception as e:
             self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
@@ -372,7 +398,8 @@ class TrainLogApp(ctk.CTk):
         filepath = filedialog.askopenfilename(filetypes=[("JSON Lines", "*.json *.jsonl *.txt"), ("All Files", "*.*")])
         if not filepath: return
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            # 这里也加上 errors='ignore' 防止本地文件有坏字节导致读取崩溃
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             self._process_memory_lines(lines) 
         except Exception as e:
