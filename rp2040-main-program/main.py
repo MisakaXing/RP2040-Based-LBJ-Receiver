@@ -602,7 +602,7 @@ while True:
             pin_bl.value(1) 
             screen_is_on = False
             
-    if need_post_train_gc and time.ticks_diff(now, last_interaction) > 2000:
+    if need_post_train_gc and time.ticks_diff(now, last_interaction) > 1000:
         gc.collect()
         need_post_train_gc = False
 
