@@ -467,7 +467,7 @@ def radio_core_task():
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
     global screen_is_on, last_interaction
-    json_str = json.dumps(data)
+    #json_str = json.dumps(data)
     if DEBUG_MODE:
         try:
             json_str = json.dumps(data) 
