@@ -16,10 +16,10 @@ from boot_post import SystemPOST
 # ★ 系统性能配置与时钟加固
 # ==========================================
 pin_bl = Pin(6, Pin.OUT, value=0)
-machine.freq(200000000) 
+machine.freq(240000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 2.9
+Program_ver = 3.0
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -27,7 +27,7 @@ BAT_OFFSET = 0.174
 DEBUG_MODE = False
 
 ui_queue = [] 
-ui_lock = _thread.allocate_lock() # ★ 新增：多线程互斥锁，防止双核抢队列导致崩溃
+ui_lock = _thread.allocate_lock() # ★ 多线程互斥锁，防止双核抢队列导致崩溃
 
 last_hw_update = 0  
 last_rssi_str = "N/A" 
@@ -89,7 +89,7 @@ menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD
 hist_ptr = -1
 total_count = 0
 
-# ★ 恢复内存优化：使用连续内存数组，彻底消灭历史记录造成的碎片
+# ★ 恢复内存优化：使用连续内存数组
 history_offsets = array.array('I') 
 last_interaction = time.ticks_ms()
 
@@ -112,6 +112,9 @@ current_status_color = GREEN
 
 last_basic, last_ext = {}, {}
 last_is_full = True
+
+# ★ 全局标记：判断是否刚处理完一趟车，需要打扫卫生
+need_post_train_gc = False 
 
 LBL_TRAIN, LBL_SPEED, LBL_ROUTE, LBL_KM, LBL_LOCO = b'\xb3\xb5:', b'\xcb\xd9:', b'\xcf\xdf:', b'\xb1\xea:', b'\xbb\xfa:'
 
@@ -280,12 +283,11 @@ def draw_hardware_bar(force=False):
     r = last_rssi_str
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
     
-    # ★ 新增：提取电量数字，低于 20 则变红
     raw_p = int(p.replace('%', ''))
     bat_color = RED if raw_p < 20 else WHITE
     
     tft.fill_rect(45, 218, 70, 16, BLACK)
-    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) # 使用动态颜色
+    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) 
     
     tft.fill_rect(170, 218, 70, 16, BLACK)
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
@@ -462,14 +464,15 @@ def draw_popup(msg, color=RED):
 # ★ 5. 核心 1 的回调与安全闭环
 # ==========================================
 def light_callback(data):
-    # ★ 修复：加锁保护，防止 Core 0 拿数据时 Core 1 写数据导致的列表崩溃
     with ui_lock:
         ui_queue.append(data)
 
 def radio_core_task():
+    # ★ 终极防弹补丁：在子线程内部强行 import time
+    # 彻底杜绝软重启或内存波动导致的 NameError: 'time' isn't defined 崩溃！
+    import time
     while True:
         try:
-            # ★ 修复：恢复防弹衣！无论收音机遇到什么干扰乱码，绝对不允许主线程崩溃退出
             receiver.tick()
         except Exception:
             pass
@@ -477,7 +480,7 @@ def radio_core_task():
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
-    global screen_is_on, last_interaction
+    global screen_is_on, last_interaction, need_post_train_gc
     
     if DEBUG_MODE:
         try:
@@ -525,6 +528,9 @@ def process_ui_data(data):
                 update_top_bar()
                 display_train_data(last_basic, last_ext, last_is_full)
                 draw_hardware_bar(force=True) 
+                
+            # ★ 在这里打上标记，告诉主循环：这趟车画完了，可以找机会收垃圾了
+            need_post_train_gc = True
     except: pass
 
 
@@ -568,14 +574,12 @@ while True:
             pin_bl.value(1) 
             screen_is_on = False
             
-    # ★ 修复：大幅降低内存强制清扫频率，从变态的 100ms 降为合理的 5000ms
-    # 之前疯狂大扫除导致 Core 1 总是被迫停机，引发错乱自尽
-    if time.ticks_diff(now, last_gc) > 5000:   
+    # ★ 完美满足要求 1：只在处理完一趟车次后，并且确信电波已经安静 2 秒后，才执行一次 GC，绝不干扰正常接收
+    if need_post_train_gc and time.ticks_diff(now, last_interaction) > 2000:
         gc.collect()
-        last_gc = now
+        need_post_train_gc = False
 
     ui_data_to_process = None
-    # ★ 修复：拿取数据时安全加锁
     with ui_lock:
         if len(ui_queue) > 0:
             ui_data_to_process = ui_queue.pop(0)
@@ -584,12 +588,13 @@ while True:
         try:
             process_ui_data(ui_data_to_process)
         except:
-            pass # 终极护盾
+            pass 
             
-        if gc.mem_free() < 20000:
-            time.sleep_ms(1)
-            gc.collect()
-            time.sleep_ms(1)
+    # ★ 完美满足要求 2：内存极低时的紧急救命 GC，并保持了微小延时防止锁死总线
+    if gc.mem_free() < 20000:
+        time.sleep_ms(1)
+        gc.collect()
+        time.sleep_ms(1)
 
     if time.ticks_diff(now, last_sec) > 1000:
         if system_state == "DASHBOARD": 
@@ -745,7 +750,6 @@ while True:
             
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN); open(HIST_FILE, 'w').close()
-            # ★ 修复格式化后不清空数组的问题
             total_count = 0; hist_ptr = -1; history_offsets = array.array('I'); time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
