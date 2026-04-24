@@ -5,6 +5,7 @@ import os
 import gc
 import sdcard
 import _thread  
+import array  # ★ 必须导入，用于内存优化
 from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
@@ -18,16 +19,19 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(200000000) 
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 2.8
+Program_ver = 2.9
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
 DEBUG_MODE = False
+
 ui_queue = [] 
-last_hw_update = 0  # 记录硬件栏上次刷新的时间
-last_rssi_str = "N/A" # 用于缓存从 JSON 传来的最新一趟车的 RSSI
-screen_is_on = True # 息屏状态标志
+ui_lock = _thread.allocate_lock() # ★ 新增：多线程互斥锁，防止双核抢队列导致崩溃
+
+last_hw_update = 0  
+last_rssi_str = "N/A" 
+screen_is_on = True 
 
 # ==========================================
 # 1. 硬件 IO 初始化 
@@ -75,7 +79,7 @@ system_state = "DASHBOARD"
 has_received = False
 menu_index = 0
 
-cfg_scr_idx = 3 # 默认 3 (never)
+cfg_scr_idx = 3 
 SCR_OFF_OPTS = ["30s", "1min", "5min", "never"]
 SCR_OFF_MS = [30000, 60000, 300000, -1]
 cfg_buzzer = True
@@ -84,7 +88,9 @@ menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD
 
 hist_ptr = -1
 total_count = 0
-history_offsets = [] 
+
+# ★ 恢复内存优化：使用连续内存数组，彻底消灭历史记录造成的碎片
+history_offsets = array.array('I') 
 last_interaction = time.ticks_ms()
 
 last_minute = -1 
@@ -146,7 +152,7 @@ def save_config():
 
 def init_history():
     global total_count, history_offsets
-    history_offsets = []
+    history_offsets = array.array('I')
     try:
         with open(HIST_FILE, 'r') as f:
             while True:
@@ -156,7 +162,7 @@ def init_history():
                 history_offsets.append(offset)
         total_count = len(history_offsets)
     except: 
-        total_count = 0; history_offsets = []
+        total_count = 0; history_offsets = array.array('I')
 
 def save_history(data):
     global total_count, history_offsets
@@ -377,7 +383,6 @@ def draw_menu_item(i, is_selected):
     tft.fill_rect(40, 60 + i*16, 240, 16, 0x2104)
     tft.draw_gbk(prefix + menu_items[i].encode(), 40, 60 + i*16, color, 0x2104)
 
-# ★ 局部刷新逻辑：full=False 时仅擦除并重绘数字部分
 def draw_set_date(full=True):
     if full:
         safe_fill_rect(0, 26, 320, 164, 0x2104)
@@ -389,7 +394,6 @@ def draw_set_date(full=True):
         
     cols = [YELLOW if edit_step == i else WHITE for i in range(3)]
     
-    # 局部擦除底色
     tft.fill_rect(70, 90, 64, 32, 0x2104)
     tft.fill_rect(150, 90, 32, 32, 0x2104)
     tft.fill_rect(198, 90, 32, 32, 0x2104)
@@ -399,7 +403,6 @@ def draw_set_date(full=True):
     tft.draw_gbk(f"{edit_d:02}".encode(), 198, 90, cols[2], 0x2104, scale=2)
     time.sleep_ms(1)
 
-# ★ 局部刷新逻辑：full=False 时仅擦除并重绘数字部分
 def draw_jump_id(full=True):
     if full:
         safe_fill_rect(0, 26, 320, 164, 0x2104)
@@ -410,7 +413,6 @@ def draw_jump_id(full=True):
         
     for i in range(4):
         color = YELLOW if edit_step == i else WHITE
-        # 局部擦除单个字符的矩形区域
         tft.fill_rect(110 + i*25, 110, 16, 32, 0x2104)
         tft.draw_gbk(str(edit_id[i]).encode(), 110 + i*25, 110, color, 0x2104, scale=2)
         time.sleep_ms(1) 
@@ -453,21 +455,26 @@ def draw_popup(msg, color=RED):
     time.sleep_ms(1)
 
 # ==========================================
-# ★ 5. 核心 1 的回调
+# ★ 5. 核心 1 的回调与安全闭环
 # ==========================================
 def light_callback(data):
-    # Core 1 极简闭环，只负责进队，禁止一切 print 打印阻塞
-    ui_queue.append(data)
+    # ★ 修复：加锁保护，防止 Core 0 拿数据时 Core 1 写数据导致的列表崩溃
+    with ui_lock:
+        ui_queue.append(data)
 
 def radio_core_task():
     while True:
-        receiver.tick()
+        try:
+            # ★ 修复：恢复防弹衣！无论收音机遇到什么干扰乱码，绝对不允许主线程崩溃退出
+            receiver.tick()
+        except Exception:
+            pass
         time.sleep_ms(1)
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
     global screen_is_on, last_interaction
-    #json_str = json.dumps(data)
+    
     if DEBUG_MODE:
         try:
             json_str = json.dumps(data) 
@@ -491,7 +498,6 @@ def process_ui_data(data):
         elif "train_data" in msg_type or "only" in msg_type:
             beep(0.05); has_received = True
             
-            # 来信号自动唤醒屏幕
             if not screen_is_on:
                 pin_bl.value(0)
                 screen_is_on = True
@@ -553,20 +559,29 @@ heartbeat = False
 while True:
     now = time.ticks_ms()
     
-    # 自动息屏检测逻辑
     if screen_is_on and cfg_scr_idx != 3: 
         if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
             pin_bl.value(1) 
             screen_is_on = False
             
-    if time.ticks_diff(now, last_gc) > 100:   
+    # ★ 修复：大幅降低内存强制清扫频率，从变态的 100ms 降为合理的 5000ms
+    # 之前疯狂大扫除导致 Core 1 总是被迫停机，引发错乱自尽
+    if time.ticks_diff(now, last_gc) > 5000:   
         gc.collect()
         last_gc = now
 
-    if len(ui_queue) > 0:
-        process_ui_data(ui_queue.pop(0))
+    ui_data_to_process = None
+    # ★ 修复：拿取数据时安全加锁
+    with ui_lock:
         if len(ui_queue) > 0:
-            time.sleep_ms(1)
+            ui_data_to_process = ui_queue.pop(0)
+
+    if ui_data_to_process:
+        try:
+            process_ui_data(ui_data_to_process)
+        except:
+            pass # 终极护盾
+            
         if gc.mem_free() < 20000:
             time.sleep_ms(1)
             gc.collect()
@@ -601,7 +616,6 @@ while True:
     # ==========================================
     # ★ 按钮交互逻辑
     # ==========================================
-    # 息屏唤醒拦截
     any_btn = not btn_menu.value() or not btn_up.value() or not btn_down.value() or not btn_ok.value()
     if any_btn:
         last_interaction = now
@@ -669,7 +683,6 @@ while True:
         elif system_state == "MENU":
             if menu_index == 0: 
                 cfg_buzzer = not cfg_buzzer; menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
-                # ★ 局部刷新
                 save_config(); draw_menu_item(0, True)
                 time.sleep_ms(100)
             elif menu_index == 1: 
@@ -707,7 +720,6 @@ while True:
             elif menu_index == 7: 
                 cfg_scr_idx = (cfg_scr_idx + 1) % 4
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
-                # ★ 局部刷新
                 save_config(); draw_menu_item(7, True)
                 time.sleep_ms(100)
                 
@@ -729,7 +741,8 @@ while True:
             
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN); open(HIST_FILE, 'w').close()
-            total_count = 0; hist_ptr = -1; history_offsets.clear(); time.sleep(1)
+            # ★ 修复格式化后不清空数组的问题
+            total_count = 0; hist_ptr = -1; history_offsets = array.array('I'); time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
         elif system_state == "CONFIRM_FORMAT_SD":
