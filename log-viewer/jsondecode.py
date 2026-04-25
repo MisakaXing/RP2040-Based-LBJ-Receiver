@@ -1,19 +1,15 @@
 import sys
 import os
 
-# ================= ★ PyInstaller 幽灵窗口终极修复 ★ =================
-# 必须放在所有图形化库导入的最前面！
-# 拦截我们自定义的内部暗号 "mpremote_internal"
 if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
-    # 剥离暗号，伪造标准的 mpremote 命令行参数
+    # 伪造标准的 mpremote 命令行参数
     sys.argv = [sys.argv[0]] + sys.argv[2:]
     from mpremote.main import main
     try:
         main() # 直接调用 mpremote 的核心引擎
     except SystemExit as e:
         sys.exit(e.code)
-    sys.exit(0) # 拿完数据立刻退出，绝对不加载图形界面
-# =================================================================
+    sys.exit(0) 
 
 import json
 import re
@@ -35,43 +31,48 @@ class TrainLogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("列车运行日志解析系统 (终极融合版)")
+        self.title("列车运行日志解析系统")
         self.geometry("1100x750")
         self.minsize(900, 650)
         
         self.log_data = [] # 存储解析后的数据
 
-        # --- 布局框架 ---
+        # 布局框架
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # ==================== 1. 左侧侧边栏 ====================
+        # 左侧侧边栏 
         self.sidebar_frame = ctk.CTkFrame(self, width=260, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(8, weight=1)
+        self.sidebar_frame.grid_rowconfigure(9, weight=1) # 调整了弹簧行号
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="列车数据过滤器", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        # --- 筛选控件 ---
+        # ================== ★ 筛选控件大改 ==================
         self.train_no_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="搜索车次 (如: D70)")
         self.train_no_entry.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
 
-        self.time_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="搜索时间 (如: 14:06)")
-        self.time_entry.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        # 将原来的单个时间框改为 开始时间 和 结束时间
+        self.time_start_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="开始时间 (如: 14:00)")
+        self.time_start_entry.grid(row=2, column=0, padx=20, pady=(10, 5), sticky="ew")
+
+        self.time_end_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="结束时间 (如: 15:30)")
+        self.time_end_entry.grid(row=3, column=0, padx=20, pady=(5, 10), sticky="ew")
 
         self.loco_entry = ctk.CTkEntry(self.sidebar_frame, placeholder_text="搜索车型 (如: CR400AF)")
-        self.loco_entry.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
+        self.loco_entry.grid(row=4, column=0, padx=20, pady=10, sticky="ew")
 
         self.search_btn = ctk.CTkButton(self.sidebar_frame, text="应用筛选", command=self.apply_filter)
-        self.search_btn.grid(row=4, column=0, padx=20, pady=15, sticky="ew")
+        self.search_btn.grid(row=5, column=0, padx=20, pady=15, sticky="ew")
         
         self.reset_btn = ctk.CTkButton(self.sidebar_frame, text="重置", fg_color="gray", command=self.reset_filter)
-        self.reset_btn.grid(row=5, column=0, padx=20, pady=0, sticky="ew")
+        self.reset_btn.grid(row=6, column=0, padx=20, pady=0, sticky="ew")
+        # ====================================================
 
-        # --- 地图源设置 ---
+        # 地图源设置 (行号顺延)
         self.map_source_label = ctk.CTkLabel(self.sidebar_frame, text="--- 地图源设置 ---", text_color="gray")
-        self.map_source_label.grid(row=6, column=0, padx=20, pady=(15, 5))
+        self.map_source_label.grid(row=7, column=0, padx=20, pady=(15, 5))
 
         self.map_source_var = ctk.StringVar(value="高德地图 (极速)")
         self.map_source_menu = ctk.CTkOptionMenu(
@@ -80,14 +81,14 @@ class TrainLogApp(ctk.CTk):
             values=["高德地图 (极速)", "OpenStreetMap (默认)", "CartoDB (海外极速)"],
             command=self.change_map_source 
         )
-        self.map_source_menu.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.map_source_menu.grid(row=8, column=0, padx=20, pady=(0, 10), sticky="ew")
 
-        # --- Pico 串口直连区域 ---
+        # Pico 串口直连区域 (行号顺延)
         self.pico_label = ctk.CTkLabel(self.sidebar_frame, text="--- Pico 串口直连 ---", text_color="gray")
-        self.pico_label.grid(row=9, column=0, padx=20, pady=(10, 5))
+        self.pico_label.grid(row=10, column=0, padx=20, pady=(10, 5))
 
         self.port_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        self.port_frame.grid(row=10, column=0, padx=20, pady=5, sticky="ew")
+        self.port_frame.grid(row=11, column=0, padx=20, pady=5, sticky="ew")
 
         self.port_var = ctk.StringVar(value="请选择端口...")
         self.port_menu = ctk.CTkOptionMenu(self.port_frame, variable=self.port_var, values=["请选择端口..."], width=130)
@@ -99,18 +100,18 @@ class TrainLogApp(ctk.CTk):
         )
         self.refresh_port_btn.pack(side="right", padx=(5, 0))
 
-        self.read_pico_btn = ctk.CTkButton(self.sidebar_frame, text="📥 从 Pico 提取历史数据", fg_color="#2b8a3e", hover_color="#237032", command=self.start_pico_read)
-        self.read_pico_btn.grid(row=11, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.read_pico_btn = ctk.CTkButton(self.sidebar_frame, text="从 Pico 提取历史数据", fg_color="#2b8a3e", hover_color="#237032", command=self.start_pico_read)
+        self.read_pico_btn.grid(row=12, column=0, padx=20, pady=(5, 10), sticky="ew")
 
-        self.export_pico_btn = ctk.CTkButton(self.sidebar_frame, text="💾 导出日志到电脑", fg_color="#d97706", hover_color="#b45309", command=self.start_pico_export)
-        self.export_pico_btn.grid(row=12, column=0, padx=20, pady=(0, 15), sticky="ew")
+        self.export_pico_btn = ctk.CTkButton(self.sidebar_frame, text="导出日志到电脑", fg_color="#d97706", hover_color="#b45309", command=self.start_pico_export)
+        self.export_pico_btn.grid(row=13, column=0, padx=20, pady=(0, 15), sticky="ew")
 
         # --- 本地文件读取 ---
         self.local_label = ctk.CTkLabel(self.sidebar_frame, text="--- 本地文件读取 ---", text_color="gray")
-        self.local_label.grid(row=13, column=0, padx=20, pady=(0, 5))
+        self.local_label.grid(row=14, column=0, padx=20, pady=(0, 5))
 
-        self.load_btn = ctk.CTkButton(self.sidebar_frame, text="📂 导入 JSON 日志文件", command=self.load_json_file)
-        self.load_btn.grid(row=14, column=0, padx=20, pady=(5, 20), sticky="ew")
+        self.load_btn = ctk.CTkButton(self.sidebar_frame, text="导入 JSON 日志文件", command=self.load_json_file)
+        self.load_btn.grid(row=15, column=0, padx=20, pady=(5, 20), sticky="ew")
 
         # ==================== 2. 右侧主内容区 ====================
         self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
@@ -177,7 +178,6 @@ class TrainLogApp(ctk.CTk):
                 self.port_var.set(port_list[0])
                 if show_prompt: messagebox.showwarning("提示", "已刷新列表，但未发现标准 Pico 设备。\n请展开下拉菜单手动选择正确的端口！")
 
-    # ★ 核心机制：软中断与复活
     def _interrupt_pico(self, port):
         """发送 Ctrl+C 强行打断死循环"""
         try:
@@ -195,22 +195,19 @@ class TrainLogApp(ctk.CTk):
         except Exception:
             pass
 
-    # ================= ★ 终极防崩溃版解码执行器 ★ =================
     def _run_mpremote_safe(self, cmd, timeout_sec=30):
-        """抓取原始字节，宽容解码，彻底告别 UnicodeDecodeError"""
+        """抓取原始字节，宽容解码"""
         try:
             startupinfo = None
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
-            # 注意：去掉 encoding 参数，接收原始 bytes
             result = subprocess.run(cmd, capture_output=True, timeout=timeout_sec, startupinfo=startupinfo)
             
             stdout_bytes = result.stdout if result.stdout else b''
             stderr_bytes = result.stderr if result.stderr else b''
             
-            # 宽容解码策略：遇到坏字节直接忽略
             try:
                 out_str = stdout_bytes.decode('utf-8', errors='ignore')
             except:
@@ -227,7 +224,6 @@ class TrainLogApp(ctk.CTk):
             return -1, "", "TIMEOUT"
         except Exception as e:
             return -2, "", str(e)
-    # =========================================================
 
     def start_pico_read(self):
         port = self.port_var.get()
@@ -262,7 +258,6 @@ class TrainLogApp(ctk.CTk):
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
-        # 1. 强行打断 Pico，让出串口
         self.after(0, lambda: self.read_pico_btn.configure(text="正在中断设备..."))
         self._interrupt_pico(port)
         self.after(0, lambda: self.read_pico_btn.configure(text="正在读取数据..."))
@@ -273,10 +268,9 @@ class TrainLogApp(ctk.CTk):
             cmd = [sys.executable, "-m", "mpremote", "connect", port, "cat", "history.jsonl"]
             
         try:
-            # 使用宽容解码包裹函数
             returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=30)
             
-            if returncode == -1: # Timeout
+            if returncode == -1: 
                 self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被占用且线缆连接正常！"))
                 return
             elif returncode != 0:
@@ -290,16 +284,14 @@ class TrainLogApp(ctk.CTk):
         except Exception as e:
             self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
-            # 2. 复活设备
             self.after(0, lambda: self.read_pico_btn.configure(text="正在恢复设备..."))
             self._reboot_pico(port)
             
-            self.after(0, lambda: self.read_pico_btn.configure(state="normal", text="📥 从 Pico 提取历史数据"))
+            self.after(0, lambda: self.read_pico_btn.configure(state="normal", text="从 Pico 提取历史数据"))
             self.after(0, lambda: self.export_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
     def _export_worker(self, port, save_path):
-        # 1. 强行打断 Pico
         self.after(0, lambda: self.export_pico_btn.configure(text="正在中断设备..."))
         self._interrupt_pico(port)
         self.after(0, lambda: self.export_pico_btn.configure(text="正在导出文件..."))
@@ -310,12 +302,11 @@ class TrainLogApp(ctk.CTk):
             cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
             
         try:
-            # 使用宽容解码包裹函数
             returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=45)
             
             if returncode == 0:
                  self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已成功导出至：\n{p}"))
-            elif returncode == -1: # Timeout
+            elif returncode == -1:
                  self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能过大或连接断开。"))
             else:
                  final_err = err_msg if err_msg else output
@@ -324,11 +315,10 @@ class TrainLogApp(ctk.CTk):
         except Exception as e:
             self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
         finally:
-            # 2. 复活设备
             self.after(0, lambda: self.export_pico_btn.configure(text="正在恢复设备..."))
             self._reboot_pico(port)
             
-            self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="💾 导出日志到电脑"))
+            self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="导出日志到电脑"))
             self.after(0, lambda: self.read_pico_btn.configure(state="normal"))
             self.after(0, lambda: self.load_btn.configure(state="normal"))
 
@@ -398,7 +388,6 @@ class TrainLogApp(ctk.CTk):
         filepath = filedialog.askopenfilename(filetypes=[("JSON Lines", "*.json *.jsonl *.txt"), ("All Files", "*.*")])
         if not filepath: return
         try:
-            # 这里也加上 errors='ignore' 防止本地文件有坏字节导致读取崩溃
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             self._process_memory_lines(lines) 
@@ -455,16 +444,34 @@ class TrainLogApp(ctk.CTk):
                 entry["gps_status"]
             ))
 
+    # ================== ★ 核心筛选逻辑大改 ==================
     def apply_filter(self):
         filter_train = self.train_no_entry.get().strip().upper()
-        filter_time = self.time_entry.get().strip()
         filter_loco = self.loco_entry.get().strip().upper()
+        
+        # 获取起止时间并补齐秒数
+        start_time = self.time_start_entry.get().strip()
+        end_time = self.time_end_entry.get().strip()
+        
+        if start_time and len(start_time) <= 5: start_time += ":00"
+        if end_time and len(end_time) <= 5: end_time += ":59"
 
         filtered_data = []
         for entry in self.log_data:
             match_train = filter_train in str(entry["train_no"]).upper() if filter_train else True
-            match_time = filter_time in str(entry["time"]) if filter_time else True
             match_loco = filter_loco in str(entry["loco_type"]).upper() if filter_loco else True
+            
+            # 时间范围比对逻辑
+            log_time = str(entry["time"])
+            time_only = log_time.split(' ')[-1] if ' ' in log_time else log_time
+            
+            match_time = True
+            if start_time and end_time:
+                match_time = start_time <= time_only <= end_time
+            elif start_time:
+                match_time = time_only >= start_time
+            elif end_time:
+                match_time = time_only <= end_time
             
             if match_train and match_time and match_loco:
                 filtered_data.append(entry)
@@ -472,10 +479,25 @@ class TrainLogApp(ctk.CTk):
         self.refresh_treeview(filtered_data)
 
     def reset_filter(self):
-        self.train_no_entry.delete(0, 'end')
-        self.time_entry.delete(0, 'end')
-        self.loco_entry.delete(0, 'end')
+        # 1. 加了安全判断：只有框里确实有内容时，才去执行 delete，完美避开 ctk 的占位符 Bug
+        if self.train_no_entry.get():
+            self.train_no_entry.delete(0, 'end')
+            
+        if self.time_start_entry.get():
+            self.time_start_entry.delete(0, 'end')
+            
+        if self.time_end_entry.get():
+            self.time_end_entry.delete(0, 'end')
+            
+        if self.loco_entry.get():
+            self.loco_entry.delete(0, 'end')
+        
+        # 2. 强制主窗口拿回焦点，让那些被删掉内容的输入框重新显示出占位符
+        self.focus_set() 
+        
+        # 3. 刷新表格恢复全量数据
         self.refresh_treeview(self.log_data)
+    # =========================================================
 
     def on_tree_select(self, event):
         selected_items = self.tree.selection()
