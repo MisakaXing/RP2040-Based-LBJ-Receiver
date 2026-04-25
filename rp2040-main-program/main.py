@@ -453,7 +453,7 @@ def draw_jump_id(full=True):
         color = YELLOW if edit_step == i else WHITE
         tft.fill_rect(110 + i*25, 110, 16, 32, 0x2104)
         tft.draw_gbk(str(edit_id[i]).encode(), 110 + i*25, 110, color, 0x2104, scale=2)
-        time.sleep_ms(1) 
+        time.sleep_ms(20) 
 
 def draw_confirm_format():
     global last_screen_layout
