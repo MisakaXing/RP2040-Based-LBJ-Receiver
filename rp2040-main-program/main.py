@@ -16,10 +16,10 @@ from boot_post import SystemPOST
 # ★ 系统性能配置与时钟加固
 # ==========================================
 pin_bl = Pin(6, Pin.OUT, value=0)
-machine.freq(240000000) #超频
+machine.freq(240000000) # 超频
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.0
+Program_ver = 3.1 # 纯视觉警告版
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -335,7 +335,6 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         h = 16 * sc
         
         if not is_partial:
-            # 标签改为全白 (WHITE)
             tft.draw_gbk(b'\xb3\xb5:', 20, y_start, WHITE, bg_color, scale=sc) 
             tft.draw_gbk(b'\xcb\xd9:', 20, y_start+y_step, WHITE, bg_color, scale=sc) 
             tft.draw_gbk(b'\xb1\xea:', 20, y_start+y_step*2, WHITE, bg_color, scale=sc) 
@@ -354,7 +353,6 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         y3 = 125 + y_offset
 
         if not is_partial:
-            # 标签改为全白 (WHITE)
             tft.draw_gbk(b'\xb3\xb5:', 5, y1, WHITE, bg_color, scale=2)   
             tft.draw_gbk(b'\xcb\xd9:', 170, y1, WHITE, bg_color, scale=2) 
             tft.draw_gbk(b'\xcf\xdf:', 5, y2, WHITE, bg_color, scale=2)   
@@ -533,7 +531,11 @@ def process_ui_data(data):
                     time.sleep_ms(1)
                     update_top_bar()
         elif "train_data" in msg_type or "only" in msg_type:
-            beep(0.05); has_received = True
+            
+            # 正常接收的提示音（满载时也不用响特殊警报了）
+            beep(0.05) 
+                
+            has_received = True
             
             if not screen_is_on:
                 pin_bl.value(0)
@@ -551,7 +553,12 @@ def process_ui_data(data):
             last_is_full = (msg_type != "basic_only")
             
             if system_state == "DASHBOARD":
-                current_status, current_status_color = (b'FULL DATA', GREEN) if last_is_full else (b'BASIC', YELLOW)
+                # ★ 视觉逻辑：内存满了强制在右上角显示红色的 MEM FULL
+                if total_count >= MAX_HIST:
+                    current_status, current_status_color = b'MEM FULL', RED
+                else:
+                    current_status, current_status_color = (b'FULL DATA', GREEN) if last_is_full else (b'BASIC', YELLOW)
+                    
                 current_status = current_status[:8]
                 time.sleep_ms(1)
                 
