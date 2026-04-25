@@ -60,9 +60,9 @@ class SystemPOST:
         # 记得在这里加上你校准后的 BAT_OFFSET，比如 0.255
         volts = (raw / 65535.0) * 3.3 * 2 + 0.255 
         
-        if volts < 3.3:
+        if volts < 3.5:
             self._check_end("ERR", f"{volts:.2f}V (CRITICAL)")
-        elif volts < 3.6:
+        elif volts < 3.7:
             self._check_end("WARN", f"{volts:.2f}V (LOW)")
         else:
             self._check_end("OK", f"{volts:.2f}V (Good)")
