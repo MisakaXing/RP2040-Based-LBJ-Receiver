@@ -3,15 +3,21 @@ import time
 import rp2
 import json
 
-# ★ 核心修复 1：将 push_thresh 改为 32，硬件 FIFO 深度扩大 4 倍，可缓冲高达 106ms 的电波！
+# ★ 核心大修 1：彻底抛弃 wait gpio！使用 jmp_pin 进行相对映射，避开 RP2350 底层陷阱
 @rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_LEFT, autopush=True, push_thresh=32)
 def pocsag_rx():
-    wait(0, gpio, 20)
-    wait(1, gpio, 20)
-    in_(pins, 1)
+    label("wait_low")
+    jmp(pin, "wait_low")  # 如果 jmp_pin(时钟) 为高电平，就在这死循环等它变低
+    
+    label("wait_high")
+    jmp(pin, "read_data") # 如果 jmp_pin(时钟) 变高了，跳去读数据 (上升沿触发)
+    jmp("wait_high")      # 否则继续等它变高
+    
+    label("read_data")
+    in_(pins, 1)          # 从 in_base(数据) 引脚读取 1 个 bit 存入移位寄存器
 
 class LBJReceiver:
-    def __init__(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15, data_pin=21, loco_file='locos.json'):
+    def __init__(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15, data_pin=21, clk_pin=20, loco_file='locos.json'):
         self.loco_types = {}
         self.callback = None
         self.loco_file = loco_file
@@ -41,7 +47,7 @@ class LBJReceiver:
         
         self._load_loco_types()
         self._init_radio(spi_id, sck, mosi, miso, cs, rst)
-        self._init_pio(data_pin)
+        self._init_pio(data_pin, clk_pin)
         time.sleep_ms(100)  
         self._w(0x01, 0x01) 
         time.sleep_ms(5)
@@ -63,12 +69,19 @@ class LBJReceiver:
         except Exception: pass
 
     def _init_radio(self, spi_id, sck, mosi, miso, cs, rst):
-        self.spi = machine.SPI(spi_id, baudrate=5000000,
+        # ★ 核心大修 2：降频至 2MHz 并明确极性，防止 RP2350 快速电平在杜邦线上产生反射导致射频芯片假死
+        self.spi = machine.SPI(spi_id, baudrate=2000000, polarity=0, phase=0,
                                sck=machine.Pin(sck), mosi=machine.Pin(mosi), miso=machine.Pin(miso))
         self.cs_pin = machine.Pin(cs, machine.Pin.OUT, value=1)
         self.rst_pin = machine.Pin(rst, machine.Pin.OUT, value=1)
         
         self.rst_pin.value(0); time.sleep_ms(10); self.rst_pin.value(1); time.sleep_ms(10)
+        
+        # ★ 增加硬件自检：如果读不到芯片版本，说明连线或 SPI 彻底挂了
+        chip_ver = self._r(0x42)
+        if chip_ver in [0x00, 0xFF]:
+            print(f"⚠️ 严重警告: 射频芯片通信失败! 读到版本号: {hex(chip_ver)}。请检查 SPI 接线！")
+            
         self._setup_pocsag(821237500, ppm_offset=6.0, bps=1200)
 
     def _r(self, r):
@@ -110,10 +123,18 @@ class LBJReceiver:
         self._w(0x0D, 0x50) 
         self._w(0x31, 0x00); self._w(0x40, 0x00); self._w(0x01, 0x05)
 
-    def _init_pio(self, data_pin):
-        self.sm = rp2.StateMachine(0, pocsag_rx, freq=2000000, in_base=machine.Pin(data_pin))
+    def _init_pio(self, data_pin, clk_pin=20):
+        # 强制显式激活数据和时钟引脚的输入缓冲器
+        self.hardware_clk = machine.Pin(clk_pin, machine.Pin.IN, machine.Pin.PULL_UP)
+        self.hardware_data = machine.Pin(data_pin, machine.Pin.IN, machine.Pin.PULL_UP)
+        
+        # ★ 核心大修 3：巧妙地将 jmp_pin 绑定到时钟，in_base 绑定到数据，完美剥离物理限制
+        self.sm = rp2.StateMachine(0, pocsag_rx, freq=2000000, 
+                                   in_base=self.hardware_data, 
+                                   jmp_pin=self.hardware_clk)
         self.sm.active(1)
-        while self.sm.rx_fifo() > 0: self.sm.get()
+        while self.sm.rx_fifo() > 0: 
+            self.sm.get()
 
     def _calc_syndrome(self, cw):
         reg = (cw >> 1) & 0x7FFFFFFF
@@ -266,10 +287,8 @@ class LBJReceiver:
             self.synced = False
             self.last_sync_time = now
 
-        # ★ 核心修复 2：按 32 位（4字节）批量拉取数据，大幅度降低 Python 的遍历负载
         while self.sm.rx_fifo() > 0:
             word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF 
-            # 一次性处理 32 个 bit，即便循环中途被中断，FIFO 也是安全的
             for i in range(31, -1, -1):
                 bit = (word >> i) & 1
                 if not self.synced:
@@ -314,7 +333,6 @@ class LBJReceiver:
                                                 self.numeric_output += self.BCD_MAP[nibble_rev]
                         self.bit_count = self.current_cw = 0
 
-        # ★ 核心修复 3：解绑了与 self.sm.rx_fifo() == 0 的强依赖，因为硬件缓存已经足够深，有数据直接解析，再也不怕拥堵
         if len(self.raw_queue) > 0:
             addr, raw, pkt_rssi = self.raw_queue.pop(0)
             try:
