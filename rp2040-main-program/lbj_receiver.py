@@ -3,7 +3,7 @@ import time
 import rp2
 import json
 
-# ★ 核心大修 1：彻底抛弃 wait gpio！使用 jmp_pin 进行相对映射，避开 RP2350 底层陷阱
+# 使用 jmp_pin 进行相对映射
 @rp2.asm_pio(in_shiftdir=rp2.PIO.SHIFT_LEFT, autopush=True, push_thresh=32)
 def pocsag_rx():
     label("wait_low")
@@ -69,7 +69,7 @@ class LBJReceiver:
         except Exception: pass
 
     def _init_radio(self, spi_id, sck, mosi, miso, cs, rst):
-        # ★ 核心大修 2：降频至 2MHz 并明确极性，防止 RP2350 快速电平在杜邦线上产生反射导致射频芯片假死
+        # 降频至 2MHz 并明确极性，防止 RP2350 快速电平在杜邦线上产生反射导致射频芯片假死
         self.spi = machine.SPI(spi_id, baudrate=2000000, polarity=0, phase=0,
                                sck=machine.Pin(sck), mosi=machine.Pin(mosi), miso=machine.Pin(miso))
         self.cs_pin = machine.Pin(cs, machine.Pin.OUT, value=1)
@@ -128,7 +128,7 @@ class LBJReceiver:
         self.hardware_clk = machine.Pin(clk_pin, machine.Pin.IN, machine.Pin.PULL_UP)
         self.hardware_data = machine.Pin(data_pin, machine.Pin.IN, machine.Pin.PULL_UP)
         
-        # ★ 核心大修 3：巧妙地将 jmp_pin 绑定到时钟，in_base 绑定到数据，完美剥离物理限制
+        # 将 jmp_pin 绑定到时钟，in_base 绑定到数据，剥离物理限制
         self.sm = rp2.StateMachine(0, pocsag_rx, freq=2000000, 
                                    in_base=self.hardware_data, 
                                    jmp_pin=self.hardware_clk)

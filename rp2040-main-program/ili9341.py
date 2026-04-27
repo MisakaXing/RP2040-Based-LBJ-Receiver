@@ -5,7 +5,6 @@ import framebuf
 BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA = 0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0x07FF, 0xFFE0, 0x8410, 0xF81F
 
 class ILI9341:
-    # 宽度和高度修改为横屏比例 320x240
     def __init__(self, spi, cs, dc, rst, width=320, height=240): 
         self.spi = spi
         self.cs = machine.Pin(cs, machine.Pin.OUT, value=1)
@@ -41,7 +40,7 @@ class ILI9341:
     def init_display(self):
         for cmd, data in [
             (0x01, None), (0x11, None), (0x3A, b'\x55'), 
-            (0x36, b'\x28'), # MADCTL: 0x28 为标准的横屏模式 (Landscape)
+            (0x36, b'\x28'), # MADCTL: 0x28 为标准的横屏模式
             (0x29, None)
         ]:
             self.write_cmd(cmd)
@@ -102,7 +101,7 @@ class ILI9341:
                 # 默认设为空白像素块 (全 0)
                 font_data = bytearray(32) 
                 
-                # 【核心拦截器】：严格校验 GB2312 汉字编码范围
+                # 严格校验 GB2312 汉字编码范围
                 # 只有区码和位码都在合法范围内，才去读字库
                 if 0xA1 <= b1 <= 0xF7 and 0xA1 <= b2 <= 0xFE:
                     offset = ((b1 - 0xA1) * 94 + (b2 - 0xA1)) * 32

@@ -12,14 +12,13 @@ from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY,
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST 
 
-# ==========================================
-# ★ 系统性能配置与时钟加固
-# ==========================================
+# 系统性能配置与时钟加固
+
 pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(240000000) # 超频
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.1 # 纯视觉警告版
+Program_ver = 3.1 
 is_es_ver = 1 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -33,13 +32,12 @@ last_hw_update = 0
 last_rssi_str = "N/A" 
 screen_is_on = True 
 
-# ==========================================
-# 1. 硬件 IO 初始化 
-# ==========================================
+# 1. 硬件 IO 初始化
+
 tft_cs = Pin(9, Pin.OUT, value=1) 
 spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
 tft = ILI9341(spi1, cs=9, dc=12, rst=13)
-spi1.init(baudrate=80000000) # 80MHz SPI 极限速度
+spi1.init(baudrate=80000000) # 80MHz SPI 速度
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
@@ -52,9 +50,7 @@ rtc = DS3231(i2c0)
 btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3, 4, 5)]
 sensor_temp = machine.ADC(4)
 
-# ==========================================
-# ★ 核心切片渲染函数
-# ==========================================
+# 核心切片渲染函数
 def safe_fill_rect(x, y, w, h, color, slice_h=15):
     current_y = y
     remain_h = h
@@ -67,9 +63,8 @@ def safe_fill_rect(x, y, w, h, color, slice_h=15):
 
 safe_fill_rect(0, 0, 320, 240, BLACK)
 
-# ==========================================
 # 2. 系统全局变量
-# ==========================================
+
 MAX_HIST = 2000
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
@@ -115,9 +110,7 @@ last_is_full = True
 need_post_train_gc = False 
 last_screen_layout = None
 
-# ==========================================
 # 3. 核心功能函数
-# ==========================================
 def beep(duration=0.02):
     if cfg_buzzer: buzzer.value(1); time.sleep(duration); buzzer.value(0)
 
@@ -239,9 +232,8 @@ def log_to_sd(data):
     finally:
         spi1.init(baudrate=80000000)
 
-# ==========================================
-# ★ 4. UI 绘制函数 (白色标签定点刷新版)
-# ==========================================
+# 4. UI 绘制函数 
+
 def draw_ui_skeleton():
     global last_screen_layout
     last_screen_layout = None 
@@ -496,9 +488,7 @@ def draw_popup(msg, color=RED):
     tft.draw_gbk(msg, 75, 100, WHITE, color)
     time.sleep_ms(1)
 
-# ==========================================
-# ★ 5. 核心 1 子线程
-# ==========================================
+# 5. 核心 1 子线程
 def light_callback(data):
     with ui_lock:
         ui_queue.append(data)
@@ -532,7 +522,7 @@ def process_ui_data(data):
                     update_top_bar()
         elif "train_data" in msg_type or "only" in msg_type:
             
-            # 正常接收的提示音（满载时也不用响特殊警报了）
+            # 正常接收的提示音
             beep(0.05) 
                 
             has_received = True
@@ -553,7 +543,7 @@ def process_ui_data(data):
             last_is_full = (msg_type != "basic_only")
             
             if system_state == "DASHBOARD":
-                # ★ 视觉逻辑：内存满了强制在右上角显示红色的 MEM FULL
+                # 内存满了强制在右上角显示红色的 MEM FULL
                 if total_count >= MAX_HIST:
                     current_status, current_status_color = b'MEM FULL', RED
                 else:
@@ -569,9 +559,8 @@ def process_ui_data(data):
             need_post_train_gc = True
     except: pass
 
-# ==========================================
 # 6. 启动初始化
-# ==========================================
+
 load_config() 
 init_history()
 check_sd_startup() 
@@ -598,9 +587,8 @@ else:
 last_sec = time.ticks_ms()
 heartbeat = False
 
-# ==========================================
-# ★ 7. 核心 0 主循环
-# ==========================================
+# 7. 核心 0 主循环
+
 while True:
     now = time.ticks_ms()
     

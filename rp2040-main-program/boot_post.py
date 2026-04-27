@@ -8,7 +8,7 @@ class SystemPOST:
         self.tft_cs = tft_cs
         self.y = 10
         self.has_warning = False
-        self.has_critical_error = False # ★ 新增：严重错误标志
+        self.has_critical_error = False # 严重错误标志
         self.rtc_error = False 
         self.tft.fill(0) 
         self.tft.draw_gbk(b'Board SelfCheck', 10, self.y, 0x07FF, 0, scale=2) 
@@ -52,14 +52,11 @@ class SystemPOST:
             else: self._check_end("ERR", "NOT FOUND/DEAD"); return False
         except Exception: self._check_end("ERR", "SPI BUS ERROR"); return False
 
-    # ★ 核心逻辑修改：电池电压三段式检查
+    # 电池电压三段式检查
     def check_bat(self, bat_adc, bat_en):
         self._check_start("Chk Battery.")
         bat_en.value(0); time.sleep_ms(10); raw = bat_adc.read_u16(); bat_en.value(1)
-        
-        # 记得在这里加上你校准后的 BAT_OFFSET，比如 0.255
-        volts = (raw / 65535.0) * 3.3 * 2 + 0.255 
-        
+        volts = (raw / 65535.0) * 3.3 * 2 + 0.174
         if volts < 3.5:
             self._check_end("ERR", f"{volts:.2f}V (CRITICAL)")
         elif volts < 3.7:
@@ -77,7 +74,7 @@ class SystemPOST:
         self._check_start("Chk RTC.....")
         try:
             raw_d = rtc.i2c.readfrom_mem(0x68, 0x04, 3)
-            # ★ 修复：给移位操作加上括号，先移位，再乘 10
+            # 给移位操作加上括号，先移位，再乘 10
             yy = (raw_d[2] >> 4) * 10 + (raw_d[2] & 0x0F)
             
             if yy < 24: 
@@ -107,7 +104,7 @@ class SystemPOST:
         self.check_sd(spi1, sd_cs)
         
         self.y += 10
-        # ★ 严重错误处理逻辑：如果是电压过低或无线电损坏，强制停机
+        # 如果是电压过低或无线电损坏，强制停机
         if not radio_ok or self.has_critical_error:
             msg = b'SYSTEM HALTED - LOW POWER' if self.has_critical_error else b'SYSTEM HALTED - RADIO DEAD'
             self.tft.fill_rect(0, self.y, 320, 30, 0xF800)
