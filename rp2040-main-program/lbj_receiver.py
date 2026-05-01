@@ -45,6 +45,9 @@ class LBJReceiver:
         self.POCSAG_IDLE  = 0x7A89C197
         self.BCH_POLY     = 0x769
         
+        # 在初始化时预计算 BCH 纠错表，只需执行一次
+        self._init_syndrome_table()
+        
         self._load_loco_types()
         self._init_radio(spi_id, sck, mosi, miso, cs, rst)
         self._init_pio(data_pin, clk_pin)
@@ -56,6 +59,22 @@ class LBJReceiver:
             self.sm.get()   
             
         self.last_sync_time = time.ticks_ms()
+
+    #预计算 1-bit 和 2-bit 错误的校验子查表
+    def _init_syndrome_table(self):
+        self.syndrome_table = {}
+        # 预计算 1-bit 错误 (数据位在 bits 1~31)
+        for i in range(1, 32):
+            mask = 1 << i
+            synd = self._calc_syndrome(mask)
+            self.syndrome_table[synd] = (mask, 1) # 记录 (错误掩码, 错误位数)
+            
+        # 预计算 2-bit 错误 (数据位在 bits 1~31)
+        for i in range(1, 32):
+            for j in range(i + 1, 32):
+                mask = (1 << i) | (1 << j)
+                synd = self._calc_syndrome(mask)
+                self.syndrome_table[synd] = (mask, 2)
 
     def set_callback(self, callback_func):
         self.callback = callback_func
@@ -69,7 +88,6 @@ class LBJReceiver:
         except Exception: pass
 
     def _init_radio(self, spi_id, sck, mosi, miso, cs, rst):
-        # 降频至 2MHz 并明确极性，防止 RP2350 快速电平在杜邦线上产生反射导致射频芯片假死
         self.spi = machine.SPI(spi_id, baudrate=2000000, polarity=0, phase=0,
                                sck=machine.Pin(sck), mosi=machine.Pin(mosi), miso=machine.Pin(miso))
         self.cs_pin = machine.Pin(cs, machine.Pin.OUT, value=1)
@@ -77,7 +95,6 @@ class LBJReceiver:
         
         self.rst_pin.value(0); time.sleep_ms(10); self.rst_pin.value(1); time.sleep_ms(10)
         
-        # ★ 增加硬件自检：如果读不到芯片版本，说明连线或 SPI 彻底挂了
         chip_ver = self._r(0x42)
         if chip_ver in [0x00, 0xFF]:
             print(f"⚠️ 严重警告: 射频芯片通信失败! 读到版本号: {hex(chip_ver)}。请检查 SPI 接线！")
@@ -124,11 +141,9 @@ class LBJReceiver:
         self._w(0x31, 0x00); self._w(0x40, 0x00); self._w(0x01, 0x05)
 
     def _init_pio(self, data_pin, clk_pin=20):
-        # 强制显式激活数据和时钟引脚的输入缓冲器
         self.hardware_clk = machine.Pin(clk_pin, machine.Pin.IN, machine.Pin.PULL_UP)
         self.hardware_data = machine.Pin(data_pin, machine.Pin.IN, machine.Pin.PULL_UP)
         
-        # 将 jmp_pin 绑定到时钟，in_base 绑定到数据，剥离物理限制
         self.sm = rp2.StateMachine(0, pocsag_rx, freq=2000000, 
                                    in_base=self.hardware_data, 
                                    jmp_pin=self.hardware_clk)
@@ -142,22 +157,46 @@ class LBJReceiver:
             if (reg >> i) & 1: reg ^= (self.BCH_POLY << (i - 10))
         return reg
 
+    # 纯位运算校验偶校验，摒弃巨慢的字符串转换 bin(cw).count('1')
+    def _parity_check(self, cw):
+        cw ^= cw >> 16
+        cw ^= cw >> 8
+        cw ^= cw >> 4
+        cw ^= cw >> 2
+        cw ^= cw >> 1
+        return (cw & 1) == 0
+
+    #重写 BCH 纠错，O(N^2) 穷举变为 O(1) 查表
     def _correct_bch(self, cw):
         synd = self._calc_syndrome(cw)
-        parity_ok = bin(cw).count('1') % 2 == 0
-        if synd == 0 and parity_ok: return cw, 0
-        if synd == 0 and not parity_ok: return cw ^ 1, 1 
-        if synd != 0 and not parity_ok:
-            for i in range(1, 32):
-                test_cw = cw ^ (1 << i)
-                if self._calc_syndrome(test_cw) == 0:
-                    test_cw = (test_cw & 0xFFFFFFFE) | (bin(test_cw >> 1).count('1') % 2)
-                    return test_cw, 1
-        if synd != 0 and parity_ok:
-            for i in range(1, 32):
-                for j in range(i + 1, 32):
-                    test_cw = cw ^ (1 << i) ^ (1 << j)
-                    if self._calc_syndrome(test_cw) == 0: return test_cw, 2
+        parity_ok = self._parity_check(cw)
+
+        # 0 bit 错误 (或仅仅是偶校验位错了)
+        if synd == 0:
+            if parity_ok:
+                return cw, 0       # 完美无错
+            else:
+                return cw ^ 1, 1   # 数据段正确，仅第 0 位(校验位)错误
+
+        # 查表匹配 1-bit 和 2-bit 错误图谱
+        match = self.syndrome_table.get(synd)
+        if match is not None:
+            err_mask, err_count = match
+            
+            if not parity_ok:
+                # 校验失败(奇数个错): 查到 1-bit 错说明是 1个数据位错误
+                if err_count == 1:
+                    return cw ^ err_mask, 1
+            else:
+                # 校验成功(偶数个错)
+                if err_count == 1:
+                    # 查到 1-bit 数据位错误，但校验和却成功了，说明校验位(bit 0)也跟着错了一个，共错 2 位
+                    return cw ^ err_mask ^ 1, 2
+                elif err_count == 2:
+                    # 查到 2-bit 数据位错误
+                    return cw ^ err_mask, 2
+
+        # 查表无果，说明大于 2-bit 错误，无法纠正
         return cw, -1
 
     def _bcd_to_hex(self, s):
