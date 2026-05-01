@@ -18,8 +18,8 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(240000000) # 超频
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.1 
-is_es_ver = 1 
+Program_ver = 3.2 
+is_es_ver = 0 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
 BAT_OFFSET = 0.174 
