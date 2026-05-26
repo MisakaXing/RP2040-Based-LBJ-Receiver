@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(240000000) # 超频
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.2 
+Program_ver = 3.4
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -30,6 +30,7 @@ ui_lock = _thread.allocate_lock()
 
 last_hw_update = 0  
 last_rssi_str = "N/A" 
+hist_rssi_str = "N/A" # 用于单独储存历史记录的 RSSI
 screen_is_on = True 
 
 # 1. 硬件 IO 初始化
@@ -48,6 +49,7 @@ i2c0 = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
 rtc = DS3231(i2c0)
 
 btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3, 4, 5)]
+btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
 # 核心切片渲染函数
@@ -95,7 +97,7 @@ last_sd_err_time = 0
 
 sd_active = False    
 sd_obj = None
-current_sd_status = "SD NO INSERT" 
+current_sd_status = "SD NOT INSERTED" 
 
 edit_y, edit_m, edit_d = 24, 1, 1
 edit_id = [0, 0, 0, 0] 
@@ -198,7 +200,7 @@ def check_sd_startup():
         else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
         sd_active = True
     except:
-        sd_active = False; sd_obj = None; current_sd_status = "SD NO INSERT"
+        sd_active = False; sd_obj = None; current_sd_status = "SD NOT INSERTED"
     finally:
         menu_items[5] = "EJECT SD" if sd_active else "MOUNT SD"
         spi1.init(baudrate=80000000)
@@ -264,12 +266,15 @@ def update_top_bar():
     time.sleep_ms(1) 
 
 def draw_hardware_bar(force=False):
-    global last_hw_update, last_rssi_str
+    global last_hw_update, last_rssi_str, hist_rssi_str, system_state
     now = time.ticks_ms()
     if not force and time.ticks_diff(now, last_hw_update) < 30000: return
     
     v, p = get_battery_info()
-    r = last_rssi_str
+    
+    # ▼ 修改：处于 HISTORY 模式时，底部状态栏使用历史 RSSI ▼
+    r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
+    
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
     
     raw_p = int(p.replace('%', ''))
@@ -586,6 +591,7 @@ else:
 
 last_sec = time.ticks_ms()
 heartbeat = False
+wake_btn_last_state = False
 
 # 7. 核心 0 主循环
 
@@ -630,8 +636,8 @@ while True:
                     last_minute = now_min
             except: pass
             
-            if not sd_active and current_sd_status != "SD NO INSERT" and time.ticks_diff(now, last_sd_err_time) > 3000:
-                current_sd_status = "SD NO INSERT"
+            if not sd_active and current_sd_status != "SD NOT INSERTED" and time.ticks_diff(now, last_sd_err_time) > 3000:
+                current_sd_status = "SD NOT INSERTED"
                 update_top_bar() 
                 
             if not has_received: 
@@ -643,16 +649,30 @@ while True:
         if has_received: display_train_data(last_basic, last_ext, last_is_full)
         else: draw_idle_screen()
 
-    # 按钮逻辑
-    any_btn = not btn_menu.value() or not btn_up.value() or not btn_down.value() or not btn_ok.value()
-    if any_btn:
+    is_wake_pressed = not btn_wake.value()
+    is_other_pressed = not btn_menu.value() or not btn_up.value() or not btn_down.value() or not btn_ok.value()
+
+    if is_wake_pressed or is_other_pressed:
         last_interaction = now
         if not screen_is_on:
             pin_bl.value(0) 
             screen_is_on = True
+            if is_wake_pressed:
+                if not wake_btn_last_state:
+                    beep()
+                    wake_btn_last_state = True
+            else:
+                beep()
             time.sleep_ms(300) 
             continue 
-            
+
+    if is_wake_pressed:
+        if not wake_btn_last_state:
+            beep()
+            wake_btn_last_state = True
+    else:
+        wake_btn_last_state = False 
+
     if not btn_menu.value():
         last_interaction = now; beep()
         if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID"]:
@@ -667,10 +687,18 @@ while True:
         last_interaction = now; beep()
         if system_state == "DASHBOARD" and total_count > 0:
             system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
-            if entry: display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+            # 读取记录时把 RSSI 提取出来，并强制刷新硬件状态栏
+            if entry:
+                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
+                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+                draw_hardware_bar(force=True)
         elif system_state == "HISTORY":
             hist_ptr = (hist_ptr - 1) % total_count; entry = load_history_entry(hist_ptr)
-            if entry: display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+            # 翻页时同样提取 RSSI 并刷新状态栏 
+            if entry:
+                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
+                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+                draw_hardware_bar(force=True)
         elif system_state == "MENU": 
             old_idx = menu_index; menu_index = (menu_index - 1) % len(menu_items); draw_menu(full=False, old_idx=old_idx)
         elif system_state == "SET_DATE":
@@ -686,10 +714,18 @@ while True:
         last_interaction = now; beep()
         if system_state == "DASHBOARD" and total_count > 0:
             system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
-            if entry: display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+            # 读取记录时提取 RSSI 并刷新状态栏 
+            if entry:
+                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
+                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+                draw_hardware_bar(force=True)
         elif system_state == "HISTORY":
             hist_ptr = (hist_ptr + 1) % total_count; entry = load_history_entry(hist_ptr)
-            if entry: display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+            # 翻页时提取 RSSI 并刷新状态栏 
+            if entry:
+                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
+                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+                draw_hardware_bar(force=True)
         elif system_state == "MENU": 
             old_idx = menu_index; menu_index = (menu_index + 1) % len(menu_items); draw_menu(full=False, old_idx=old_idx)
         elif system_state == "SET_DATE":
@@ -758,7 +794,10 @@ while True:
                 target_id = edit_id[0]*1000 + edit_id[1]*100 + edit_id[2]*10 + edit_id[3] - 1
                 if 0 <= target_id < total_count:
                     system_state = "HISTORY"; hist_ptr = target_id; entry = load_history_entry(hist_ptr)
+                    # 按 ID 跳转记录时提取 RSSI 并刷新状态栏 
+                    hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
                     display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
+                    draw_hardware_bar(force=True)
                 else: draw_popup(b'INDEX ERROR!'); time.sleep(1); draw_jump_id(full=True); edit_step = 0
             else: draw_jump_id(full=False)
             
