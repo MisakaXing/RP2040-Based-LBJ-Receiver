@@ -15,10 +15,10 @@ from boot_post import SystemPOST
 # 系统性能配置与时钟加固
 
 pin_bl = Pin(6, Pin.OUT, value=0)
-machine.freq(240000000) # 超频
-time.sleep_ms(200) 
+time.sleep_ms(200)
+machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 3.5
+Program_ver = 3.4
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -38,7 +38,7 @@ screen_is_on = True
 tft_cs = Pin(9, Pin.OUT, value=1) 
 spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
 tft = ILI9341(spi1, cs=9, dc=12, rst=13)
-spi1.init(baudrate=80000000) # 80MHz SPI 速度
+spi1.init(baudrate=60000000, polarity=0, phase=0) # 60MHz SPI 速度
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
@@ -52,9 +52,11 @@ btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3
 btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
-# 切片渲染函数
+# 核心切片渲染函数
 def safe_fill_rect(x, y, w, h, color, slice_h=15):
+    # 抛弃切片和休眠，直接调用底层硬件填充
     tft.fill_rect(x, y, w, h, color)
+
 safe_fill_rect(0, 0, 320, 240, BLACK)
 
 # 2. 系统全局变量
@@ -814,3 +816,4 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
+

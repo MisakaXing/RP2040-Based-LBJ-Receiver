@@ -20,9 +20,9 @@ class ILI9341:
 
     def reset(self):
         self.rst.value(0)
-        time.sleep_ms(50)
+        time.sleep_ms(100)
         self.rst.value(1)
-        time.sleep_ms(50)
+        time.sleep_ms(200)
 
     def write_cmd(self, cmd):
         self.dc.value(0)
@@ -38,14 +38,20 @@ class ILI9341:
         self.cs.value(1)
 
     def init_display(self):
-        for cmd, data in [
-            (0x01, None), (0x11, None), (0x3A, b'\x55'), 
-            (0x36, b'\x28'), # MADCTL: 0x28 为标准的横屏模式
-            (0x29, None)
-        ]:
-            self.write_cmd(cmd)
-            if data: self.write_data(data)
-            time.sleep_ms(10)
+        self.write_cmd(0x01)
+        time.sleep_ms(150)
+
+        self.write_cmd(0x11)
+        time.sleep_ms(150)
+
+        self.write_cmd(0x3A)
+        self.write_data(b'\x55')
+
+        self.write_cmd(0x36)
+        self.write_data(b'\x28')
+
+        self.write_cmd(0x29)
+        time.sleep_ms(20)
 
     def set_window(self, x, y, w, h):
         self.write_cmd(0x2A)
@@ -156,3 +162,4 @@ class ILI9341:
             # 无论出不出错，退出前统一关闭一次文件即可
             if hzk_file: 
                 hzk_file.close()
+
