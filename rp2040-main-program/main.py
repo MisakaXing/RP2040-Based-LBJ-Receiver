@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(240000000) # 超频
 time.sleep_ms(200) 
 last_gc = 0
-Program_ver = 3.4
+Program_ver = 3.5
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 Serial_Number = "N/A"
@@ -52,17 +52,9 @@ btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3
 btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
-# 核心切片渲染函数
+# 切片渲染函数
 def safe_fill_rect(x, y, w, h, color, slice_h=15):
-    current_y = y
-    remain_h = h
-    while remain_h > 0:
-        step = min(slice_h, remain_h)
-        tft.fill_rect(x, current_y, w, step, color)
-        time.sleep_ms(1)  
-        current_y += step
-        remain_h -= step
-
+    tft.fill_rect(x, y, w, h, color)
 safe_fill_rect(0, 0, 320, 240, BLACK)
 
 # 2. 系统全局变量

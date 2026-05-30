@@ -57,12 +57,23 @@ class ILI9341:
     def fill_rect(self, x, y, w, h, color):
         x, y = max(0, min(x, self.width - 1)), max(0, min(y, self.height - 1))
         w, h = max(0, min(w, self.width - x)), max(0, min(h, self.height - y))
-        if w == 0 or h == 0: return
+        if w <= 0 or h <= 0: return
         self.set_window(x, y, w, h)
         self.dc.value(1)
         self.cs.value(0)
-        color_buf = bytes([color >> 8, color & 0xFF]) * w
-        for _ in range(h): self.spi.write(color_buf)
+        
+        # 优化：每次将 8 行组合成一个数据块，大幅减少 Python 循环和 SPI 开销
+        # w*8*2 字节 = 最大只需占用约 5KB 内存，RP2040 完全扛得住
+        chunk_h = min(8, h)
+        color_buf = bytes([color >> 8, color & 0xFF]) * (w * chunk_h)
+        
+        for _ in range(h // chunk_h): 
+            self.spi.write(color_buf)
+            
+        rem = h % chunk_h
+        if rem: # 写入剩余不足一块的行
+            self.spi.write(bytes([color >> 8, color & 0xFF]) * (w * rem))
+            
         self.cs.value(1)
 
     def fill(self, color):
@@ -71,48 +82,77 @@ class ILI9341:
     def _draw_matrix(self, data, w, h, x, y, color, bg_color, scale):
         block_w, block_h = w * scale, h * scale
         buf = bytearray(block_w * block_h * 2)
+        
+        # 优化：提前分离高低字节，避免在内层循环做上千次位移计算
+        ch, cl = color >> 8, color & 0xFF
+        bh, bl = bg_color >> 8, bg_color & 0xFF
+        
         idx = 0
+        byte_idx = 0
+        bit_pos = 7
+        
         for row in range(h):
+            # 以行为单位渲染，减少内循环复杂度
+            line_buf = bytearray(block_w * 2)
+            l_idx = 0
+            for col in range(w):
+                is_set = data[byte_idx] & (1 << bit_pos)
+                high, low = (ch, cl) if is_set else (bh, bl)
+                
+                # 水平放大
+                for _ in range(scale):
+                    line_buf[l_idx] = high
+                    line_buf[l_idx+1] = low
+                    l_idx += 2
+                    
+                if bit_pos == 0:
+                    bit_pos = 7
+                    byte_idx += 1
+                else:
+                    bit_pos -= 1
+                    
+            # 垂直放大：直接整行进行 bytearray 级拷贝，比单个像素描绘快极多
             for _ in range(scale):
-                for col in range(w):
-                    bit_idx = row * w + col
-                    byte_idx, bit_pos = bit_idx // 8, 7 - (bit_idx % 8)
-                    pixel_color = color if (data[byte_idx] & (1 << bit_pos)) else bg_color
-                    high, low = pixel_color >> 8, pixel_color & 0xFF
-                    for _ in range(scale):
-                        buf[idx], buf[idx+1] = high, low
-                        idx += 2
+                buf[idx:idx+len(line_buf)] = line_buf
+                idx += len(line_buf)
+                
         self.set_window(x, y, block_w, block_h)
         self.dc.value(1); self.cs.value(0); self.spi.write(buf); self.cs.value(1)
 
     def draw_gbk(self, gbk_bytes, x, y, color, bg_color=BLACK, scale=1):
         curr_x = x
         i = 0
-        while i < len(gbk_bytes):
-            b1 = gbk_bytes[i]
-            if b1 < 0x80: 
-                self.char_fb.fill(0); self.char_fb.text(chr(b1), 0, 0, 1)
-                self._draw_matrix(self.char_buf, 8, 8, curr_x, y, color, bg_color, scale)
-                curr_x += 8 * scale; i += 1
-            else: 
-                if i + 1 >= len(gbk_bytes): break
-                b2 = gbk_bytes[i+1]
-                
-                # 默认设为空白像素块 (全 0)
-                font_data = bytearray(32) 
-                
-                # 严格校验 GB2312 汉字编码范围
-                # 只有区码和位码都在合法范围内，才去读字库
-                if 0xA1 <= b1 <= 0xF7 and 0xA1 <= b2 <= 0xFE:
-                    offset = ((b1 - 0xA1) * 94 + (b2 - 0xA1)) * 32
-                    if 0 <= offset <= 267616 - 32:
-                        try:
-                            with open('HZK16', 'rb') as f:
-                                f.seek(offset)
-                                read_data = f.read(32)
+        hzk_file = None # 优化：把文件句柄提到循环外
+        
+        try:
+            while i < len(gbk_bytes):
+                b1 = gbk_bytes[i]
+                if b1 < 0x80: 
+                    self.char_fb.fill(0); self.char_fb.text(chr(b1), 0, 0, 1)
+                    self._draw_matrix(self.char_buf, 8, 8, curr_x, y, color, bg_color, scale)
+                    curr_x += 8 * scale; i += 1
+                else: 
+                    if i + 1 >= len(gbk_bytes): break
+                    b2 = gbk_bytes[i+1]
+                    font_data = bytearray(32) 
+                    
+                    if 0xA1 <= b1 <= 0xF7 and 0xA1 <= b2 <= 0xFE:
+                        offset = ((b1 - 0xA1) * 94 + (b2 - 0xA1)) * 32
+                        if 0 <= offset <= 267616 - 32:
+                            # 优化：画一整串字，只做一次文件 Open！
+                            if hzk_file is None:
+                                try: hzk_file = open('HZK16', 'rb')
+                                except: pass
+                                
+                            if hzk_file:
+                                hzk_file.seek(offset)
+                                read_data = hzk_file.read(32)
                                 if len(read_data) == 32:
                                     font_data = read_data
-                        except: pass 
-                
-                self._draw_matrix(font_data, 16, 16, curr_x, y, color, bg_color, scale)
-                curr_x += 16 * scale; i += 2
+                                    
+                    self._draw_matrix(font_data, 16, 16, curr_x, y, color, bg_color, scale)
+                    curr_x += 16 * scale; i += 2
+        finally:
+            # 无论出不出错，退出前统一关闭一次文件即可
+            if hzk_file: 
+                hzk_file.close()
