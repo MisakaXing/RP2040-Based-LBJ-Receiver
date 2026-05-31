@@ -10,23 +10,22 @@ from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
-from boot_post import SystemPOST 
+from boot_post import SystemPOST
+import onewire
 
 # 系统性能配置与时钟加固
 
 pin_bl = Pin(6, Pin.OUT, value=0)
-machine.freq(240000000) # 超频
 time.sleep_ms(200)
+machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 3.5
+Program_ver = 3.6
 is_es_ver = 0 
 Author_Name = "MisakaXing"
-Serial_Number = "N/A"
+Serial_Number = get_serial_number()
 BAT_OFFSET = 0.174 
 DEBUG_MODE = False
-history_cache = {}
-MAX_CACHE_SIZE = 50  # 缓存在内存中的历史条数
-hist_read_file = None # 常驻的文件句柄
+
 ui_queue = [] 
 ui_lock = _thread.allocate_lock() 
 
@@ -40,7 +39,8 @@ screen_is_on = True
 tft_cs = Pin(9, Pin.OUT, value=1) 
 spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
 tft = ILI9341(spi1, cs=9, dc=12, rst=13)
-spi1.init(baudrate=40000000, polarity=0, phase=0) # 60MHz SPI 速度
+spi1.init(baudrate=60000000, polarity=0, phase=0) # 60MHz SPI 速度
+
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
 bat_adc = ADC(Pin(27)) 
@@ -53,9 +53,9 @@ btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3
 btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
-# 切片渲染函数
+# 核心切片渲染函数
 def safe_fill_rect(x, y, w, h, color, slice_h=15):
-    # 直接调用底层硬件填充
+    # 抛弃切片和休眠，直接调用底层硬件填充
     tft.fill_rect(x, y, w, h, color)
 
 safe_fill_rect(0, 0, 320, 240, BLACK)
@@ -108,6 +108,41 @@ need_post_train_gc = False
 last_screen_layout = None
 
 # 3. 核心功能函数
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x8C
+            else:
+                crc >>= 1
+    return crc
+
+
+def get_serial_number():
+    try:
+        ow = onewire.OneWire(Pin(26))
+        roms = ow.scan()
+
+        # 没芯片
+        if not roms:
+            return "N/A"
+
+        rom = roms[0]
+
+        # CRC校验
+        if crc8(rom[:7]) != rom[7]:
+            return "S/N INVALID"
+
+        # 返回48位唯一序列号
+        return ''.join('{:02X}'.format(b) for b in rom[1:7])
+
+    except Exception as e:
+        if DEBUG_MODE:
+            print("DS2401 Error:", e)
+        return "S/N INVALID"
+    
 def beep(duration=0.02):
     if cfg_buzzer: buzzer.value(1); time.sleep(duration); buzzer.value(0)
 
@@ -156,73 +191,29 @@ def init_history():
 
 def save_history(data):
     global total_count, history_offsets
-    # 注意：history_cache 和 MAX_CACHE_SIZE 已经在上一步定义为全局变量了，这里直接用即可
-    
-    if total_count >= MAX_HIST: 
-        return 
-        
+    if total_count >= MAX_HIST: return 
     try:
         time.sleep_ms(1) 
         t_str = rtc.get_time_str(True)
         time.sleep_ms(1) 
-        
-        # 1. 组装要保存的数据包
         record = {"t": t_str, "d": data}
         json_str = json.dumps(record) 
         time.sleep_ms(1) 
-        
-        # 2. 写入 Flash 闪存 (防止断电丢失)
         with open(HIST_FILE, 'a') as f:
-            f.seek(0, 2)
-            offset = f.tell() 
+            f.seek(0, 2); offset = f.tell() 
             f.write(json_str + '\n')
             history_offsets.append(offset) 
-            
-        # 3. 新增：将组装好的新数据直接送入内存缓存
-        new_index = total_count  # 此时的 total_count 正好是这个新数据的索引编号
-        history_cache[new_index] = record
-        
-        # 4. 新增：超出缓存最大容量时的清理逻辑 
-        if len(history_cache) > MAX_CACHE_SIZE:
-            # next(iter()) 会获取字典中最老的一个 Key (即最早进缓存的那个索引)
-            oldest_key = next(iter(history_cache))
-            del history_cache[oldest_key]
-            
-        # 5. 总数加 1
         total_count += 1
         time.sleep_ms(1) 
-    except Exception as e: 
-        print("Save history error:", e)
+    except: pass
 
 def load_history_entry(idx):
-    global hist_read_file
     if idx < 0 or idx >= len(history_offsets): return None
-    
-    # 1. 如果该页已经在缓存中，直接从 RAM 返回（耗时 0 毫秒）
-    if idx in history_cache:
-        return history_cache[idx]
-        
-    # 2. 缓存没命中时，使用常驻句柄去读，不反复执行耗时的 open()
     try:
-        if hist_read_file is None:
-            hist_read_file = open(HIST_FILE, 'r')
-            
-        hist_read_file.seek(history_offsets[idx])
-        line = hist_read_file.readline()
-        data = json.loads(line)
-        
-        # 存入字典缓存
-        history_cache[idx] = data
-        
-        # 维护缓存大小，超过50条就把最早看过的清掉，防止内存溢出
-        if len(history_cache) > MAX_CACHE_SIZE:
-            oldest_idx = next(iter(history_cache))
-            del history_cache[oldest_idx]
-            
-        return data
-    except Exception as e: 
-        print("Load history error:", e)
-        return None
+        with open(HIST_FILE, 'r') as f:
+            f.seek(history_offsets[idx]); line = f.readline()
+            return json.loads(line)
+    except: return None
 
 def check_sd_startup():
     global current_sd_status, sd_active, sd_obj, menu_items
@@ -311,7 +302,7 @@ def draw_hardware_bar(force=False):
     
     v, p = get_battery_info()
     
-    # 处于 HISTORY 模式时，底部状态栏使用历史 RSSI 
+    # ▼ 修改：处于 HISTORY 模式时，底部状态栏使用历史 RSSI ▼
     r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
     
     t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
@@ -369,19 +360,19 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         y_step = 40 if is_history else 50
         lbl_w = 48 if sc == 2 else 72  
         h = 16 * sc
-        full_train_str = "{:<12}".format(full_train)
-        speed_str = "{:<12}".format(f"{speed} K/H")
-        km_str = "{:<12}".format(f"{km} K")
         
         if not is_partial:
             tft.draw_gbk(b'\xb3\xb5:', 20, y_start, WHITE, bg_color, scale=sc) 
             tft.draw_gbk(b'\xcb\xd9:', 20, y_start+y_step, WHITE, bg_color, scale=sc) 
             tft.draw_gbk(b'\xb1\xea:', 20, y_start+y_step*2, WHITE, bg_color, scale=sc) 
-        
+        else:
+            tft.fill_rect(20+lbl_w, y_start, 300-lbl_w, h, bg_color)
+            tft.fill_rect(20+lbl_w, y_start+y_step, 300-lbl_w, h, bg_color)
+            tft.fill_rect(20+lbl_w, y_start+y_step*2, 300-lbl_w, h, bg_color)
 
-        tft.draw_gbk(full_train_str.encode(), 20+lbl_w, y_start, CYAN, bg_color, scale=sc)
-        tft.draw_gbk(speed_str.encode(), 20+lbl_w, y_start+y_step, YELLOW, bg_color, scale=sc)
-        tft.draw_gbk(km_str.encode(), 20+lbl_w, y_start+y_step*2, GREEN, bg_color, scale=sc)
+        tft.draw_gbk(full_train.encode(), 20+lbl_w, y_start, CYAN, bg_color, scale=sc)
+        tft.draw_gbk(speed.encode() + b' K/H', 20+lbl_w, y_start+y_step, YELLOW, bg_color, scale=sc)
+        tft.draw_gbk(km.encode() + b' K', 20+lbl_w, y_start+y_step*2, GREEN, bg_color, scale=sc)
 
     else:
         y1 = 35 + y_offset
@@ -861,6 +852,4 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
-
-
 
