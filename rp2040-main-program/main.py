@@ -22,7 +22,6 @@ last_gc = 0
 Program_ver = 3.6
 is_es_ver = 0 
 Author_Name = "MisakaXing"
-Serial_Number = get_serial_number()
 BAT_OFFSET = 0.174 
 DEBUG_MODE = False
 
@@ -59,9 +58,42 @@ def safe_fill_rect(x, y, w, h, color, slice_h=15):
     tft.fill_rect(x, y, w, h, color)
 
 safe_fill_rect(0, 0, 320, 240, BLACK)
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x8C
+            else:
+                crc >>= 1
+    return crc
 
+
+def get_serial_number():
+    try:
+        ow = onewire.OneWire(Pin(26))
+        roms = ow.scan()
+
+        # 没芯片
+        if not roms:
+            return "N/A"
+
+        rom = roms[0]
+
+        # CRC校验
+        if crc8(rom[:7]) != rom[7]:
+            return "S/N INVALID"
+
+        # 返回48位唯一序列号
+        return ''.join('{:02X}'.format(b) for b in rom[1:7])
+
+    except Exception as e:
+        if DEBUG_MODE:
+            print("DS2401 Error:", e)
+        return "S/N INVALID"
 # 2. 系统全局变量
-
+Serial_Number = get_serial_number()
 MAX_HIST = 2000
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
@@ -108,40 +140,7 @@ need_post_train_gc = False
 last_screen_layout = None
 
 # 3. 核心功能函数
-def crc8(data):
-    crc = 0
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x8C
-            else:
-                crc >>= 1
-    return crc
 
-
-def get_serial_number():
-    try:
-        ow = onewire.OneWire(Pin(26))
-        roms = ow.scan()
-
-        # 没芯片
-        if not roms:
-            return "N/A"
-
-        rom = roms[0]
-
-        # CRC校验
-        if crc8(rom[:7]) != rom[7]:
-            return "S/N INVALID"
-
-        # 返回48位唯一序列号
-        return ''.join('{:02X}'.format(b) for b in rom[1:7])
-
-    except Exception as e:
-        if DEBUG_MODE:
-            print("DS2401 Error:", e)
-        return "S/N INVALID"
     
 def beep(duration=0.02):
     if cfg_buzzer: buzzer.value(1); time.sleep(duration); buzzer.value(0)
@@ -462,7 +461,7 @@ def draw_set_date(full=True):
     tft.draw_gbk(f"20{edit_y:02}".encode(), 70, 90, cols[0], 0x2104, scale=2)
     tft.draw_gbk(f"{edit_m:02}".encode(), 150, 90, cols[1], 0x2104, scale=2)
     tft.draw_gbk(f"{edit_d:02}".encode(), 198, 90, cols[2], 0x2104, scale=2)
-    time.sleep_ms(1)
+    time.sleep_ms(100)
 
 def draw_jump_id(full=True):
     global last_screen_layout
