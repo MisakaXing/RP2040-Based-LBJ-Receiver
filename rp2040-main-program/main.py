@@ -17,9 +17,9 @@ import onewire
 
 pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
-machine.freq(240000000) # 超频 
+machine.freq(200000000) # 超频 
 last_gc = 0
-Program_ver = 3.6
+Program_ver = 3.7
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -58,40 +58,34 @@ def safe_fill_rect(x, y, w, h, color, slice_h=15):
     tft.fill_rect(x, y, w, h, color)
 
 safe_fill_rect(0, 0, 320, 240, BLACK)
-def crc8(data):
-    crc = 0
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x8C
-            else:
-                crc >>= 1
-    return crc
-
 
 def get_serial_number():
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
     try:
-        ow = onewire.OneWire(Pin(26))
-        roms = ow.scan()
+        n = int.from_bytes(machine.unique_id(), 'big')
 
-        # 没芯片
-        if not roms:
-            return "N/A"
+        # Base36
+        s = ""
+        while n:
+            n, r = divmod(n, 36)
+            s = chars[r] + s
 
-        rom = roms[0]
+        s = s or "0"
 
-        # CRC校验
-        if crc8(rom[:7]) != rom[7]:
-            return "S/N INVALID"
+        # 固定12位，前补0
+        if len(s) < 12:
+            s = ("0" * (12 - len(s))) + s
 
-        # 返回48位唯一序列号
-        return ''.join('{:02X}'.format(b) for b in rom[1:7])
+        # 超过12位截取后12位
+        return s[-12:]
 
     except Exception as e:
-        if DEBUG_MODE:
-            print("DS2401 Error:", e)
+        print(e)
         return "S/N INVALID"
+
+
+
 # 2. 系统全局变量
 Serial_Number = get_serial_number()
 MAX_HIST = 2000
@@ -851,4 +845,7 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
+
+
+
 
