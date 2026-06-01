@@ -53,11 +53,22 @@ btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
 # 核心切片渲染函数
-def safe_fill_rect(x, y, w, h, color, slice_h=15):
-    # 抛弃切片和休眠，直接调用底层硬件填充
-    tft.fill_rect(x, y, w, h, color)
-
-safe_fill_rect(0, 0, 320, 240, BLACK)
+# 专为 Pico 2 (RP2350) 优化的核心切片渲染函数
+def safe_fill_rect(x, y, w, h, color, slice_h=120):
+    # Pico 2 拥有 520KB 超大内存，120行切片毫无压力
+    current_y = y
+    remain_h = h
+    while remain_h > 0:
+        step = min(slice_h, remain_h)
+        tft.fill_rect(x, current_y, w, step, color)
+        
+        # 必须用 sleep_ms 才能在 Pico 2 上真正且安全地释放双核锁
+        # 因为全屏(240行)只被切成了 2 块，所以只会执行 1~2 次休眠
+        # 也就是说总共只延迟 1 毫秒！肉眼看来依然是极致的瞬间刷新！
+        time.sleep_ms(1) 
+        
+        current_y += step
+        remain_h -= step
 
 def get_serial_number():
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
