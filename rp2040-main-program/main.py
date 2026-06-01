@@ -17,7 +17,7 @@ import onewire
 
 pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
-machine.freq(200000000) # 超频 
+machine.freq(240000000) # 超频 
 last_gc = 0
 Program_ver = 3.7
 is_es_ver = 0 
