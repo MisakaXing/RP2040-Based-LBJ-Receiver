@@ -300,14 +300,13 @@ def draw_hardware_bar(force=False):
     
     # 处于 HISTORY 模式时，底部状态栏使用历史 RSSI
     r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
-    #从DS3231读取温度
+    
+    # 从 RP2040 内部温度传感器读取温度
     try:
-        raw_temp = i2c0.readfrom_mem(0x68, 0x11, 2)
-        # MSB 是整数部分，LSB 的高两位是小数部分 (0.25 的倍数)
-        temp_c = raw_temp[0] + ((raw_temp[1] >> 6) * 0.25)
-        # 处理负温度 (最高位为 1)
-        if raw_temp[0] & 0x80: 
-            temp_c -= 256
+        # 读取 ADC4 原生值并转换为电压
+        reading = sensor_temp.read_u16() * (3.3 / 65535.0)
+        # 使用 RP2040 官方数据手册给出的转换公式
+        temp_c = 27 - (reading - 0.706) / 0.001721
         t = f"{temp_c:.1f}C"
     except:
         t = "ERR"
