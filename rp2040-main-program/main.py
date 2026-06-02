@@ -298,10 +298,19 @@ def draw_hardware_bar(force=False):
     
     v, p = get_battery_info()
     
-    # ▼ 修改：处于 HISTORY 模式时，底部状态栏使用历史 RSSI ▼
+    # 处于 HISTORY 模式时，底部状态栏使用历史 RSSI
     r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
-    
-    t = f"{27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721:.1f}C"
+    #从DS3231读取温度
+    try:
+        raw_temp = i2c0.readfrom_mem(0x68, 0x11, 2)
+        # MSB 是整数部分，LSB 的高两位是小数部分 (0.25 的倍数)
+        temp_c = raw_temp[0] + ((raw_temp[1] >> 6) * 0.25)
+        # 处理负温度 (最高位为 1)
+        if raw_temp[0] & 0x80: 
+            temp_c -= 256
+        t = f"{temp_c:.1f}C"
+    except:
+        t = "ERR"
     
     raw_p = int(p.replace('%', ''))
     bat_color = RED if raw_p < 20 else WHITE
@@ -848,7 +857,3 @@ while True:
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
 
     time.sleep_ms(1)
-
-
-
-

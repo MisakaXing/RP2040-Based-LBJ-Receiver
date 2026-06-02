@@ -24,7 +24,7 @@ from tkinter import messagebox
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-# ================= 嵌入的硬件自检脚本 =================
+# 嵌入的硬件自检脚本 
 # 这个脚本不会被写入 Flash，只会通过 mpremote run 直接在 RAM 里运行并回传结果
 HARDWARE_TEST_SCRIPT = """import machine
 import time
@@ -174,7 +174,7 @@ class PicoUpdaterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pico LBJ-Receiver 自动更新与自检助手")
+        self.title("Pico LBJ-Receiver 自动更新与自检工具")
         self.geometry("750x600")
         self.minsize(650, 550)
 
