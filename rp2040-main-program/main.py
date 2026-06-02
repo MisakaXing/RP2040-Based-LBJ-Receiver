@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
 machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 3.7
+Program_ver = 3.8
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -121,7 +121,7 @@ last_sd_err_time = 0
 
 sd_active = False    
 sd_obj = None
-current_sd_status = "SD NOT INSERTED" 
+current_sd_status = "NO SD CARD" 
 
 edit_y, edit_m, edit_d = 24, 1, 1
 edit_id = [0, 0, 0, 0] 
@@ -226,7 +226,7 @@ def check_sd_startup():
         else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
         sd_active = True
     except:
-        sd_active = False; sd_obj = None; current_sd_status = "SD NOT INSERTED"
+        sd_active = False; sd_obj = None; current_sd_status = "NO SD CARD"
     finally:
         menu_items[5] = "EJECT SD" if sd_active else "MOUNT SD"
         spi1.init(baudrate=80000000)
@@ -278,17 +278,17 @@ def update_top_bar():
     tft.fill_rect(0, 0, 320, 24, 0x01CF) 
     time.sleep_ms(1) 
     
-    tft.draw_gbk(current_sd_status.encode(), 5, 4, WHITE, 0x01CF)
+    tft.draw_gbk(current_sd_status.encode(), 10, 4, WHITE, 0x01CF)
     last_sd_status_drawn = current_sd_status 
     time.sleep_ms(1) 
     
     t_str = rtc.get_time_str(show_seconds=False)
-    tft.draw_gbk(t_str.encode(), 135, 4, YELLOW, 0x01CF)
+    tft.draw_gbk(t_str.encode(), 145, 4, YELLOW, 0x01CF)
     try: last_minute = int(t_str.split(':')[1])
     except: pass
     time.sleep_ms(1) 
     
-    tft.draw_gbk(current_status, 220, 4, current_status_color, 0x01CF)
+    tft.draw_gbk(current_status, 230, 4, current_status_color, 0x01CF)
     time.sleep_ms(1) 
 
 def draw_hardware_bar(force=False):
@@ -671,8 +671,8 @@ while True:
                     last_minute = now_min
             except: pass
             
-            if not sd_active and current_sd_status != "SD NOT INSERTED" and time.ticks_diff(now, last_sd_err_time) > 3000:
-                current_sd_status = "SD NOT INSERTED"
+            if not sd_active and current_sd_status != "NO SD CARD" and time.ticks_diff(now, last_sd_err_time) > 3000:
+                current_sd_status = "NO SD CARD"
                 update_top_bar() 
                 
             if not has_received: 

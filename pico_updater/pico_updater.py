@@ -1,5 +1,13 @@
 import sys
 import os
+import re
+import threading
+import tempfile
+import subprocess
+import requests
+import customtkinter as ctk
+import serial.tools.list_ports
+from tkinter import messagebox
 
 if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
     # 伪造标准的 mpremote 命令行参数
@@ -11,23 +19,35 @@ if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
         sys.exit(e.code)
     sys.exit(0) # 执行完毕立刻退出
 
-import re
-import threading
-import tempfile
-import subprocess
-import requests
-import customtkinter as ctk
-import serial.tools.list_ports
-from tkinter import messagebox
-
 # 配置 CustomTkinter 主题
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-# 嵌入的硬件自检脚本 
-# 这个脚本不会被写入 Flash，只会通过 mpremote run 直接在 RAM 里运行并回传结果
+# ================= 嵌入的硬件自检脚本 =================
 HARDWARE_TEST_SCRIPT = """import machine
 import time
+
+# --- 全局测试状态记录 ---
+test_results = {
+    "DS3231": False,
+    "SX1276_SPI": False,
+    "SX1276_Signal": False
+}
+
+def get_serial_number():
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    try:
+        n = int.from_bytes(machine.unique_id(), 'big')
+        s = ""
+        while n:
+            n, r = divmod(n, 36)
+            s = chars[r] + s
+        s = s or "0"
+        if len(s) < 12:
+            s = ("0" * (12 - len(s))) + s
+        return s[-12:]
+    except Exception as e:
+        return "S/N INVALID"
 
 print("\\n" + "="*40)
 print("开始执行硬件自检 (DS3231 & SX1276)")
@@ -36,11 +56,11 @@ print("="*40)
 # --- 1. 检查 DS3231 ---
 print("\\n[0] 正在测试 DS3231 RTC 模块...")
 try:
-    # 依据你项目配置，I2C0 挂在 Pin(0) 和 Pin(1)
     i2c = machine.I2C(0, sda=machine.Pin(0), scl=machine.Pin(1), freq=400000)
     devices = i2c.scan()
     if 0x68 in devices:
         print("    ✅ DS3231 芯片检测成功 (I2C地址: 0x68)")
+        test_results["DS3231"] = True
     else:
         print("    ❌ 未在 I2C 总线上找到 DS3231 (0x68)！请检查接线或电源。")
 except Exception as e:
@@ -97,6 +117,8 @@ class SX1276Validator:
             print("    ✅ 确认芯片为 SX1276/77/78/79 系列。")
         else:
             print("    ⚠️ 读到版本号正常，但可能不是标准 SX1276 (通常为 0x12)。")
+        
+        test_results["SX1276_SPI"] = True
         return True
 
     def setup_continuous_rx(self):
@@ -140,10 +162,6 @@ class SX1276Validator:
         count_0 = self.bit_samples.count(0)
         count_1 = self.bit_samples.count(1)
         
-        print(f"    -> 总采样数: {sample_count}")
-        print(f"    -> 0 的数量: {count_0} ({count_0/sample_count*100:.1f}%)")
-        print(f"    -> 1 的数量: {count_1} ({count_1/sample_count*100:.1f}%)")
-        
         if count_0 == sample_count:
             print("    ❌ 异常：比特流【全为 0】。数据引脚可能接地短路，或射频前端未输出数据。")
         elif count_1 == sample_count:
@@ -151,12 +169,10 @@ class SX1276Validator:
         else:
             ratio = count_0 / sample_count
             if 0.4 < ratio < 0.6:
-                print("    ✅ 正常：比特流分布均匀（0和1各占约一半）。符合无信号时的【背景白噪声】特征。证明时钟和数据引脚全部正常工作！")
+                print("    ✅ 正常：比特流分布均匀（0和1各占约一半）。符合无信号时的【背景白噪声】特征。")
             else:
                 print("    ✅ 正常：存在 0/1 交替。可能有真实信号正在传输，或者存在定向干扰。")
-                
-        preview = "".join(str(b) for b in self.bit_samples[:100])
-        print(f"\\n[比特流前100位预览]: \\n    {preview}...")
+            test_results["SX1276_Signal"] = True
 
 validator = SX1276Validator()
 validator.hardware_reset()
@@ -164,8 +180,31 @@ if validator.check_spi():
     validator.setup_continuous_rx()
     validator.analyze_bitstream()
 
+# ================= 最终裁决报告 =================
 print("\\n" + "="*40)
-print("硬件自检流程结束。")
+print("硬件自检最终报告")
+print("="*40)
+
+chip_id = get_serial_number()
+print(f"芯片序列号 (S/N): {chip_id}")
+
+failed_components = []
+if not test_results["DS3231"]: 
+    failed_components.append("DS3231 RTC (I2C通信失败或未找到设备)")
+if not test_results["SX1276_SPI"]: 
+    failed_components.append("SX1276 射频 (SPI通信验证失败)")
+elif not test_results["SX1276_Signal"]: 
+    failed_components.append("SX1276 射频 (射频时钟或信号捕获异常)")
+
+if not failed_components:
+    print("\\n🎉 最终结果: 【全部正常通过】")
+    print("所有核心硬件模块均工作在最佳状态！")
+else:
+    print("\\n❌ 最终结果: 【未通过】")
+    print("报错部件清单:")
+    for comp in failed_components:
+        print(f"  - {comp}")
+
 print("="*40 + "\\n")
 """
 
@@ -193,11 +232,9 @@ class PicoUpdaterApp(ctk.CTk):
         self.refresh_ports() 
 
     def setup_ui(self):
-        # 顶部标题
         self.title_label = ctk.CTkLabel(self, text="RP2040 固件自动更新工具", font=ctk.CTkFont(size=24, weight="bold"))
         self.title_label.pack(pady=(20, 5))
 
-        # 硬件连接区域
         self.conn_frame = ctk.CTkFrame(self)
         self.conn_frame.pack(fill="x", padx=40, pady=5)
         
@@ -209,7 +246,6 @@ class PicoUpdaterApp(ctk.CTk):
         self.refresh_btn = ctk.CTkButton(self.conn_frame, text="🔄 刷新", width=60, command=self.refresh_ports)
         self.refresh_btn.pack(side="right", padx=10)
 
-        # 版本信息区域
         self.info_frame = ctk.CTkFrame(self)
         self.info_frame.pack(fill="x", padx=40, pady=5)
         
@@ -219,7 +255,6 @@ class PicoUpdaterApp(ctk.CTk):
         self.remote_ver_label = ctk.CTkLabel(self.info_frame, text="远程版本: 未知", font=ctk.CTkFont(size=16))
         self.remote_ver_label.pack(side="right", padx=20, pady=10, expand=True)
 
-        # 进度与日志区域
         self.log_textbox = ctk.CTkTextbox(self, height=220, state="disabled")
         self.log_textbox.pack(fill="both", expand=True, padx=40, pady=10)
 
@@ -227,14 +262,12 @@ class PicoUpdaterApp(ctk.CTk):
         self.progress_bar.pack(fill="x", padx=40, pady=5)
         self.progress_bar.set(0)
 
-        # 动作按钮区域
         self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.btn_frame.pack(pady=(10, 20), padx=40, fill="x")
 
         self.action_btn = ctk.CTkButton(self.btn_frame, text="检查更新", font=ctk.CTkFont(size=16, weight="bold"), height=40, command=lambda: self.start_update_process(force=False))
         self.action_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
-        # ★ 新增硬件自检按钮
         self.test_btn = ctk.CTkButton(self.btn_frame, text="硬件自检", font=ctk.CTkFont(size=16, weight="bold"), height=40, fg_color="#059669", hover_color="#047857", command=self.start_hardware_test)
         self.test_btn.pack(side="left", fill="x", expand=True, padx=5)
 
@@ -285,7 +318,8 @@ class PicoUpdaterApp(ctk.CTk):
                 self.port_var.set(port_list[0])
                 self.log("已刷新串口列表，但未发现标准 Pico 设备，请手动确认。")
 
-    def run_mpremote(self, port, args_list, timeout_sec=60):
+    # [改进版] 支持实时流式输出的 run_mpremote
+    def run_mpremote(self, port, args_list, timeout_sec=60, live_stream=False):
         if getattr(sys, 'frozen', False):
             cmd = [sys.executable, "mpremote_internal", "connect", port] + args_list
         else:
@@ -296,9 +330,24 @@ class PicoUpdaterApp(ctk.CTk):
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=timeout_sec, startupinfo=startupinfo)
-            return True, result.stdout
+            
+            if live_stream:
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                           text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo)
+                full_output = []
+                for line in iter(process.stdout.readline, ''):
+                    clean_line = line.strip('\r\n')
+                    if clean_line:
+                        self.log(clean_line) 
+                    full_output.append(clean_line)
+                    
+                process.stdout.close()
+                process.wait(timeout=timeout_sec)
+                return True, "\n".join(full_output)
+            else:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                        encoding='utf-8', errors='replace', timeout=timeout_sec, startupinfo=startupinfo)
+                return True, result.stdout
         except subprocess.TimeoutExpired:
             return False, "命令执行超时 (可能 Pico 处于死循环，或文件传输时间过长)"
         except Exception as e:
@@ -339,24 +388,19 @@ class PicoUpdaterApp(ctk.CTk):
             self.after(0, self.progress_bar.set, 0.3)
             self.log("正在将自检脚本注入 Pico 内存运行 (过程需要数秒，请勿断开连接)...\n")
             
-            # 将硬件测试脚本写入临时文件
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
                 f.write(HARDWARE_TEST_SCRIPT)
                 temp_path = f.name
 
-            # 通过 mpremote run 直接运行临时文件
-            success, output = self.run_mpremote(port, ["run", temp_path], timeout_sec=20)
+            # 开启实时流式输出 (live_stream=True)
+            success, output = self.run_mpremote(port, ["run", temp_path], timeout_sec=20, live_stream=True)
             
-            if success:
-                self.log(output)
-            else:
-                self.log(f"❌ 自检执行超时或发生异常:\n{output}")
+            if not success:
+                self.log(f"\n❌ 自检执行超时或发生异常:\n{output}")
                 
             self.after(0, self.progress_bar.set, 1.0)
             
-            # 删掉电脑本机的临时脚本
-            try:
-                os.remove(temp_path)
+            try: os.remove(temp_path)
             except: pass
 
         except Exception as e:
@@ -399,7 +443,6 @@ class PicoUpdaterApp(ctk.CTk):
 
     def _update_worker(self, port, force):
         try:
-            # 0. 连通性预检
             self.log(f"正在测试 Pico ({port}) 连接状态...")
             success, output = self.run_mpremote(port, ["exec", "print('PICO_OK')"], timeout_sec=10)
             if not success or "PICO_OK" not in output:
@@ -409,7 +452,6 @@ class PicoUpdaterApp(ctk.CTk):
                 return
             self.log("✅ Pico 串口通信正常！")
 
-            # 1. 获取远程版本
             self.log("正在连接 GitHub 获取远程版本...")
             self.after(0, self.progress_bar.set, 0.1)
             resp = requests.get(self.main_py_url, timeout=15)
@@ -421,7 +463,6 @@ class PicoUpdaterApp(ctk.CTk):
                 self.log("获取远程文件失败，请检查网络！")
                 return
 
-            # 2. 获取本地版本
             self.log("正在探测 Pico 文件系统...")
             self.after(0, self.progress_bar.set, 0.2)
             
@@ -439,7 +480,6 @@ class PicoUpdaterApp(ctk.CTk):
             self.after(0, lambda lv=self.local_version: self.local_ver_label.configure(text=f"本地版本: {lv}"))
             self.after(0, self.progress_bar.set, 0.3)
 
-            # 3. 比较版本 
             if not force:
                 if self.local_version >= self.remote_version and self.local_version != 0.0:
                     self.log("\n✅ 当前已是最新版本，无需更新！")
@@ -449,7 +489,6 @@ class PicoUpdaterApp(ctk.CTk):
             else:
                 self.log("\n⚡ 用户已选择强制刷入，跳过版本校验拦截...")
 
-            # 4. 获取文件列表
             self.log("正在解析远程仓库文件列表...")
             api_resp = requests.get(self.api_url, timeout=15)
             if api_resp.status_code != 200:
@@ -460,7 +499,6 @@ class PicoUpdaterApp(ctk.CTk):
             downloadable_files = [f for f in files_data if f.get('type') == 'file']
             
             with tempfile.TemporaryDirectory() as temp_dir:
-                # 5. 下载文件到临时目录
                 total_files = len(downloadable_files)
                 for i, file_info in enumerate(downloadable_files):
                     file_name = file_info['name']
@@ -480,7 +518,6 @@ class PicoUpdaterApp(ctk.CTk):
                         
                     self.after(0, self.progress_bar.set, 0.3 + 0.3 * ((i+1)/total_files))
 
-                # 6. 清空 Pico
                 self.log("正在清空 Pico 中的旧文件...")
                 wipe_script = "import os; [os.remove(f) for f in os.listdir() if not (os.stat(f)[0] & 0x4000)]"
                 success, output = self.run_mpremote(port, ["exec", wipe_script], timeout_sec=20)
@@ -489,7 +526,6 @@ class PicoUpdaterApp(ctk.CTk):
                 
                 self.after(0, self.progress_bar.set, 0.7)
 
-                # 7. 写入新文件
                 for i, file_info in enumerate(downloadable_files):
                     file_name = file_info['name']
                     local_path = os.path.join(temp_dir, file_name)
@@ -503,7 +539,6 @@ class PicoUpdaterApp(ctk.CTk):
                     
                     self.after(0, self.progress_bar.set, 0.7 + 0.25 * ((i+1)/total_files))
 
-            # 8. 软重启 Pico
             self.log("正在重启 Pico 生效固件...")
             self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
             
