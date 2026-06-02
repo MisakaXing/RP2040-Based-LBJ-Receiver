@@ -11,9 +11,8 @@ from lbj_receiver import LBJReceiver
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST
-import onewire
 
-# 系统性能配置与时钟加固
+# 系统性能配置
 
 pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
@@ -52,21 +51,14 @@ btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3
 btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
 sensor_temp = machine.ADC(4)
 
-# 核心切片渲染函数
-# 专为 Pico 2 (RP2350) 优化的核心切片渲染函数
+# 切片渲染函数
 def safe_fill_rect(x, y, w, h, color, slice_h=120):
-    # Pico 2 拥有 520KB 超大内存，120行切片毫无压力
     current_y = y
     remain_h = h
     while remain_h > 0:
         step = min(slice_h, remain_h)
         tft.fill_rect(x, current_y, w, step, color)
-        
-        # 必须用 sleep_ms 才能在 Pico 2 上真正且安全地释放双核锁
-        # 因为全屏(240行)只被切成了 2 块，所以只会执行 1~2 次休眠
-        # 也就是说总共只延迟 1 毫秒！肉眼看来依然是极致的瞬间刷新！
-        time.sleep_ms(1) 
-        
+        time.sleep_ms(1) #释放双核锁
         current_y += step
         remain_h -= step
 
@@ -74,7 +66,7 @@ def get_serial_number():
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     try:
-        n = int.from_bytes(machine.unique_id(), 'big')
+        n = int.from_bytes(machine.unique_id(), 'big')#读取芯片唯一ID
 
         # Base36
         s = ""
