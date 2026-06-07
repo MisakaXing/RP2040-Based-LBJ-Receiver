@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
 machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 3.8
+Program_ver = 3.9
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -91,7 +91,7 @@ def get_serial_number():
 
 # 2. 系统全局变量
 Serial_Number = get_serial_number()
-MAX_HIST = 2000
+MAX_HIST = 2500
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
@@ -513,7 +513,7 @@ def draw_about():
     es_tag = " (ES)" if is_es_ver == 1 else " (Rel)"
     tft.draw_gbk(f"Version: v{Program_ver}{es_tag}".encode(), 40, 70, RED if is_es_ver == 1 else WHITE, 0x2104)
     time.sleep_ms(1) 
-    tft.draw_gbk(f"Records: {total_count}/2000".encode(), 40, 95, WHITE, 0x2104)
+    tft.draw_gbk(f"Records: {total_count}/2500".encode(), 40, 95, WHITE, 0x2104)
     time.sleep_ms(1) 
     tft.draw_gbk(b"Author: " + Author_Name.encode(), 40, 120, YELLOW, 0x2104)
     time.sleep_ms(1) 
