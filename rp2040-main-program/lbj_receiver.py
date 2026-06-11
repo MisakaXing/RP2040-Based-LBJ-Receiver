@@ -17,7 +17,37 @@ def pocsag_rx():
     in_(pins, 1)          # 从 in_base(数据) 引脚读取 1 个 bit 存入移位寄存器
 
 class LBJReceiver:
-    def __init__(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15, data_pin=21, clk_pin=20, loco_file='locos.json'):
+    FXOSC = 32000000
+    FRF_SCALE = 524288
+    FSTEP_HZ = FXOSC / FRF_SCALE
+    BASE_FREQ_HZ = 821237500
+
+    # This restores the empirically stable Direct-mode FEI correction path.
+    # If correction moves in the wrong direction, change this to -1.
+    FEI_SIGN = 1
+    FEI_ALPHA = 0.20
+    FEI_MAX_HZ = 20000
+    PPM_LIMIT = 25.0
+    PRINT_FEI_CORRECTION = True
+
+    RXBW = 0x15  # ~10.4 kHz, stable for SX1276 Direct mode POCSAG
+    PPM_SCAN_INTERVAL_MS = 20000
+    PPM_SCAN_STEPS = (0, 1, -1, 2, -2, 3, -3)
+    CALIBRATION_SAMPLES = 3
+    CALIBRATION_SPREAD_PPM = 0.75
+
+    REG_FRF_MSB = 0x06
+    REG_FRF_MID = 0x07
+    REG_FRF_LSB = 0x08
+    REG_RXBW = 0x12
+    REG_RXCONFIG = 0x0D
+    REG_AFCFEI = 0x1A
+    REG_FEIMSB = 0x1D
+    REG_FEILSB = 0x1E
+
+    def __init__(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15,
+                 data_pin=21, clk_pin=20, loco_file='locos.json',
+                 ppm_offset=6.0, enable_ppm_scan=True, enable_calibration=True):
         self.loco_types = {}
         self.callback = None
         self.loco_file = loco_file
@@ -40,6 +70,22 @@ class LBJReceiver:
         
         self.current_rssi = "N/A"
         self.rssi_val = "N/A" 
+
+        self.base_freq_hz = self.BASE_FREQ_HZ
+        self.ppm_offset = ppm_offset
+        self.saved_ppm_offset = ppm_offset
+        self.pending_fei_hz = None
+        self.last_fei_hz = 0.0
+        self.last_fei_ppm = 0.0
+        self.calibrated_ppm_offset = None
+        self.calibration_samples = []
+        self.calibration_enabled = enable_calibration
+        self.ppm_scan_index = 0
+        self.ppm_scan_enabled = enable_ppm_scan
+        self.last_ppm_scan_time = time.ticks_ms()
+        print("BOOT_PPM", self.ppm_offset,
+              "scan=", self.ppm_scan_enabled,
+              "calibration=", self.calibration_enabled)
         
         self.POCSAG_SYNC  = 0x7CD215D8
         self.POCSAG_IDLE  = 0x7A89C197
@@ -99,7 +145,7 @@ class LBJReceiver:
         if chip_ver in [0x00, 0xFF]:
             print(f"⚠️ 严重警告: 射频芯片通信失败! 读到版本号: {hex(chip_ver)}。请检查 SPI 接线！")
             
-        self._setup_pocsag(821237500, ppm_offset=6.0, bps=1200)
+        self._setup_pocsag(self.base_freq_hz, ppm_offset=self.ppm_offset, bps=1200)
 
     def _r(self, r):
         self.cs_pin.value(0)
@@ -120,8 +166,101 @@ class LBJReceiver:
         self.spi.write(bytearray([r | 0x80, v]))
         self.cs_pin.value(1)
 
+    def _read_s16(self, msb_reg, lsb_reg):
+        raw = (self._r(msb_reg) << 8) | self._r(lsb_reg)
+        if raw & 0x8000:
+            raw -= 0x10000
+        return raw
+
+    def _read_fei_hz(self):
+        try:
+            fei_raw = self._read_s16(self.REG_FEIMSB, self.REG_FEILSB)
+            return fei_raw * self.FSTEP_HZ
+        except:
+            return None
+
+    def _set_frequency_from_ppm(self, ppm_offset):
+        if ppm_offset > self.PPM_LIMIT:
+            ppm_offset = self.PPM_LIMIT
+        elif ppm_offset < -self.PPM_LIMIT:
+            ppm_offset = -self.PPM_LIMIT
+
+        self.ppm_offset = ppm_offset
+        actual_freq_hz = self.base_freq_hz * (1 + (ppm_offset / 1000000.0))
+        frf = int((actual_freq_hz * self.FRF_SCALE) / self.FXOSC)
+
+        self._w(self.REG_FRF_MSB, (frf >> 16) & 0xFF)
+        self._w(self.REG_FRF_MID, (frf >> 8) & 0xFF)
+        self._w(self.REG_FRF_LSB, frf & 0xFF)
+
+    def _clamp_ppm(self, ppm_offset):
+        if ppm_offset > self.PPM_LIMIT:
+            return self.PPM_LIMIT
+        if ppm_offset < -self.PPM_LIMIT:
+            return -self.PPM_LIMIT
+        return ppm_offset
+
+    def _update_calibration(self, corrected_ppm):
+        if not self.calibration_enabled:
+            return
+
+        self.calibration_samples.append(corrected_ppm)
+        if len(self.calibration_samples) > self.CALIBRATION_SAMPLES:
+            self.calibration_samples.pop(0)
+
+        print("PPM_CAL_SAMPLE", corrected_ppm,
+              "count=", len(self.calibration_samples))
+
+        if len(self.calibration_samples) < self.CALIBRATION_SAMPLES:
+            return
+
+        low = min(self.calibration_samples)
+        high = max(self.calibration_samples)
+        if high - low > self.CALIBRATION_SPREAD_PPM:
+            return
+
+        calibrated_ppm = sum(self.calibration_samples) / len(self.calibration_samples)
+        self.calibrated_ppm_offset = self._clamp_ppm(calibrated_ppm)
+        self.calibration_enabled = False
+        self.ppm_scan_enabled = False
+        self._set_frequency_from_ppm(self.calibrated_ppm_offset)
+        print("PPM_CALIBRATED", self.calibrated_ppm_offset)
+
+    def _apply_pending_fei_correction(self):
+        if self.pending_fei_hz is None:
+            return
+
+        fei_hz = self.pending_fei_hz
+        self.pending_fei_hz = None
+
+        if abs(fei_hz) > self.FEI_MAX_HZ:
+            return
+
+        fei_ppm = (fei_hz / self.base_freq_hz) * 1000000.0
+        self.last_fei_hz = fei_hz
+        self.last_fei_ppm = fei_ppm
+
+        old_ppm = self.ppm_offset
+        corrected_ppm = self._clamp_ppm(
+            old_ppm + (self.FEI_SIGN * fei_ppm)
+        )
+        runtime_ppm = old_ppm + (self.FEI_SIGN * fei_ppm * self.FEI_ALPHA)
+        self._set_frequency_from_ppm(runtime_ppm)
+        self.ppm_scan_enabled = False
+        self._update_calibration(corrected_ppm)
+
+        if self.PRINT_FEI_CORRECTION:
+            print("FEI_CORR",
+                  "fei_hz=", fei_hz,
+                  "fei_ppm=", fei_ppm,
+                  "old_ppm=", old_ppm,
+                  "new_ppm=", self.ppm_offset,
+                  "corrected_ppm=", corrected_ppm)
+
     def _setup_pocsag(self, base_freq_hz, ppm_offset, bps):
-        actual_freq_hz = base_freq_hz * (1 + (ppm_offset / 1000000.0))
+        self.base_freq_hz = base_freq_hz
+        self.ppm_offset = ppm_offset
+        self.saved_ppm_offset = ppm_offset
         self._w(0x01, 0x00); time.sleep_ms(10)
         self._w(0x01, 0x01); time.sleep_ms(10)
 
@@ -130,14 +269,13 @@ class LBJReceiver:
         self._w(0x03, bitrate & 0xFF)
         self._w(0x04, 0x00); self._w(0x05, 74) 
 
-        frf = int((actual_freq_hz * 524288) / 32000000)
-        self._w(0x06, (frf >> 16) & 0xFF)
-        self._w(0x07, (frf >> 8) & 0xFF)
-        self._w(0x08, frf & 0xFF)
+        self._set_frequency_from_ppm(ppm_offset)
 
-        self._w(0x12, 0x15) 
-        self._w(0x0C, 0x23) 
-        self._w(0x0D, 0x50) 
+        self._w(self.REG_RXBW, self.RXBW)
+        self._w(0x0C, 0x23)  # Original maximum LNA gain + boost setting.
+        self._w(self.REG_RXCONFIG, 0x50)  # Original Direct-mode AFC config.
+        self._w(self.REG_AFCFEI, 0x01)
+
         self._w(0x31, 0x00); self._w(0x40, 0x00); self._w(0x01, 0x05)
 
     def _init_pio(self, data_pin, clk_pin=20):
@@ -308,14 +446,28 @@ class LBJReceiver:
             self._emit(msg)
 
     def _flush_message(self):
+        self._apply_pending_fei_correction()
         if self.numeric_output:
             self.raw_queue.append((self.current_address, self.numeric_output, self.current_rssi))
         self.numeric_output = ""
         self.current_address = ""
         self.error_strike = 0
 
+    def _cold_start_ppm_scan(self, now):
+        if not self.ppm_scan_enabled or self.synced:
+            return
+        if time.ticks_diff(now, self.last_ppm_scan_time) < self.PPM_SCAN_INTERVAL_MS:
+            return
+
+        self.ppm_scan_index = (self.ppm_scan_index + 1) % len(self.PPM_SCAN_STEPS)
+        scan_ppm = self.saved_ppm_offset + self.PPM_SCAN_STEPS[self.ppm_scan_index]
+        self._set_frequency_from_ppm(scan_ppm)
+        self.last_ppm_scan_time = now
+        print("PPM_SCAN", scan_ppm)
+
     def tick(self):
         now = time.ticks_ms()
+        self._cold_start_ppm_scan(now)
         
         if time.ticks_diff(now, self.last_sync_time) > 30000:
             self._w(0x01, 0x01) 
@@ -334,10 +486,15 @@ class LBJReceiver:
                     self.sync_window = ((self.sync_window << 1) | bit) & 0xFFFFFFFF
                     if self.sync_window == self.POCSAG_SYNC:
                         self.synced = True
+                        self.saved_ppm_offset = self.ppm_offset
+                        self.ppm_scan_enabled = False
                         self.bit_count = self.current_cw = 0
                         self.last_sync_time = time.ticks_ms() 
                         self.current_rssi = self.get_rssi()
                         self.rssi_val = self.current_rssi 
+                        fei_hz = self._read_fei_hz()
+                        if fei_hz is not None:
+                            self.pending_fei_hz = fei_hz
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1

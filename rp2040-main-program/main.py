@@ -95,6 +95,7 @@ MAX_HIST = 2500
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
+PPM_CALIBRATION_VERSION = 4
 
 system_state = "DASHBOARD" 
 has_received = False
@@ -104,6 +105,8 @@ cfg_scr_idx = 3
 SCR_OFF_OPTS = ["30s", "1min", "5min", "never"]
 SCR_OFF_MS = [30000, 60000, 300000, -1]
 cfg_buzzer = True
+cfg_ppm_offset = 6.0
+cfg_ppm_calibrated = False
 
 menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"]
 
@@ -155,21 +158,62 @@ def get_battery_info():
     percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
 
-def load_config():
-    global cfg_buzzer, cfg_scr_idx, menu_items
+def _read_config_dict():
     try:
         with open(CONFIG_FILE, 'r') as f:
-            config = json.loads(f.read())
-            cfg_buzzer = config.get("buzzer", True) 
-            cfg_scr_idx = config.get("scr_idx", 3)
-            menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
-            menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
-    except: pass 
+            return json.loads(f.read())
+    except:
+        return {}
+
+def load_config():
+    global cfg_buzzer, cfg_scr_idx, cfg_ppm_offset, cfg_ppm_calibrated, menu_items
+    try:
+        config = _read_config_dict()
+        cfg_buzzer = config.get("buzzer", True)
+        cfg_scr_idx = config.get("scr_idx", 3)
+        ppm_value = float(config.get("ppm_offset", 6.0))
+        ppm_valid = -25.0 <= ppm_value <= 25.0
+        ppm_version_ok = config.get("ppm_calibration_version", 0) == PPM_CALIBRATION_VERSION
+        cfg_ppm_calibrated = (
+            bool(config.get("ppm_calibrated", False))
+            and ppm_valid
+            and ppm_version_ok
+        )
+        cfg_ppm_offset = ppm_value if cfg_ppm_calibrated else 6.0
+        menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
+        menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
+    except:
+        cfg_ppm_offset = 6.0
+        cfg_ppm_calibrated = False
 
 def save_config():
     try:
-        with open(CONFIG_FILE, 'w') as f: f.write(json.dumps({"buzzer": cfg_buzzer, "scr_idx": cfg_scr_idx}))
+        config = _read_config_dict()
+        config["buzzer"] = cfg_buzzer
+        config["scr_idx"] = cfg_scr_idx
+        config["ppm_offset"] = cfg_ppm_offset
+        config["ppm_calibrated"] = cfg_ppm_calibrated
+        config["ppm_calibration_version"] = PPM_CALIBRATION_VERSION
+        with open(CONFIG_FILE, 'w') as f: f.write(json.dumps(config))
     except: pass
+
+def save_ppm_offset(ppm_offset):
+    global cfg_ppm_offset, cfg_ppm_calibrated
+    try:
+        ppm_offset = round(float(ppm_offset), 4)
+        config = _read_config_dict()
+        config["buzzer"] = cfg_buzzer
+        config["scr_idx"] = cfg_scr_idx
+        config["ppm_offset"] = ppm_offset
+        config["ppm_calibrated"] = True
+        config["ppm_calibration_version"] = PPM_CALIBRATION_VERSION
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(json.dumps(config))
+        cfg_ppm_offset = ppm_offset
+        cfg_ppm_calibrated = True
+        print("PPM_SAVE", ppm_offset)
+    except Exception as e:
+        print("PPM_SAVE_ERR", e)
 
 def init_history():
     global total_count, history_offsets
@@ -325,7 +369,6 @@ def draw_hardware_bar(force=False):
 
     last_hw_update = now
     time.sleep_ms(1)
-
 def draw_idle_screen():
     global last_screen_layout
     last_screen_layout = None 
@@ -609,7 +652,11 @@ boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzze
 if boot_status == "HALT":
     while True: pass 
 
-receiver = LBJReceiver()
+receiver = LBJReceiver(
+    ppm_offset=cfg_ppm_offset,
+    enable_ppm_scan=False,
+    enable_calibration=not cfg_ppm_calibrated
+)
 receiver.set_callback(light_callback) 
 _thread.start_new_thread(radio_core_task, ()) 
 
@@ -631,6 +678,9 @@ wake_btn_last_state = False
 
 while True:
     now = time.ticks_ms()
+
+    if not cfg_ppm_calibrated and receiver.calibrated_ppm_offset is not None:
+        save_ppm_offset(receiver.calibrated_ppm_offset)
     
     if screen_is_on and cfg_scr_idx != 3: 
         if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
