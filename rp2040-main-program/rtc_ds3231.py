@@ -130,10 +130,14 @@ class DS3231:
             )
 
             if self.model == "DS3231":
-                oscillator_stopped = bool(
-                    self.i2c.readfrom_mem(self.addr, 0x0F, 1)[0] & 0x80
-                )
-                return oscillator_stopped or date_invalid
+                if date_invalid:
+                    return True
+
+                # OSF is sticky and is also set on first power-up. A valid
+                # stored date is sufficient here; clear the historical flag
+                # so it does not force date setup on every subsequent boot.
+                self._clear_ds3231_osf()
+                return False
 
             if self.model == "PCF8563":
                 voltage_low = bool(
