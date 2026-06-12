@@ -73,17 +73,17 @@ class SystemPOST:
     def check_rtc(self, rtc):
         self._check_start("Chk RTC.....")
         try:
-            raw_d = rtc.i2c.readfrom_mem(0x68, 0x04, 3)
-            # 给移位操作加上括号，先移位，再乘 10
-            yy = (raw_d[2] >> 4) * 10 + (raw_d[2] & 0x0F)
-            
-            if yy < 24: 
-                self._check_end("WARN", "Needs Sync!")
-                self.rtc_error = True 
-            else: 
-                self._check_end("OK", f"Valid (20{yy})")
-                self.rtc_error = False # 确保标志位被重置
-        except Exception: 
+            model = rtc.detect()
+            if model == "UNKNOWN":
+                self._check_end("WARN", "Not Found")
+                self.rtc_error = True
+            elif rtc.needs_sync():
+                self._check_end("WARN", f"{model} Sync!")
+                self.rtc_error = True
+            else:
+                self._check_end("OK", model)
+                self.rtc_error = False
+        except Exception:
             self._check_end("WARN", "Comms Failed")
             self.rtc_error = True
 

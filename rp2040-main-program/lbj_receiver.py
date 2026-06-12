@@ -22,15 +22,17 @@ class LBJReceiver:
     FSTEP_HZ = FXOSC / FRF_SCALE
     BASE_FREQ_HZ = 821237500
 
-    # This restores the empirically stable Direct-mode FEI correction path.
-    # If correction moves in the wrong direction, change this to -1.
-    FEI_SIGN = 1
-    FEI_ALPHA = 0.20
+    # Stable Direct-mode profile: fixed +6 ppm tuning with per-burst hardware
+    # AFC. FEI is diagnostic only and must never accumulate into ppm_offset.
     FEI_MAX_HZ = 20000
     PPM_LIMIT = 25.0
     PRINT_FEI_CORRECTION = True
 
-    RXBW = 0x15  # ~10.4 kHz, stable for SX1276 Direct mode POCSAG
+    RXBW = 0x0D  # 12.5 kHz: mantissa 20, exponent 5.
+    AFCBW = 0x0B  # 50 kHz acquisition bandwidth.
+    LNA_FIXED_GAIN_BOOST = 0x23  # Gain 001 + LnaBoostHf, AGC disabled.
+    PREAMBLE_DETECT = 0xAA  # Enabled, 2-byte detector, tolerance 10.
+    RXCONFIG_AFC_PREAMBLE = 0x16  # AFC auto, AGC off, preamble trigger.
     PPM_SCAN_INTERVAL_MS = 20000
     PPM_SCAN_STEPS = (0, 1, -1, 2, -2, 3, -3)
     CALIBRATION_SAMPLES = 3
@@ -40,10 +42,14 @@ class LBJReceiver:
     REG_FRF_MID = 0x07
     REG_FRF_LSB = 0x08
     REG_RXBW = 0x12
+    REG_AFCBW = 0x13
     REG_RXCONFIG = 0x0D
     REG_AFCFEI = 0x1A
+    REG_AFCMSB = 0x1B
+    REG_AFCLSB = 0x1C
     REG_FEIMSB = 0x1D
     REG_FEILSB = 0x1E
+    REG_PREAMBLEDETECT = 0x1F
 
     def __init__(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15,
                  data_pin=21, clk_pin=20, loco_file='locos.json',
@@ -75,8 +81,10 @@ class LBJReceiver:
         self.ppm_offset = ppm_offset
         self.saved_ppm_offset = ppm_offset
         self.pending_fei_hz = None
+        self.pending_afc_hz = None
         self.last_fei_hz = 0.0
         self.last_fei_ppm = 0.0
+        self.last_afc_hz = 0.0
         self.calibrated_ppm_offset = None
         self.calibration_samples = []
         self.calibration_enabled = enable_calibration
@@ -179,6 +187,13 @@ class LBJReceiver:
         except:
             return None
 
+    def _read_afc_hz(self):
+        try:
+            afc_raw = self._read_s16(self.REG_AFCMSB, self.REG_AFCLSB)
+            return afc_raw * self.FSTEP_HZ
+        except:
+            return None
+
     def _set_frequency_from_ppm(self, ppm_offset):
         if ppm_offset > self.PPM_LIMIT:
             ppm_offset = self.PPM_LIMIT
@@ -226,36 +241,32 @@ class LBJReceiver:
         self._set_frequency_from_ppm(self.calibrated_ppm_offset)
         print("PPM_CALIBRATED", self.calibrated_ppm_offset)
 
-    def _apply_pending_fei_correction(self):
+    def _report_pending_frequency_error(self):
         if self.pending_fei_hz is None:
             return
 
         fei_hz = self.pending_fei_hz
+        afc_hz = self.pending_afc_hz
         self.pending_fei_hz = None
+        self.pending_afc_hz = None
 
         if abs(fei_hz) > self.FEI_MAX_HZ:
+            print("FEI_REJECT", "fei_hz=", fei_hz,
+                  "fixed_ppm=", self.ppm_offset)
             return
 
         fei_ppm = (fei_hz / self.base_freq_hz) * 1000000.0
         self.last_fei_hz = fei_hz
         self.last_fei_ppm = fei_ppm
-
-        old_ppm = self.ppm_offset
-        corrected_ppm = self._clamp_ppm(
-            old_ppm + (self.FEI_SIGN * fei_ppm)
-        )
-        runtime_ppm = old_ppm + (self.FEI_SIGN * fei_ppm * self.FEI_ALPHA)
-        self._set_frequency_from_ppm(runtime_ppm)
-        self.ppm_scan_enabled = False
-        self._update_calibration(corrected_ppm)
+        if afc_hz is not None:
+            self.last_afc_hz = afc_hz
 
         if self.PRINT_FEI_CORRECTION:
-            print("FEI_CORR",
+            print("AFC_LOCK",
                   "fei_hz=", fei_hz,
                   "fei_ppm=", fei_ppm,
-                  "old_ppm=", old_ppm,
-                  "new_ppm=", self.ppm_offset,
-                  "corrected_ppm=", corrected_ppm)
+                  "afc_hz=", afc_hz,
+                  "fixed_ppm=", self.ppm_offset)
 
     def _setup_pocsag(self, base_freq_hz, ppm_offset, bps):
         self.base_freq_hz = base_freq_hz
@@ -272,11 +283,22 @@ class LBJReceiver:
         self._set_frequency_from_ppm(ppm_offset)
 
         self._w(self.REG_RXBW, self.RXBW)
-        self._w(0x0C, 0x23)  # Original maximum LNA gain + boost setting.
-        self._w(self.REG_RXCONFIG, 0x50)  # Original Direct-mode AFC config.
-        self._w(self.REG_AFCFEI, 0x01)
-
-        self._w(0x31, 0x00); self._w(0x40, 0x00); self._w(0x01, 0x05)
+        self._w(self.REG_AFCBW, self.AFCBW)
+        self._w(0x0C, self.LNA_FIXED_GAIN_BOOST)
+        self._w(0x31, 0x00)  # Continuous Direct mode.
+        self._w(0x40, 0x00)  # DIO1=DCLK, DIO2=DATA.
+        self._w(self.REG_PREAMBLEDETECT, self.PREAMBLE_DETECT)
+        self._w(self.REG_AFCFEI, 0x02)  # Clear stale AFC before entering RX.
+        self._w(self.REG_AFCFEI, 0x01)  # Auto-clear AFC for each trigger.
+        self._w(self.REG_RXCONFIG, self.RXCONFIG_AFC_PREAMBLE)
+        self._w(0x01, 0x05)
+        print("RADIO_CFG",
+              "freq_hz=", int(self.base_freq_hz * (1 + self.ppm_offset / 1000000.0)),
+              "ppm=", self.ppm_offset,
+              "rxbw_hz=12500",
+              "afc=hardware",
+              "agc=off",
+              "lna=0x23")
 
     def _init_pio(self, data_pin, clk_pin=20):
         self.hardware_clk = machine.Pin(clk_pin, machine.Pin.IN, machine.Pin.PULL_UP)
@@ -446,7 +468,7 @@ class LBJReceiver:
             self._emit(msg)
 
     def _flush_message(self):
-        self._apply_pending_fei_correction()
+        self._report_pending_frequency_error()
         if self.numeric_output:
             self.raw_queue.append((self.current_address, self.numeric_output, self.current_rssi))
         self.numeric_output = ""
@@ -495,6 +517,7 @@ class LBJReceiver:
                         fei_hz = self._read_fei_hz()
                         if fei_hz is not None:
                             self.pending_fei_hz = fei_hz
+                            self.pending_afc_hz = self._read_afc_hz()
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1

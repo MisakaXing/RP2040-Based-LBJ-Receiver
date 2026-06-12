@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
 machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 3.9
+Program_ver = 4.0
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -95,7 +95,7 @@ MAX_HIST = 2500
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
-PPM_CALIBRATION_VERSION = 4
+PPM_CALIBRATION_VERSION = 5
 
 system_state = "DASHBOARD" 
 has_received = False
@@ -655,7 +655,7 @@ if boot_status == "HALT":
 receiver = LBJReceiver(
     ppm_offset=cfg_ppm_offset,
     enable_ppm_scan=False,
-    enable_calibration=not cfg_ppm_calibrated
+    enable_calibration=False
 )
 receiver.set_callback(light_callback) 
 _thread.start_new_thread(radio_core_task, ()) 
@@ -663,8 +663,7 @@ _thread.start_new_thread(radio_core_task, ())
 if boot_status == "RTC_SYNC":
     system_state = "SET_DATE"; edit_step = 0
     try:
-        raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
-        edit_d, edit_m, edit_y = [(r >> 4) * 10 + (r & 0x0F) for r in raw_d]
+        edit_y, edit_m, edit_d = rtc.get_date()
     except: pass
     draw_ui_skeleton(); draw_set_date(full=True)    
 else:
@@ -679,9 +678,6 @@ wake_btn_last_state = False
 while True:
     now = time.ticks_ms()
 
-    if not cfg_ppm_calibrated and receiver.calibrated_ppm_offset is not None:
-        save_ppm_offset(receiver.calibrated_ppm_offset)
-    
     if screen_is_on and cfg_scr_idx != 3: 
         if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
             pin_bl.value(1) 
@@ -835,8 +831,7 @@ while True:
                 time.sleep_ms(100)
             elif menu_index == 1: 
                 try:
-                    raw_d = i2c0.readfrom_mem(0x68, 0x04, 3)
-                    edit_d, edit_m, edit_y = [(r >> 4) * 10 + (r & 0x0F) for r in raw_d]
+                    edit_y, edit_m, edit_d = rtc.get_date()
                 except: pass
                 edit_step = 0; system_state = "SET_DATE"; draw_set_date(full=True)
             elif menu_index == 2: 

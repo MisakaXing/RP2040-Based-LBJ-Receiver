@@ -29,7 +29,8 @@ import time
 
 # --- 全局测试状态记录 ---
 test_results = {
-    "DS3231": False,
+    "RTC": False,
+    "RTC_Model": "UNKNOWN",
     "SX1276_SPI": False,
     "SX1276_Signal": False
 }
@@ -50,21 +51,26 @@ def get_serial_number():
         return "S/N INVALID"
 
 print("\\n" + "="*40)
-print("开始执行硬件自检 (DS3231 & SX1276)")
+print("开始执行硬件自检 (RTC & SX1276)")
 print("="*40)
 
-# --- 1. 检查 DS3231 ---
-print("\\n[0] 正在测试 DS3231 RTC 模块...")
+# --- 1. 检查 RTC ---
+print("\\n[0] 正在测试 RTC 模块...")
 try:
     i2c = machine.I2C(0, sda=machine.Pin(0), scl=machine.Pin(1), freq=400000)
     devices = i2c.scan()
     if 0x68 in devices:
         print("    ✅ DS3231 芯片检测成功 (I2C地址: 0x68)")
-        test_results["DS3231"] = True
+        test_results["RTC"] = True
+        test_results["RTC_Model"] = "DS3231"
+    elif 0x51 in devices:
+        print("    ✅ PCF8563 芯片检测成功 (I2C地址: 0x51)")
+        test_results["RTC"] = True
+        test_results["RTC_Model"] = "PCF8563"
     else:
-        print("    ❌ 未在 I2C 总线上找到 DS3231 (0x68)！请检查接线或电源。")
+        print("    ❌ 未找到 DS3231 (0x68) 或 PCF8563 (0x51)！请检查接线或电源。")
 except Exception as e:
-    print("    ❌ DS3231 I2C 通信异常:", e)
+    print("    ❌ RTC I2C 通信异常:", e)
 
 # --- 2. 检查 SX1276 ---
 SPI_ID = 0
@@ -189,8 +195,10 @@ chip_id = get_serial_number()
 print(f"芯片序列号 (S/N): {chip_id}")
 
 failed_components = []
-if not test_results["DS3231"]: 
-    failed_components.append("DS3231 RTC (I2C通信失败或未找到设备)")
+if not test_results["RTC"]:
+    failed_components.append("RTC (DS3231/PCF8563 I2C通信失败或未找到设备)")
+else:
+    print(f"RTC型号: {test_results['RTC_Model']}")
 if not test_results["SX1276_SPI"]: 
     failed_components.append("SX1276 射频 (SPI通信验证失败)")
 elif not test_results["SX1276_Signal"]: 
