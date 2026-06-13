@@ -186,6 +186,19 @@ def get_max_days(y, m):
     if m == 2: return 29 if y % 4 == 0 else 28
     return 30 if m in [4, 6, 9, 11] else 31
 
+def get_rtc_date_for_edit():
+    try:
+        year, month, day = rtc.get_date()
+        if (
+            24 <= year <= 99
+            and 1 <= month <= 12
+            and 1 <= day <= get_max_days(year, month)
+        ):
+            return year, month, day
+    except:
+        pass
+    return 26, 1, 1
+
 def get_battery_info():
     bat_en.value(0); time.sleep_ms(5)
     raw = bat_adc.read_u16()
@@ -699,9 +712,7 @@ _thread.start_new_thread(radio_core_task, ())
 
 if boot_status == "RTC_SYNC":
     system_state = "SET_DATE"; edit_step = 0
-    try:
-        edit_y, edit_m, edit_d = rtc.get_date()
-    except: pass
+    edit_y, edit_m, edit_d = get_rtc_date_for_edit()
     draw_ui_skeleton(); draw_set_date(full=True)    
 else:
     draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
@@ -867,9 +878,7 @@ while True:
                 save_config(); draw_menu_item(0, True)
                 time.sleep_ms(100)
             elif menu_index == 1: 
-                try:
-                    edit_y, edit_m, edit_d = rtc.get_date()
-                except: pass
+                edit_y, edit_m, edit_d = get_rtc_date_for_edit()
                 edit_step = 0; system_state = "SET_DATE"; draw_set_date(full=True)
             elif menu_index == 2: 
                 edit_step = 0; edit_id = [0,0,0,0]; system_state = "JUMP_ID"; draw_jump_id(full=True)

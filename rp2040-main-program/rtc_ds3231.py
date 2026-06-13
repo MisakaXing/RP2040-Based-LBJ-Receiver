@@ -19,6 +19,15 @@ class DS3231:
     def _bcd2dec(self, bcd):
         return ((bcd >> 4) * 10) + (bcd & 0x0F)
 
+    def _decode_bcd(self, raw, mask, minimum, maximum):
+        value = raw & mask
+        if (value & 0x0F) > 9 or ((value >> 4) & 0x0F) > 9:
+            return None
+        value = self._bcd2dec(value)
+        if not minimum <= value <= maximum:
+            return None
+        return value
+
     def _probe(self, addr, reg):
         try:
             self.i2c.readfrom_mem(addr, reg, 1)
@@ -80,9 +89,11 @@ class DS3231:
 
             if self.model == "PCF8563":
                 data = self.i2c.readfrom_mem(self.addr, 0x02, 3)
-                second = self._bcd2dec(data[0] & 0x7F)
-                minute = self._bcd2dec(data[1] & 0x7F)
-                hour = self._bcd2dec(data[2] & 0x3F)
+                second = self._decode_bcd(data[0], 0x7F, 0, 59)
+                minute = self._decode_bcd(data[1], 0x7F, 0, 59)
+                hour = self._decode_bcd(data[2], 0x3F, 0, 23)
+                if second is None or minute is None or hour is None:
+                    return (0, 0, 0)
                 return (hour, minute, second)
         except:
             pass
@@ -106,12 +117,12 @@ class DS3231:
                 return (year, month, day)
 
             if self.model == "PCF8563":
-                day = self._bcd2dec(
-                    self.i2c.readfrom_mem(self.addr, 0x05, 1)[0] & 0x3F
-                )
-                data = self.i2c.readfrom_mem(self.addr, 0x07, 2)
-                month = self._bcd2dec(data[0] & 0x1F)
-                year = self._bcd2dec(data[1])
+                data = self.i2c.readfrom_mem(self.addr, 0x05, 4)
+                day = self._decode_bcd(data[0], 0x3F, 1, 31)
+                month = self._decode_bcd(data[2], 0x1F, 1, 12)
+                year = self._decode_bcd(data[3], 0xFF, 0, 99)
+                if day is None or month is None or year is None:
+                    return (0, 0, 0)
                 return (year, month, day)
         except:
             pass
@@ -167,8 +178,20 @@ class DS3231:
         except:
             pass
 
+    def _start_pcf8563(self):
+        if self.model != "PCF8563":
+            return
+        try:
+            control = self.i2c.readfrom_mem(self.addr, 0x00, 1)[0]
+            self.i2c.writeto_mem(self.addr, 0x00, bytes([control & 0xDF]))
+        except:
+            pass
+
     def sync_time(self, hh, mm):
         """Set hour/minute and reset seconds to zero."""
+        if not 0 <= hh <= 23 or not 0 <= mm <= 59:
+            return False
+
         try:
             data = bytes([0, self._dec2bcd(mm), self._dec2bcd(hh)])
             if self.model == "DS3231":
@@ -177,6 +200,7 @@ class DS3231:
                 return True
 
             if self.model == "PCF8563":
+                self._start_pcf8563()
                 self.i2c.writeto_mem(self.addr, 0x02, data)
                 return True
         except:
@@ -185,6 +209,9 @@ class DS3231:
 
     def set_date(self, yy, mm, dd):
         """Set date, where yy is the last two digits of a 20xx year."""
+        if not 0 <= yy <= 99 or not 1 <= mm <= 12 or not 1 <= dd <= 31:
+            return False
+
         try:
             if self.model == "DS3231":
                 data = bytes([
@@ -197,13 +224,16 @@ class DS3231:
                 return True
 
             if self.model == "PCF8563":
-                self.i2c.writeto_mem(
-                    self.addr, 0x05, bytes([self._dec2bcd(dd)])
-                )
+                self._start_pcf8563()
                 self.i2c.writeto_mem(
                     self.addr,
-                    0x07,
-                    bytes([self._dec2bcd(mm), self._dec2bcd(yy)]),
+                    0x05,
+                    bytes([
+                        self._dec2bcd(dd),
+                        0,
+                        self._dec2bcd(mm),
+                        self._dec2bcd(yy),
+                    ]),
                 )
                 self._clear_pcf8563_vl()
                 return True
