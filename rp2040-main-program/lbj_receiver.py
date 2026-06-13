@@ -386,7 +386,10 @@ class LBJReceiver:
             loco_raw = s[4:12]
             try:
                 type_str = str(int(loco_raw[0:3]))
-                loco_display = f"{self.loco_types[type_str]}-{loco_raw[4:8]}" if type_str in self.loco_types else f"UNK({type_str})-{loco_raw[4:8]}"
+                if type_str in self.loco_types:
+                    loco_display = f"{self.loco_types[type_str]}-{loco_raw[4:8]}"
+                else:
+                    loco_display = f"UNK({type_str})-{loco_raw[4:8]}"
             except: loco_display = loco_raw 
             route_hex = self._bcd_to_hex(s[14:30]) 
             return {

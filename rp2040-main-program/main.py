@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
 machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 4.1
+Program_ver = 4.2
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -61,6 +61,43 @@ def safe_fill_rect(x, y, w, h, color, slice_h=120):
         time.sleep_ms(1) #释放双核锁
         current_y += step
         remain_h -= step
+
+LOCO_NAME_GBK = {
+    "解放": b"\xbd\xe2\xb7\xc5",
+    "前进": b"\xc7\xb0\xbd\xf8",
+    "建设": b"\xbd\xa8\xc9\xe8",
+    "蓝箭控车": b"\xc0\xb6\xbc\xfd\xbf\xd8\xb3\xb5",
+    "北京": b"\xb1\xb1\xbe\xa9",
+    "北京宽": b"\xb1\xb1\xbe\xa9\xbf\xed",
+    "轻油": b"\xc7\xe1\xd3\xcd",
+    "天安": b"\xcc\xec\xb0\xb2",
+    "新曙光": b"\xd0\xc2\xca\xef\xb9\xe2",
+    "神州": b"\xc9\xf1\xd6\xdd",
+    "DJ熊猫": b"DJ\xd0\xdc\xc3\xa8",
+    "蓝箭动车": b"\xc0\xb6\xbc\xfd\xb6\xaf\xb3\xb5",
+    "先锋号": b"\xcf\xc8\xb7\xe6\xba\xc5",
+    "天梭": b"\xcc\xec\xcb\xf3",
+    "DJ4和谐": b"DJ4\xba\xcd\xd0\xb3",
+}
+UNKNOWN_LOCO_GBK = b"\xce\xb4\xd6\xaa"
+
+def encode_loco_gbk(loco):
+    """Encode the mixed Chinese/ASCII locomotive label for HZK16."""
+    loco = str(loco)
+
+    if loco.startswith("UNK("):
+        return UNKNOWN_LOCO_GBK + loco[3:].encode()
+    if loco.startswith("未知("):
+        return UNKNOWN_LOCO_GBK + loco[2:].encode()
+
+    separator = loco.find("-")
+    name = loco if separator < 0 else loco[:separator]
+    suffix = b"" if separator < 0 else loco[separator:].encode()
+    name_gbk = LOCO_NAME_GBK.get(name)
+    if name_gbk is not None:
+        return name_gbk + suffix
+
+    return loco.encode()
 
 def get_serial_number():
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -455,7 +492,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         cab = ext.get('cab_end', '')
         if cab == '31': loco += 'A'
         elif cab == '32': loco += 'B'
-        tft.draw_gbk(loco.encode(), 53, y3, WHITE, bg_color, scale=2)
+        tft.draw_gbk(encode_loco_gbk(loco), 53, y3, WHITE, bg_color, scale=2)
 
     if not is_history: 
         lon = ext.get('lon', '---').replace('°', ' ')
