@@ -37,6 +37,10 @@ class LBJReceiver:
     PPM_SCAN_STEPS = (0, 1, -1, 2, -2, 3, -3)
     CALIBRATION_SAMPLES = 3
     CALIBRATION_SPREAD_PPM = 0.75
+    NUMERIC_CHARS_PER_WORD = 5
+    LBJ_BLOCK_LEN = 47
+    MIN_LBJ_BLOCK_SCORE = 120
+    VALID_CAB_ENDS = ("30", "31", "32")
 
     REG_FRF_MSB = 0x06
     REG_FRF_MID = 0x07
@@ -363,6 +367,90 @@ class LBJReceiver:
         m = {'*':'A', 'U':'B', ' ':'C', '-': 'D', ']':'E', ')':'E', '[':'F', '(':'F'}
         return "".join([m.get(c, c if c.isdigit() else '0') for c in s])
 
+    def _decode_class_tag(self, raw):
+        if len(raw) != 4 or 'X' in raw:
+            return "?", False
+        try:
+            class_bytes = bytes.fromhex(self._bcd_to_hex(raw))
+            if any(value != 0 and not 32 <= value <= 126 for value in class_bytes):
+                return "?", False
+            return class_bytes.decode('ascii').replace('\x00', '').strip(), True
+        except:
+            return "?", False
+
+    def _resolve_loco_code(self, raw_code):
+        if len(raw_code) != 3:
+            return raw_code, None
+        if raw_code.isdigit():
+            code = str(int(raw_code))
+            return code, self.loco_types.get(code)
+        if any(char != 'X' and not char.isdigit() for char in raw_code):
+            return raw_code, None
+
+        matched_code = None
+        matched_name = None
+        for code, name in self.loco_types.items():
+            padded = str(code).zfill(3)
+            if len(padded) != 3:
+                continue
+            if all(a == 'X' or a == b for a, b in zip(raw_code, padded)):
+                if matched_code is not None:
+                    return raw_code, None
+                matched_code = str(code)
+                matched_name = name
+        return matched_code if matched_code is not None else raw_code, matched_name
+
+    def _score_lbj_candidate(self, block):
+        # 失败码字已经由 XXXXX 占满 5 个字符；不足 47 字符表示消息被截断，
+        # 不能再补位后猜测，否则报文尾部数字很容易被误认成车型。
+        if len(block) < self.LBJ_BLOCK_LEN:
+            return None
+
+        class_raw = block[0:4]
+        loco_raw = block[4:12]
+        cab_raw = block[12:14]
+        if len(loco_raw) != 8:
+            return None
+        if any(char != 'X' and not char.isdigit() for char in loco_raw):
+            return None
+
+        type_raw = loco_raw[0:3]
+        number_raw = loco_raw[4:8]
+        type_digits = sum(char.isdigit() for char in type_raw)
+        number_digits = sum(char.isdigit() for char in number_raw)
+        if type_digits < 2 or number_digits < 2:
+            return None
+
+        type_code, type_name = self._resolve_loco_code(type_raw)
+        class_tag, class_valid = self._decode_class_tag(class_raw)
+
+        score = 0
+        score += 100 if type_name is not None else 20
+        score += type_digits * 10
+        score += number_digits * 12
+        score += 45 if class_valid else -15
+
+        if loco_raw[3].isdigit():
+            score += 8
+            if loco_raw[3] == '0':
+                score += 4
+
+        if cab_raw in self.VALID_CAB_ENDS:
+            score += 35
+        elif cab_raw.isdigit():
+            score += 8
+        elif all(char == 'X' or char.isdigit() for char in cab_raw):
+            score -= 5
+        else:
+            score -= 20
+
+        coord_raw = block[30:self.LBJ_BLOCK_LEN]
+        score += sum(char.isdigit() for char in coord_raw)
+        if len(block) >= self.LBJ_BLOCK_LEN:
+            score += 5
+
+        return score, type_code, type_name, class_tag
+
     def _parse_basic(self, s):
         parts = [p for p in s.split(' ') if p]
         cleaned_parts = []
@@ -372,68 +460,102 @@ class LBJReceiver:
                 cleaned_parts.append(parts[i] + parts[i+1]); i += 2
             else:
                 cleaned_parts.append(parts[i]); i += 1
-        if len(cleaned_parts) >= 3:
-            try: km = round(float(cleaned_parts[2]) / 10.0, 1)
-            except: km = cleaned_parts[2]
-            return {"train_no": cleaned_parts[0], "speed_kmh": cleaned_parts[1], "km_post": km}
-        return {}
+
+        # 基础报文固定为“车次 速度 公里标”。不可纠正码字产生的 XXXXX
+        # 也可能恰好被空格分成三段，不能仅凭字段数量就认定为有效报文。
+        if len(cleaned_parts) != 3:
+            return {}
+
+        train_no, speed_raw, km_raw = cleaned_parts
+        if not train_no.isdigit() or not 1 <= len(train_no) <= 8:
+            return {}
+        if 'X' in speed_raw or 'X' in km_raw:
+            return {}
+
+        try:
+            speed = float(speed_raw)
+            km_value = float(km_raw)
+        except:
+            return {}
+
+        if abs(speed) > 500 or abs(km_value) > 1000000:
+            return {}
+
+        return {
+            "train_no": train_no,
+            "speed_kmh": speed_raw,
+            "km_post": round(km_value / 10.0, 1)
+        }
 
     def _parse_ext(self, s):
-        if len(s) < 47: s = s + 'X' * (47 - len(s))
+        if len(s) < self.LBJ_BLOCK_LEN:
+            s = s + 'X' * (self.LBJ_BLOCK_LEN - len(s))
         try:
-            cls_hex = self._bcd_to_hex(s[0:4])
-            cls_tag = bytes.fromhex(cls_hex).decode('ascii').replace('\x00', '').strip() if cls_hex else "?"
+            cls_tag, class_valid = self._decode_class_tag(s[0:4])
             loco_raw = s[4:12]
-            try:
-                type_str = str(int(loco_raw[0:3]))
-                if type_str in self.loco_types:
-                    loco_display = f"{self.loco_types[type_str]}-{loco_raw[4:8]}"
-                else:
-                    loco_display = f"UNK({type_str})-{loco_raw[4:8]}"
-            except: loco_display = loco_raw 
-            route_hex = self._bcd_to_hex(s[14:30]) 
+            type_str, type_name = self._resolve_loco_code(loco_raw[0:3])
+            if type_name is not None:
+                loco_display = f"{type_name}-{loco_raw[4:8]}"
+            elif loco_raw[0:3].isdigit():
+                loco_display = f"UNK({type_str})-{loco_raw[4:8]}"
+            else:
+                loco_display = loco_raw
+
+            route_raw = s[14:30]
+            route_hex = "" if 'X' in route_raw else self._bcd_to_hex(route_raw)
             return {
                 "loco_type": loco_display, "loco_raw": loco_raw, "cab_end": s[12:14],
                 "route_hex": route_hex, "class_tag": cls_tag,
+                "class_valid": class_valid,
                 "lon": f"{s[30:33]}°{s[33:35]}.{s[35:39]}' E", "lat": f"{s[39:41]}°{s[41:43]}.{s[43:47]}' N"
             }
         except: return {}
 
     def _find_lbj_block(self, msg):
         best_score, best_idx = -1, -1
+        best_info = None
         if len(msg) < 12: return -1
-        
-        for i in range(len(msg) - 11):
-            block = msg[i:i+47]
-            loco_part = block[4:12]
-            if ' ' in loco_part: continue
-            
-            cab_part = block[12:14] if len(block) >= 14 else ""
-            coord_part = block[30:47] if len(block) >= 47 else block[30:]
-            
-            loco_digits = sum(1 for c in loco_part if c.isdigit())
-            cab_digits = sum(1 for c in cab_part if c.isdigit())
-            coord_digits = sum(1 for c in coord_part if c.isdigit())
-            
-            score = (loco_digits * 20) + (cab_digits * 5) + coord_digits
-            
-            if loco_digits >= 6 or (loco_digits >= 4 and coord_digits >= 4):
-                if score > best_score: 
-                    best_score, best_idx = score, i
-                    
+
+        # 每个 POCSAG 数字消息码字固定产生 5 个字符。不可纠正码字也以
+        # "XXXXX" 占位，因此扩展块只能从 5 字符边界开始，不能逐字符滑动。
+        for i in range(0, len(msg) - 11, self.NUMERIC_CHARS_PER_WORD):
+            block = msg[i:i+self.LBJ_BLOCK_LEN]
+            candidate = self._score_lbj_candidate(block)
+            if candidate is None:
+                continue
+            score, type_code, type_name, class_tag = candidate
+            if score > best_score:
+                best_score = score
+                best_idx = i
+                best_info = (type_code, type_name, class_tag, block[4:12])
+
+        if best_score < self.MIN_LBJ_BLOCK_SCORE:
+            return -1
+
+        if best_idx != -1 and 'X' in msg:
+            print("LBJ_ALIGN",
+                  "start=", best_idx,
+                  "score=", best_score,
+                  "loco=", best_info[3],
+                  "type=", best_info[1] if best_info[1] is not None else best_info[0])
         return best_idx
 
     def _parse_train_data(self, msg):
-        msg_clean = msg.strip(' \r\n\t\x00')
-        if not msg_clean: return {"type": "empty", "raw": msg}
-        if msg_clean.startswith(('*', '-')) and len(msg_clean) >= 5 and msg_clean[1:5].isdigit():
-            return {"type": "time_sync", "time": f"{msg_clean[1:3]}:{msg_clean[3:5]}", "raw": msg_clean}
+        # 保留开头空格，它们也是 5 字符码字相位的一部分。
+        msg_clean = msg.rstrip('\r\n\t\x00')
+        if not msg_clean or not msg_clean.strip(' '):
+            return {"type": "empty", "raw": msg}
+
+        time_msg = msg_clean.lstrip(' ')
+        if time_msg.startswith(('*', '-')) and len(time_msg) >= 5 and time_msg[1:5].isdigit():
+            return {"type": "time_sync", "time": f"{time_msg[1:3]}:{time_msg[3:5]}", "raw": msg_clean}
 
         lbj_start_idx = self._find_lbj_block(msg_clean)
         if lbj_start_idx != -1:
-            lbj_block = msg_clean[lbj_start_idx:lbj_start_idx+47]
+            lbj_block = msg_clean[lbj_start_idx:lbj_start_idx+self.LBJ_BLOCK_LEN]
             basic_str = msg_clean[:lbj_start_idx].strip()
             ext_dict = self._parse_ext(lbj_block)
+            ext_dict["block_start"] = lbj_start_idx
             if basic_str:
                 basic_dict = self._parse_basic(basic_str)
                 if basic_dict and "train_no" in basic_dict:
@@ -443,9 +565,24 @@ class LBJReceiver:
         else:
             basic_dict = self._parse_basic(msg_clean)
             if basic_dict and "train_no" in basic_dict: return {"type": "basic_only", "raw": msg_clean, "basic": basic_dict}
+            x_count = msg_clean.count('X')
+            if x_count:
+                return {
+                    "type": "corrupt",
+                    "raw": msg_clean,
+                    "error": "uncorrectable_codewords",
+                    "x_count": x_count
+                }
             return {"type": "unknown", "raw": msg_clean}
 
     def _handle_parsed_msg(self, msg):
+        if msg.get("type") == "corrupt":
+            print("LBJ_DROP_CORRUPT",
+                  "ric=", msg.get("ric", ""),
+                  "x=", msg.get("x_count", 0),
+                  "len=", len(msg.get("raw", "")))
+            return
+
         now = time.ticks_ms()
         if self.pending_msg and msg.get("ric") == self.pending_msg.get("ric"):
             p_type, c_type = self.pending_msg.get("type"), msg.get("type")
