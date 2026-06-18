@@ -400,6 +400,17 @@ class LBJReceiver:
                 matched_name = name
         return matched_code if matched_code is not None else raw_code, matched_name
 
+    def _is_emu_loco_code(self, type_code):
+        try:
+            return int(type_code) >= 301
+        except:
+            return False
+
+    def _loco_number_raw(self, loco_raw, type_code):
+        if self._is_emu_loco_code(type_code):
+            return loco_raw[3:7]
+        return loco_raw[4:8]
+
     def _score_lbj_candidate(self, block):
         # 失败码字已经由 XXXXX 占满 5 个字符；不足 47 字符表示消息被截断，
         # 不能再补位后猜测，否则报文尾部数字很容易被误认成车型。
@@ -415,13 +426,14 @@ class LBJReceiver:
             return None
 
         type_raw = loco_raw[0:3]
-        number_raw = loco_raw[4:8]
         type_digits = sum(char.isdigit() for char in type_raw)
-        number_digits = sum(char.isdigit() for char in number_raw)
+        type_code, type_name = self._resolve_loco_code(type_raw)
+        legacy_number_digits = sum(char.isdigit() for char in loco_raw[4:8])
+        emu_number_digits = sum(char.isdigit() for char in loco_raw[3:7])
+        number_digits = max(legacy_number_digits, emu_number_digits)
         if type_digits < 2 or number_digits < 2:
             return None
 
-        type_code, type_name = self._resolve_loco_code(type_raw)
         class_tag, class_valid = self._decode_class_tag(class_raw)
 
         score = 0
@@ -430,10 +442,15 @@ class LBJReceiver:
         score += number_digits * 12
         score += 45 if class_valid else -15
 
-        if loco_raw[3].isdigit():
-            score += 8
-            if loco_raw[3] == '0':
-                score += 4
+        placeholder_score = 0
+        for placeholder_idx in (3, 7):
+            if loco_raw[placeholder_idx].isdigit():
+                candidate_score = 8
+                if loco_raw[placeholder_idx] == '0':
+                    candidate_score += 4
+                if candidate_score > placeholder_score:
+                    placeholder_score = candidate_score
+        score += placeholder_score
 
         if cab_raw in self.VALID_CAB_ENDS:
             score += 35
@@ -467,25 +484,46 @@ class LBJReceiver:
             return {}
 
         train_no, speed_raw, km_raw = cleaned_parts
+        if train_no == '---' and speed_raw == '---' and km_raw == '---':
+            return {
+                "train_no": "---",
+                "speed_kmh": "---",
+                "km_post": "---",
+                "placeholder": True
+            }
+
         if not train_no.isdigit() or not 1 <= len(train_no) <= 8:
             return {}
-        if 'X' in speed_raw or 'X' in km_raw:
-            return {}
+
+        speed_out = "---"
+        km_out = "---"
+        try:
+            if 'X' not in speed_raw:
+                speed = float(speed_raw)
+                if abs(speed) <= 500:
+                    speed_out = speed_raw
+        except:
+            pass
 
         try:
-            speed = float(speed_raw)
-            km_value = float(km_raw)
+            if 'X' not in km_raw:
+                km_value = float(km_raw)
+                if abs(km_value) <= 1000000:
+                    km_out = round(km_value / 10.0, 1)
         except:
+            pass
+
+        if speed_out == "---" and km_out == "---":
             return {}
 
-        if abs(speed) > 500 or abs(km_value) > 1000000:
-            return {}
-
-        return {
+        result = {
             "train_no": train_no,
-            "speed_kmh": speed_raw,
-            "km_post": round(km_value / 10.0, 1)
+            "speed_kmh": speed_out,
+            "km_post": km_out
         }
+        if speed_out == "---" or km_out == "---":
+            result["partial"] = True
+        return result
 
     def _parse_ext(self, s):
         if len(s) < self.LBJ_BLOCK_LEN:
@@ -494,10 +532,11 @@ class LBJReceiver:
             cls_tag, class_valid = self._decode_class_tag(s[0:4])
             loco_raw = s[4:12]
             type_str, type_name = self._resolve_loco_code(loco_raw[0:3])
+            loco_number = self._loco_number_raw(loco_raw, type_str)
             if type_name is not None:
-                loco_display = f"{type_name}-{loco_raw[4:8]}"
+                loco_display = f"{type_name}-{loco_number}"
             elif loco_raw[0:3].isdigit():
-                loco_display = f"UNK({type_str})-{loco_raw[4:8]}"
+                loco_display = f"UNK({type_str})-{loco_number}"
             else:
                 loco_display = loco_raw
 
@@ -575,6 +614,11 @@ class LBJReceiver:
                 }
             return {"type": "unknown", "raw": msg_clean}
 
+    def _ric_addr(self, ric):
+        if not ric:
+            return ""
+        return str(ric).split("-F", 1)[0]
+
     def _handle_parsed_msg(self, msg):
         if msg.get("type") == "corrupt":
             print("LBJ_DROP_CORRUPT",
@@ -584,7 +628,11 @@ class LBJReceiver:
             return
 
         now = time.ticks_ms()
-        if self.pending_msg and msg.get("ric") == self.pending_msg.get("ric"):
+        same_ric_addr = (
+            self.pending_msg
+            and self._ric_addr(msg.get("ric")) == self._ric_addr(self.pending_msg.get("ric"))
+        )
+        if same_ric_addr:
             p_type, c_type = self.pending_msg.get("type"), msg.get("type")
             if (p_type == "basic_only" and c_type == "extended_only") or (p_type == "extended_only" and c_type == "basic_only"):
                 merged = {

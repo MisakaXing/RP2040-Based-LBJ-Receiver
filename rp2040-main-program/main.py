@@ -18,7 +18,7 @@ pin_bl = Pin(6, Pin.OUT, value=0)
 time.sleep_ms(200)
 machine.freq(240000000) # 超频 
 last_gc = 0
-Program_ver = 4.3
+Program_ver = 4.4
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -132,7 +132,7 @@ MAX_HIST = 2500
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
-PPM_CALIBRATION_VERSION = 5
+PPM_CALIBRATION_VERSION = 7
 
 system_state = "DASHBOARD" 
 has_received = False
