@@ -2,7 +2,6 @@ import machine
 import time
 import framebuf
 import micropython
-import struct
 
 # 常用颜色定义 (RGB565)
 BLACK   = 0x0000
@@ -47,6 +46,21 @@ def _fast_draw_matrix(data: ptr8, buf: ptr8, w: int, h: int, ch: int, cl: int, b
                 buf[idx] = buf[line_start + i]
                 idx += 1
 
+
+@micropython.viper
+def _fill_color_buffer(buf: ptr8, pixels: int, ch: int, cl: int):
+    idx = 0
+    for _ in range(pixels):
+        buf[idx] = ch
+        buf[idx + 1] = cl
+        idx += 2
+
+
+@micropython.viper
+def _clear_buffer(buf: ptr8, length: int):
+    for idx in range(length):
+        buf[idx] = 0
+
 # ==========================================
 # ILI9341 驱动类
 # ==========================================
@@ -59,6 +73,15 @@ class ILI9341:
         self.rst = machine.Pin(rst, machine.Pin.OUT, value=1)
         self.width = width
         self.height = height
+
+        self._one = bytearray(1)
+        self._window_buf = bytearray(4)
+        self._fill_buf = bytearray(4096)
+        self._fill_mv = memoryview(self._fill_buf)
+        self._fill_color = -1
+        self._glyph_buf = bytearray(16 * 16 * 3 * 3 * 2)
+        self._glyph_mv = memoryview(self._glyph_buf)
+        self._font_buf = bytearray(32)
         
         self.char_buf = bytearray(8)
         self.char_fb = framebuf.FrameBuffer(self.char_buf, 8, 8, framebuf.MONO_HLSB)
@@ -75,34 +98,40 @@ class ILI9341:
             self.hzk_file = None
 
     def write_cmd(self, cmd):
+        self._one[0] = cmd
         self.dc.value(0)
         self.cs.value(0)
-        self.spi.write(bytearray([cmd]))
-        self.cs.value(1)
+        try:
+            self.spi.write(self._one)
+        finally:
+            self.cs.value(1)
 
     def write_data(self, data):
         self.dc.value(1)
         self.cs.value(0)
-        if isinstance(data, int):
-            self.spi.write(bytearray([data]))
-        else:
-            self.spi.write(data)
-        self.cs.value(1)
+        try:
+            if isinstance(data, int):
+                self._one[0] = data
+                self.spi.write(self._one)
+            else:
+                self.spi.write(data)
+        finally:
+            self.cs.value(1)
 
     def reset(self):
         self.rst.value(1)
-        time.sleep_ms(50)
+        time.sleep_ms(10)
         self.rst.value(0)
-        time.sleep_ms(50)
+        time.sleep_ms(20)
         self.rst.value(1)
-        time.sleep_ms(50)
+        time.sleep_ms(20)
     #屏幕初始化寄存器
     def init_display(self):
         self.write_cmd(0x01)
-        time.sleep_ms(150)
+        time.sleep_ms(10)
 
         self.write_cmd(0x11)
-        time.sleep_ms(150)
+        time.sleep_ms(120)
 
         self.write_cmd(0x3A)
         self.write_data(b'\x55')
@@ -111,13 +140,24 @@ class ILI9341:
         self.write_data(b'\x28')
 
         self.write_cmd(0x29)
-        time.sleep_ms(20)
+        time.sleep_ms(10)
 
     def set_window(self, x, y, w, h):
+        buf = self._window_buf
         self.write_cmd(0x2A)
-        self.write_data(struct.pack(">HH", x, x + w - 1))
+        x_end = x + w - 1
+        buf[0] = (x >> 8) & 0xFF
+        buf[1] = x & 0xFF
+        buf[2] = (x_end >> 8) & 0xFF
+        buf[3] = x_end & 0xFF
+        self.write_data(buf)
         self.write_cmd(0x2B)
-        self.write_data(struct.pack(">HH", y, y + h - 1))
+        y_end = y + h - 1
+        buf[0] = (y >> 8) & 0xFF
+        buf[1] = y & 0xFF
+        buf[2] = (y_end >> 8) & 0xFF
+        buf[3] = y_end & 0xFF
+        self.write_data(buf)
         self.write_cmd(0x2C)
 
     # 兼容性最高且速度极快的分块颜色填充，解决乘法报错
@@ -128,25 +168,21 @@ class ILI9341:
         self.set_window(x, y, w, h)
         self.dc.value(1)
         self.cs.value(0)
-        
-        chunk_h = min(8, h)
-        total_bytes = w * chunk_h * 2
-        
-        color_buf = bytearray(total_bytes)
-        ch = color >> 8
-        cl = color & 0xFF
-        for i in range(0, total_bytes, 2):
-            color_buf[i] = ch
-            color_buf[i+1] = cl
-        
-        for _ in range(h // chunk_h): 
-            self.spi.write(color_buf)
-            
-        rem = h % chunk_h
-        if rem: 
-            self.spi.write(color_buf[:w * rem * 2])
-            
-        self.cs.value(1)
+        try:
+            ch = color >> 8
+            cl = color & 0xFF
+            if self._fill_color != color:
+                _fill_color_buffer(self._fill_buf, len(self._fill_buf) // 2, ch, cl)
+                self._fill_color = color
+
+            remaining_pixels = w * h
+            chunk_pixels = len(self._fill_buf) // 2
+            while remaining_pixels > 0:
+                count = min(chunk_pixels, remaining_pixels)
+                self.spi.write(self._fill_mv[:count * 2])
+                remaining_pixels -= count
+        finally:
+            self.cs.value(1)
 
     def fill(self, color):
         self.fill_rect(0, 0, self.width, self.height, color)
@@ -157,18 +193,22 @@ class ILI9341:
         if x + block_w > self.width or y + block_h > self.height:
             return
             
-        buf = bytearray(block_w * block_h * 2)
+        needed = block_w * block_h * 2
+        if needed > len(self._glyph_buf):
+            return
         
         ch, cl = color >> 8, color & 0xFF
         bh, bl = bg_color >> 8, bg_color & 0xFF
         
-        _fast_draw_matrix(data, buf, w, h, ch, cl, bh, bl, scale)
+        _fast_draw_matrix(data, self._glyph_buf, w, h, ch, cl, bh, bl, scale)
                 
         self.set_window(x, y, block_w, block_h)
         self.dc.value(1)
         self.cs.value(0)
-        self.spi.write(buf)
-        self.cs.value(1)
+        try:
+            self.spi.write(self._glyph_mv[:needed])
+        finally:
+            self.cs.value(1)
 
     def draw_gbk(self, gbk_bytes, x, y, color, bg_color=BLACK, scale=1):
         if type(gbk_bytes) == str:
@@ -190,16 +230,20 @@ class ILI9341:
                 if i + 1 >= len(gbk_bytes): 
                     break
                 b2 = gbk_bytes[i+1]
-                font_data = bytearray(32) 
+                font_data = self._font_buf
+                _clear_buffer(font_data, len(font_data))
                 
                 if 0xA1 <= b1 <= 0xF7 and 0xA1 <= b2 <= 0xFE:
                     offset = ((b1 - 0xA1) * 94 + (b2 - 0xA1)) * 32
                     if 0 <= offset <= 267616 - 32:
                         if self.hzk_file:  
                             self.hzk_file.seek(offset)
-                            read_data = self.hzk_file.read(32)
-                            if len(read_data) == 32:
-                                font_data = read_data
+                            try:
+                                self.hzk_file.readinto(font_data)
+                            except AttributeError:
+                                read_data = self.hzk_file.read(32)
+                                if len(read_data) == 32:
+                                    font_data[:] = read_data
                                 
                 self._draw_matrix(font_data, 16, 16, curr_x, y, color, bg_color, scale)
                 curr_x += 16 * scale

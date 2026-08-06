@@ -1186,5 +1186,3 @@ class LBJReceiver:
             self._flush_pending_fragments(now)
             self.last_timeout_check = now
         self._service_radio_health(now)
-
-
