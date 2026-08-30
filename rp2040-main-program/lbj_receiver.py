@@ -730,9 +730,9 @@ class LBJReceiver:
         except:
             pass
 
-        if speed_out == "---" and km_out == "---":
-            return {}
-
+        # A valid numeric train number is sufficient to keep the basic frame.
+        # Speed and kilometre post are independent optional measurements; both
+        # may legitimately be unavailable and must remain visible as "---".
         result = {
             "train_no": train_no,
             "speed_kmh": speed_out,
@@ -817,13 +817,14 @@ class LBJReceiver:
             ext_dict["block_start"] = lbj_start_idx
             if basic_str:
                 basic_dict = self._parse_basic(basic_str)
-                if basic_dict and "train_no" in basic_dict:
+                if str(basic_dict.get("train_no", "")).isdigit():
                     return {"type": "train_data_full", "raw": msg_clean, "basic": basic_dict, "extended": ext_dict}
                 return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict, "garbage_prefix": basic_str}
             return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict}
         else:
             basic_dict = self._parse_basic(msg_clean)
-            if basic_dict and "train_no" in basic_dict: return {"type": "basic_only", "raw": msg_clean, "basic": basic_dict}
+            if str(basic_dict.get("train_no", "")).isdigit():
+                return {"type": "basic_only", "raw": msg_clean, "basic": basic_dict}
             x_count = msg_clean.count('X')
             if x_count:
                 return {
@@ -1186,5 +1187,4 @@ class LBJReceiver:
             self._flush_pending_fragments(now)
             self.last_timeout_check = now
         self._service_radio_health(now)
-
 
