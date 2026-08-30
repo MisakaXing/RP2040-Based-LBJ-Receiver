@@ -5,26 +5,50 @@ import os
 import gc
 import sdcard
 import _thread  
-import array  
 from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver, FixedQueue
+from history_store import (
+    APPEND_FULL,
+    APPEND_INVALID,
+    APPEND_NO_SPACE,
+    APPEND_OK,
+    APPEND_RETRY,
+    HistoryStore,
+    make_history_record,
+    storage_write_due,
+)
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231
 from boot_post import SystemPOST
+from wireless_portal import WirelessPortal, AP_SSID
 
 # 系统性能配置
 
+# Preserve the original receiver timing/performance.  The Waveshare-specific
+# MicroPython build has been hardware-tested with CYW43 AP mode at 200 MHz.
 CPU_FREQ_HZ = 200000000
 TFT_SPI_BAUD = 60000000
 UI_QUEUE_CAPACITY = 16
 HISTORY_QUEUE_CAPACITY = 24
 HISTORY_RADIO_QUIET_MS = 100
 STORAGE_WRITE_GAP_MS = 80
+STORAGE_MAX_DEFER_MS = 1500
+STORAGE_HARD_DEFER_MS = 5000
 RADIO_CORE_STALL_MS = 10000
 RADIO_ERROR_RECOVERY_THRESHOLD = 3
 RADIO_AUTO_RECOVERY_ENABLED = True
 RADIO_HEALTH_LOG_MS = 60000
 BUTTON_BEEP_MS = 25
+HISTORY_BEEP_GAP_MS = 6
+BUTTON_REPEAT_DELAY_MS = 350
+BUTTON_REPEAT_INTERVAL_MS = 120
+HISTORY_REPEAT_DELAY_MS = 220
+HISTORY_REPEAT_INTERVAL_MS = 45
+MAX_STORAGE_RETRIES = 3
+SD_MIN_FREE_BYTES = 1024 * 1024
+WIFI_RETRY_INITIAL_MS = 5000
+WIFI_RETRY_MAX_MS = 60000
+PHYSICAL_FLASH_MIB = 16
 
 pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(CPU_FREQ_HZ)
@@ -32,7 +56,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = 5.2
+Program_ver = "5.2-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -48,6 +72,16 @@ RADIO_LAST_ERROR_LOG = 3
 radio_state = [time.ticks_ms(), 0, 0, 0]
 last_radio_health_log = 0
 last_storage_write = 0
+storage_pending_since = None
+storage_turn = 0
+history_write_retries = 0
+history_dropped = 0
+sd_dropped = 0
+storage_errors = 0
+storage_forced_writes = 0
+wifi_service_errors = 0
+wifi_retry_at = 0
+wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
 
 last_hw_update = 0  
 last_rssi_str = "N/A" 
@@ -66,20 +100,25 @@ spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
-bat_adc = ADC(Pin(27)) 
+bat_adc = ADC(Pin(41))
 buzzer = Pin(22, Pin.OUT, value=0)
+try:
+    buzzer_timer = machine.Timer(-1)
+except Exception:
+    buzzer_timer = None
 
 i2c0 = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
 rtc = DS3231(i2c0)
 
 btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3, 4, 5)]
-btn_wake = Pin(28, Pin.IN, Pin.PULL_UP)
-sensor_temp = machine.ADC(4)
+btn_wake = Pin(42, Pin.IN, Pin.PULL_UP)
+sensor_temp = ADC(ADC.CORE_TEMP)
 
 
 class ButtonTracker:
     def __init__(self, pin, repeat=False, debounce_ms=12,
-                 repeat_delay_ms=350, repeat_interval_ms=120):
+                 repeat_delay_ms=BUTTON_REPEAT_DELAY_MS,
+                 repeat_interval_ms=BUTTON_REPEAT_INTERVAL_MS):
         self.pin = pin
         self.repeat = repeat
         self.debounce_ms = debounce_ms
@@ -89,12 +128,39 @@ class ButtonTracker:
         self.stable_pressed = self.raw_pressed
         self.changed_at = time.ticks_ms()
         self.repeat_at = time.ticks_add(self.changed_at, repeat_delay_ms)
+        self.suppress_until_release = False
+
+    def set_repeat_profile(self, delay_ms, interval_ms, now,
+                           suppress_until_release=False):
+        self.repeat_delay_ms = delay_ms
+        self.repeat_interval_ms = interval_ms
+        self.repeat_at = time.ticks_add(now, delay_ms)
+        if suppress_until_release:
+            self.suppress_until_release = (
+                self.raw_pressed
+                or self.stable_pressed
+                or not self.pin.value()
+            )
 
     def poll(self, now):
         raw_pressed = not self.pin.value()
         if raw_pressed != self.raw_pressed:
             self.raw_pressed = raw_pressed
             self.changed_at = now
+
+        # A direction key may still be held when HISTORY exits.  Swallow that
+        # hold through a debounced release so its accelerated repeat cannot
+        # leak into the dashboard or menu.
+        if self.suppress_until_release:
+            if (
+                not self.raw_pressed
+                and self.stable_pressed
+                and time.ticks_diff(now, self.changed_at) >= self.debounce_ms
+            ):
+                self.stable_pressed = False
+            if not self.raw_pressed and not self.stable_pressed:
+                self.suppress_until_release = False
+            return False
 
         if (
             self.raw_pressed != self.stable_pressed
@@ -186,11 +252,14 @@ def get_serial_number():
 
 # 2. 系统全局变量
 Serial_Number = get_serial_number()
-MAX_HIST = 2500
+wifi_portal = WirelessPortal(Serial_Number)
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
 PPM_CALIBRATION_VERSION = 7
+history_store = HistoryStore(HIST_FILE)
+MAX_HIST = history_store.max_records
+FLASH_FS_BYTES = history_store.total_bytes
 
 system_state = "DASHBOARD" 
 has_received = False
@@ -202,14 +271,19 @@ SCR_OFF_MS = [30000, 60000, 300000, -1]
 cfg_buzzer = True
 cfg_ppm_offset = 6.0
 cfg_ppm_calibrated = False
+cfg_wifi_enabled = False
+wifi_module_ok = True
 
-menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"]
+menu_items = ["BUZZER: ON", "SET DATE", "JUMP TO ID", "FORMAT FLASH", "FORMAT SD", "MOUNT SD", "ABOUT DEV", f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}", "WIRELESS SETTING"]
+MENU_WIFI_INDEX = 8
+MENU_VISIBLE_ROWS = 8
+menu_view_start = 0
 
 hist_ptr = -1
 total_count = 0
 
-history_offsets = array.array('I') 
 last_interaction = time.ticks_ms()
+history_last_input = last_interaction
 
 last_minute = -1 
 last_sd_err_time = 0
@@ -227,6 +301,7 @@ current_status_color = GREEN
 
 last_basic, last_ext = {}, {}
 last_is_full = True
+latest_train_record = None
 
 need_post_train_gc = False 
 last_screen_layout = None
@@ -235,10 +310,23 @@ buzzer_off_at = None
 # 3. 核心功能函数
 
     
+def _buzzer_timer_off(_timer):
+    # Pin writes are IRQ-safe on RP2; keep the timer callback allocation-free.
+    buzzer.value(0)
+
+def _cancel_buzzer_timer():
+    if buzzer_timer is not None:
+        try:
+            buzzer_timer.deinit()
+        except Exception:
+            pass
+
 def beep():
     global buzzer_off_at
     if not cfg_buzzer:
         return
+    _cancel_buzzer_timer()
+    buzzer_off_at = None
     buzzer.value(1)
     time.sleep_ms(BUTTON_BEEP_MS)
     buzzer.value(0)
@@ -249,14 +337,62 @@ def service_buzzer(now):
     if buzzer_off_at is not None and time.ticks_diff(now, buzzer_off_at) >= 0:
         buzzer.value(0)
         buzzer_off_at = None
+        _cancel_buzzer_timer()
 
 def stop_buzzer():
     global buzzer_off_at
+    _cancel_buzzer_timer()
     buzzer.value(0)
     buzzer_off_at = None
 
 def navigation_beep():
     beep()
+
+def history_navigation_beep():
+    """Emit one distinct pulse for every displayed HISTORY page."""
+    global buzzer_off_at
+    if not cfg_buzzer:
+        return
+
+    # Normally the one-shot timer has already made the pin low while the next
+    # page is drawing.  This fallback gap also guarantees separation if timer
+    # delivery was delayed by a driver or the timer is unavailable.
+    if buzzer.value():
+        buzzer.value(0)
+        time.sleep_ms(HISTORY_BEEP_GAP_MS)
+    _cancel_buzzer_timer()
+    buzzer.value(1)
+    buzzer_off_at = time.ticks_add(time.ticks_ms(), BUTTON_BEEP_MS)
+    if buzzer_timer is not None:
+        try:
+            buzzer_timer.init(
+                period=BUTTON_BEEP_MS,
+                mode=machine.Timer.ONE_SHOT,
+                callback=_buzzer_timer_off,
+            )
+            return
+        except Exception:
+            pass
+
+    # Compatibility fallback for a firmware without virtual timers.
+    time.sleep_ms(BUTTON_BEEP_MS)
+    buzzer.value(0)
+    buzzer_off_at = None
+
+def set_history_navigation_mode(enabled, suppress_until_release=False, now=None):
+    """Change only the HISTORY repeat profile; menu timing stays untouched."""
+    if now is None:
+        now = time.ticks_ms()
+    delay_ms = HISTORY_REPEAT_DELAY_MS if enabled else BUTTON_REPEAT_DELAY_MS
+    interval_ms = (
+        HISTORY_REPEAT_INTERVAL_MS if enabled else BUTTON_REPEAT_INTERVAL_MS
+    )
+    up_button.set_repeat_profile(
+        delay_ms, interval_ms, now, suppress_until_release
+    )
+    down_button.set_repeat_profile(
+        delay_ms, interval_ms, now, suppress_until_release
+    )
 
 def get_max_days(y, m):
     if m == 2: return 29 if y % 4 == 0 else 28
@@ -292,11 +428,16 @@ def _read_config_dict():
         return {}
 
 def load_config():
-    global cfg_buzzer, cfg_scr_idx, cfg_ppm_offset, cfg_ppm_calibrated, menu_items
+    global cfg_buzzer, cfg_scr_idx, cfg_ppm_offset, cfg_ppm_calibrated
+    global cfg_wifi_enabled, menu_items
     try:
         config = _read_config_dict()
-        cfg_buzzer = config.get("buzzer", True)
-        cfg_scr_idx = config.get("scr_idx", 3)
+        cfg_buzzer = bool(config.get("buzzer", True))
+        try:
+            loaded_scr_idx = int(config.get("scr_idx", 3))
+        except (TypeError, ValueError):
+            loaded_scr_idx = 3
+        cfg_scr_idx = loaded_scr_idx if 0 <= loaded_scr_idx < len(SCR_OFF_OPTS) else 3
         ppm_value = float(config.get("ppm_offset", 6.0))
         ppm_valid = -25.0 <= ppm_value <= 25.0
         ppm_version_ok = config.get("ppm_calibration_version", 0) == PPM_CALIBRATION_VERSION
@@ -306,13 +447,21 @@ def load_config():
             and ppm_version_ok
         )
         cfg_ppm_offset = ppm_value if cfg_ppm_calibrated else 6.0
+        cfg_wifi_enabled = bool(config.get("wifi_enabled", False))
         menu_items[0] = f"BUZZER: {'ON' if cfg_buzzer else 'OFF'}"
         menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
-    except:
+    except Exception as exc:
+        print("CONFIG_LOAD_ERR", repr(exc))
+        cfg_buzzer = True
+        cfg_scr_idx = 3
         cfg_ppm_offset = 6.0
         cfg_ppm_calibrated = False
+        cfg_wifi_enabled = False
+        menu_items[0] = "BUZZER: ON"
+        menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
 
 def save_config():
+    temp_name = CONFIG_FILE + ".tmp"
     try:
         config = _read_config_dict()
         config["buzzer"] = cfg_buzzer
@@ -320,94 +469,222 @@ def save_config():
         config["ppm_offset"] = cfg_ppm_offset
         config["ppm_calibrated"] = cfg_ppm_calibrated
         config["ppm_calibration_version"] = PPM_CALIBRATION_VERSION
-        with open(CONFIG_FILE, 'w') as f: f.write(json.dumps(config))
-    except: pass
-
-def init_history():
-    global total_count, history_offsets
-    history_offsets = array.array('I')
-    try:
-        with open(HIST_FILE, 'r') as f:
-            while True:
-                offset = f.tell()      
-                line = f.readline()    
-                if not line: break     
-                history_offsets.append(offset)
-        total_count = len(history_offsets)
-    except: 
-        total_count = 0; history_offsets = array.array('I')
-
-def save_history(data):
-    global total_count, history_offsets
-    if total_count >= MAX_HIST:
-        return False
-    try:
-        t_str = rtc.get_time_str(True)
-        record = {"t": t_str, "d": data}
-        json_str = json.dumps(record) 
-        with open(HIST_FILE, 'a') as f:
-            f.seek(0, 2); offset = f.tell() 
-            f.write(json_str + '\n')
-            history_offsets.append(offset) 
-        total_count += 1
+        config["wifi_enabled"] = cfg_wifi_enabled
+        with open(temp_name, 'w') as f:
+            f.write(json.dumps(config))
+            f.flush()
+        os.rename(temp_name, CONFIG_FILE)
         return True
     except Exception as exc:
-        print("HISTORY_WRITE_ERR", repr(exc))
+        print("CONFIG_SAVE_ERR", repr(exc))
+        try:
+            os.remove(temp_name)
+        except Exception:
+            pass
         return False
 
-def queue_history(data):
+def _schedule_wifi_retry(now):
+    global wifi_retry_at, wifi_retry_delay_ms
+    wifi_retry_at = time.ticks_add(now, wifi_retry_delay_ms)
+    wifi_retry_delay_ms = min(WIFI_RETRY_MAX_MS, wifi_retry_delay_ms * 2)
+
+def service_wifi(now):
+    global wifi_service_errors, wifi_retry_delay_ms, wifi_retry_at
+    if not cfg_wifi_enabled or not wifi_module_ok:
+        return
+    if not wifi_portal.is_enabled():
+        if time.ticks_diff(now, wifi_retry_at) < 0:
+            return
+        if wifi_portal.set_enabled(True):
+            wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
+            wifi_retry_at = 0
+        else:
+            wifi_service_errors = (wifi_service_errors + 1) & 0x3FFFFFFF
+            print("WIFI_RETRY_ERR", wifi_portal.get_status()["error"])
+            _schedule_wifi_retry(now)
+        return
+    try:
+        wifi_portal.service(now)
+    except Exception as exc:
+        wifi_service_errors = (wifi_service_errors + 1) & 0x3FFFFFFF
+        print("WIFI_SERVICE_ERR", repr(exc), "count=", wifi_service_errors)
+        wifi_portal.stop_for_error(exc)
+        gc.collect()
+        _schedule_wifi_retry(now)
+
+def init_history():
+    global total_count, current_status, current_status_color
+    global MAX_HIST, FLASH_FS_BYTES
+    total_count = history_store.scan()
+    MAX_HIST = history_store.max_records
+    FLASH_FS_BYTES = history_store.total_bytes
+    print(
+        "HISTORY_INDEX",
+        "valid=", total_count,
+        "invalid=", history_store.invalid_lines,
+        "checkpoints=", len(history_store.offsets),
+        "limit=", MAX_HIST,
+        "fs_bytes=", history_store.total_bytes,
+    )
+    if not history_store.index_complete:
+        current_status, current_status_color = b'HIST ERR', RED
+        print("HISTORY_INDEX_ERR", history_store.last_error)
+
+def save_history(record):
+    global total_count
+    result = history_store.append(record)
+    total_count = history_store.count
+    return result
+
+def history_alert_status():
+    if history_store.read_only or not history_store.index_complete:
+        return b'HIST ERR'
+    if (
+        history_store.full
+        or total_count + len(history_queue) >= MAX_HIST
+    ):
+        return b'MEM FULL'
+    return None
+
+def queue_history(record):
+    global history_dropped
     # Flash writes can stall both RP2040 cores. Keep the real-time receiver
     # independent and persist only during a quiet gap between transmissions.
-    if total_count + len(history_queue) >= MAX_HIST:
+    if record is None:
+        return False
+    if (
+        history_store.read_only
+        or history_store.full
+        or total_count + len(history_queue) >= MAX_HIST
+    ):
+        history_dropped = (history_dropped + 1) & 0x3FFFFFFF
         return False
     if len(history_queue) >= HISTORY_QUEUE_CAPACITY:
+        history_dropped = (history_dropped + 1) & 0x3FFFFFFF
         return False
-    history_queue.put(data)
-    return True
+    queued = history_queue.put(record)
+    if not queued:
+        history_dropped = (history_dropped + 1) & 0x3FFFFFFF
+    return queued
 
 def service_history_storage(now):
-    global last_storage_write
+    global last_storage_write, storage_pending_since, storage_turn
+    global history_write_retries, storage_forced_writes
+    global history_dropped, sd_dropped, storage_errors
+    global current_status, current_status_color
     if len(history_queue) == 0 and len(sd_log_queue) == 0:
+        storage_pending_since = None
         return
-    if time.ticks_diff(now, receiver.last_word_time) < HISTORY_RADIO_QUIET_MS:
+    if storage_pending_since is None:
+        storage_pending_since = now
+    raw_pending = len(receiver.raw_queue)
+    if not storage_write_due(
+        now,
+        receiver.last_word_time,
+        storage_pending_since,
+        last_storage_write,
+        raw_pending,
+        time.ticks_diff,
+        HISTORY_RADIO_QUIET_MS,
+        STORAGE_MAX_DEFER_MS,
+        STORAGE_HARD_DEFER_MS,
+        STORAGE_WRITE_GAP_MS,
+    ):
         return
-    if len(receiver.raw_queue) != 0:
-        return
-    if time.ticks_diff(now, last_storage_write) < STORAGE_WRITE_GAP_MS:
-        return
+    if (
+        raw_pending
+        or time.ticks_diff(now, receiver.last_word_time) < HISTORY_RADIO_QUIET_MS
+    ):
+        storage_forced_writes = (storage_forced_writes + 1) & 0x3FFFFFFF
 
-    # One physical write per quiet gap keeps the PIO/decoder side real-time.
-    data = history_queue.get()
-    if data is not None:
-        save_history(data)
+    # Alternate destinations so a busy internal log cannot starve the SD log.
+    # Peek first and remove only after success or a terminal failure.
+    for _ in range(2):
+        target = storage_turn
+        storage_turn ^= 1
+        if target == 0:
+            record = history_queue.peek()
+            if record is None:
+                continue
+            result = save_history(record)
+            if result == APPEND_OK:
+                history_queue.get()
+                history_write_retries = 0
+            elif result in (APPEND_FULL, APPEND_NO_SPACE, APPEND_INVALID):
+                history_queue.get()
+                history_dropped = (history_dropped + 1) & 0x3FFFFFFF
+                history_write_retries = 0
+                current_status = b'MEM FULL' if result != APPEND_INVALID else b'HIST BAD'
+                current_status_color = RED
+                print("HISTORY_REJECT", result, history_store.last_error)
+                if system_state == "DASHBOARD":
+                    update_top_bar()
+            else:
+                history_write_retries += 1
+                storage_errors = (storage_errors + 1) & 0x3FFFFFFF
+                print("HISTORY_WRITE_ERR", history_store.last_error,
+                      "retry=", history_write_retries)
+                if history_write_retries >= MAX_STORAGE_RETRIES:
+                    history_queue.get()
+                    history_dropped = (history_dropped + 1) & 0x3FFFFFFF
+                    history_write_retries = 0
+                    current_status, current_status_color = b'HIST ERR', RED
+                elif history_store.read_only or not history_store.index_complete:
+                    current_status, current_status_color = b'HIST ERR', RED
+                if current_status == b'HIST ERR' and system_state == "DASHBOARD":
+                    update_top_bar()
+            last_storage_write = now
+            storage_pending_since = (
+                now if len(history_queue) or len(sd_log_queue) else None
+            )
+            return
+
+        record = sd_log_queue.peek()
+        if record is None:
+            continue
+        if log_to_sd(record):
+            sd_log_queue.get()
+        else:
+            # log_to_sd disables the failed card and may clear the queue.
+            if sd_log_queue.peek() is record:
+                sd_log_queue.get()
+                sd_dropped = (sd_dropped + 1) & 0x3FFFFFFF
+            storage_errors = (storage_errors + 1) & 0x3FFFFFFF
         last_storage_write = now
+        storage_pending_since = (
+            now if len(history_queue) or len(sd_log_queue) else None
+        )
         return
 
-    data = sd_log_queue.get()
-    if data is not None:
-        log_to_sd(data)
-        last_storage_write = now
+    storage_pending_since = None
 
-def queue_sd_log(data):
+def queue_sd_log(record):
+    global sd_dropped
     if not sd_active or len(sd_log_queue) >= HISTORY_QUEUE_CAPACITY:
+        if sd_active:
+            sd_dropped = (sd_dropped + 1) & 0x3FFFFFFF
         return False
-    sd_log_queue.put(data)
-    return True
+    queued = sd_log_queue.put(record)
+    if not queued:
+        sd_dropped = (sd_dropped + 1) & 0x3FFFFFFF
+    return queued
 
 def load_history_entry(idx):
-    if idx < 0 or idx >= len(history_offsets): return None
-    try:
-        with open(HIST_FILE, 'r') as f:
-            f.seek(history_offsets[idx]); line = f.readline()
-            return json.loads(line)
-    except: return None
+    return history_store.load(idx)
 
-def check_sd_startup():
+def load_latest_valid_history():
+    return history_store.latest()
+
+def check_sd_startup(preinitialized=None):
     global current_sd_status, sd_active, sd_obj, menu_items
     try:
         tft_cs.value(1)
-        spi1.init(baudrate=1000000) 
-        sd_obj = sdcard.SDCard(spi1, sd_cs)
+        if preinitialized is None:
+            spi1.init(baudrate=1000000)
+            sd_obj = sdcard.SDCard(spi1, sd_cs)
+        else:
+            sd_obj = preinitialized
+        spi1.init(baudrate=5000000)
         os.mount(os.VfsFat(sd_obj), "/sd")
         s = os.statvfs("/sd")
         total_kb = (s[0] * s[2]) / 1024
@@ -416,7 +693,8 @@ def check_sd_startup():
         if total_kb > 1048576: current_sd_status = f"SD:{used_kb/1048576:.1f}/{total_kb/1048576:.1f}G"
         else: current_sd_status = f"SD:{used_kb/1024:.1f}/{total_kb/1024:.1f}M"
         sd_active = True
-    except:
+    except Exception as exc:
+        print("SD_MOUNT_ERR", repr(exc))
         sd_active = False; sd_obj = None; current_sd_status = "NO SD CARD"
     finally:
         menu_items[5] = "EJECT SD" if sd_active else "MOUNT SD"
@@ -424,10 +702,19 @@ def check_sd_startup():
 
 def disable_sd_forever(reason, redraw=True):
     global sd_active, current_sd_status, sd_obj, menu_items, last_sd_err_time
-    try: os.umount("/sd")
-    except: pass
+    global sd_dropped
+    try:
+        tft_cs.value(1)
+        spi1.init(baudrate=5000000)
+        os.umount("/sd")
+    except:
+        pass
+    finally:
+        spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
     sd_active = False
     sd_obj = None
+    sd_dropped = (sd_dropped + len(sd_log_queue)) & 0x3FFFFFFF
+    sd_log_queue.clear()
     current_sd_status = reason
     last_sd_err_time = time.ticks_ms()
     menu_items[5] = "MOUNT SD"
@@ -435,15 +722,25 @@ def disable_sd_forever(reason, redraw=True):
         if system_state == "DASHBOARD": update_top_bar()
         elif system_state == "MENU": draw_menu(full=True)
 
-def log_to_sd(data):
-    if not sd_active: return 
+def log_to_sd(record):
+    if not sd_active:
+        return False
     redraw_after_error = False
     try:
-        t_str = rtc.get_time_str(True)
-        j_str = json.dumps({"t": t_str, "d": data}) + '\n'
-        tft_cs.value(1); spi1.init(baudrate=5000000)
-        with open(SD_LOG_FILE, 'a') as f:
-            f.write(j_str)
+        tft_cs.value(1)
+        spi1.init(baudrate=5000000)
+        values = os.statvfs("/sd")
+        free_bytes = values[0] * values[3]
+        if free_bytes < SD_MIN_FREE_BYTES:
+            raise OSError("SD reserve reached")
+        j_data = (json.dumps(record) + '\n').encode('utf-8')
+        with open(SD_LOG_FILE, 'ab') as f:
+            written = f.write(j_data)
+            if written is not None and written != len(j_data):
+                raise OSError("short SD write")
+            try: f.flush()
+            except AttributeError: pass
+        return True
     except Exception as exc:
         print("SD_LOG_ERR", repr(exc))
         disable_sd_forever("SD WRITE ERR", redraw=False)
@@ -453,6 +750,7 @@ def log_to_sd(data):
     if redraw_after_error:
         if system_state == "DASHBOARD": update_top_bar()
         elif system_state == "MENU": draw_menu(full=True)
+    return False
 
 # 4. UI 绘制函数 
 
@@ -514,6 +812,15 @@ def draw_hardware_bar(force=False):
     tft.fill_rect(265, 218, 50, 16, BLACK)
     tft.draw_gbk(t.encode(), 265, 218, WHITE, BLACK)
 
+def draw_history_rssi():
+    """Refresh the only hardware-bar value that belongs to a history entry."""
+    try:
+        rssi = str(hist_rssi_str)[:8].encode()
+    except Exception:
+        rssi = b'N/A'
+    tft.fill_rect(170, 218, 70, 16, BLACK)
+    tft.draw_gbk(rssi, 170, 218, WHITE, BLACK)
+
 
 def draw_idle_screen():
     global last_screen_layout
@@ -521,7 +828,8 @@ def draw_idle_screen():
     safe_fill_rect(0, 26, 320, 164, BLACK) 
     tft.draw_gbk(b'WAITING FOR SIGNAL', 15, 95, GRAY, BLACK, scale=2)
 
-def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_time="", hist_idx=0):
+def display_train_data(basic, ext, is_full_mode=True, is_history=False,
+                       hist_time="", hist_idx=0, record_type=""):
     global last_screen_layout
     
     current_layout = f"{'HIST' if is_history else 'DASH'}_{'FULL' if is_full_mode else 'BASIC'}"
@@ -533,16 +841,18 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
 
     if is_history:
         if is_partial: tft.fill_rect(0, 30, 320, 16, bg_color) 
-        header = f"HISTORY [{hist_idx+1}/{total_count}]  {hist_time}"
+        page_name = "EXT ONLY" if record_type == "extended_only" else "HISTORY"
+        header = f"{page_name} [{hist_idx+1}/{total_count}]  {hist_time}"
         tft.draw_gbk(header.encode(), 5, 30, YELLOW, bg_color, scale=1)
         y_offset = 20
     else: y_offset = 0
 
-    train_no = basic.get('train_no', '---')
+    train_no = str(basic.get('train_no', '---'))
+    has_train_no = train_no.isdigit()
     speed = str(basic.get('speed_kmh', '---'))
     km = str(basic.get('km_post', '---'))
-    cls = ext.get('class_tag', '') if ext.get('class_tag') != '?' else ''
-    full_train = f"{cls}{train_no}"
+    cls = ext.get('class_tag', '') if has_train_no and ext.get('class_tag') != '?' else ''
+    full_train = f"{cls}{train_no}" if has_train_no else "---"
     if len(full_train) > 8: full_train = full_train[:8]
 
     if not is_full_mode:
@@ -585,37 +895,99 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         tft.draw_gbk(full_train.encode(), 53, y1, CYAN, bg_color, scale=2)
         tft.draw_gbk(speed.encode() + b'K', 218, y1, YELLOW, bg_color, scale=2)
 
-        route_hex = ext.get('route_hex', '')
-        route_b = bytes.fromhex(route_hex)[:8] if route_hex else b'----'
+        route_hex = str(ext.get('route_hex', '') or '')
+        try:
+            route_b = bytes.fromhex(route_hex)[:8] if route_hex else b'----'
+        except (TypeError, ValueError):
+            route_b = b'----'
         tft.draw_gbk(route_b, 53, y2, WHITE, bg_color, scale=2)
 
-        digits = [c for c in str(train_no) if c.isdigit()]
-        direction = b'\xc9\xcf' if digits and int(digits[-1]) % 2 == 0 else b'\xcf\xc2'
+        digits = [c for c in train_no if c.isdigit()] if has_train_no else []
+        if digits:
+            direction = b'\xc9\xcf' if int(digits[-1]) % 2 == 0 else b'\xcf\xc2'
+        else:
+            direction = b'--'
         tft.draw_gbk(direction, 180, y2, MAGENTA, bg_color, scale=2)
 
         tft.draw_gbk(km.encode() + b'K', 220, y2, GREEN, bg_color, scale=2)
 
-        loco = ext.get('loco_type', '----')
-        cab = ext.get('cab_end', '')
+        loco = str(ext.get('loco_type', '----'))
+        cab = str(ext.get('cab_end', ''))
         if cab == '31': loco += 'A'
         elif cab == '32': loco += 'B'
         tft.draw_gbk(encode_loco_gbk(loco), 53, y3, WHITE, bg_color, scale=2)
 
     if not is_history: 
-        lon = ext.get('lon', '---').replace('°', ' ')
-        lat = ext.get('lat', '---').replace('°', ' ')
+        lon = str(ext.get('lon', '---')).replace('°', ' ')
+        lat = str(ext.get('lat', '---')).replace('°', ' ')
         tft.fill_rect(0, 192, 320, 18, BLACK) 
         tft.draw_gbk(b'GPS: ' + lon.encode() + b' / ' + lat.encode(), 5, 195, GRAY, BLACK, scale=1)
         
     last_screen_layout = current_layout
 
+def show_history_index(index, announce=False):
+    global system_state, hist_ptr, hist_rssi_str, history_last_input
+    global current_status, current_status_color
+    entry = load_history_entry(index)
+    if not isinstance(entry, dict) or not isinstance(entry.get('d'), dict):
+        current_status, current_status_color = b'HIST ERR', RED
+        print("HISTORY_READ_ERR", "index=", index, history_store.last_error)
+        if system_state == "DASHBOARD":
+            update_top_bar()
+        return False
+    data = entry['d']
+    basic = data.get('basic', {})
+    extended = data.get('extended', {})
+    if not isinstance(basic, dict) or not isinstance(extended, dict):
+        current_status, current_status_color = b'HIST ERR', RED
+        return False
+    # The Flash record is valid, so this key event will display exactly one
+    # page. Start its non-blocking pulse before the comparatively slow TFT draw.
+    if announce:
+        history_navigation_beep()
+    entering_history = system_state != "HISTORY"
+    system_state = "HISTORY"
+    if entering_history:
+        set_history_navigation_mode(True)
+    history_last_input = time.ticks_ms()
+    hist_ptr = index
+    hist_rssi_str = str(data.get('rssi', 'N/A'))
+    display_train_data(
+        basic,
+        extended,
+        data.get('type') != "basic_only",
+        True,
+        entry.get('t', '---'),
+        index,
+        data.get('type', ''),
+    )
+    draw_history_rssi()
+    return True
+
+def _ensure_menu_visible():
+    global menu_view_start
+    menu_view_start = (menu_index // MENU_VISIBLE_ROWS) * MENU_VISIBLE_ROWS
+
+def move_menu_selection(delta):
+    global menu_index
+    old_idx = menu_index
+    old_view = menu_view_start
+    menu_index = (menu_index + delta) % len(menu_items)
+    _ensure_menu_visible()
+    draw_menu(full=(old_view != menu_view_start), old_idx=old_idx)
+
 def draw_menu(full=True, old_idx=-1):
     global last_screen_layout
+    _ensure_menu_visible()
     if full: 
         last_screen_layout = None 
         safe_fill_rect(0, 26, 320, 164, 0x2104) 
-        tft.draw_gbk(b'--- SYSTEM MENU ---', 80, 40, CYAN, 0x2104)
-        for i in range(len(menu_items)): 
+        page_count = (len(menu_items) + MENU_VISIBLE_ROWS - 1) // MENU_VISIBLE_ROWS
+        page_number = menu_index // MENU_VISIBLE_ROWS + 1
+        title = f"--- SYSTEM MENU {page_number}/{page_count} ---"
+        tft.draw_gbk(title.encode(), 68, 40, CYAN, 0x2104)
+        end = min(len(menu_items), menu_view_start + MENU_VISIBLE_ROWS)
+        for i in range(menu_view_start, end):
             draw_menu_item(i, i == menu_index)
     else: 
         if old_idx >= 0: 
@@ -623,10 +995,42 @@ def draw_menu(full=True, old_idx=-1):
         draw_menu_item(menu_index, True)   
 
 def draw_menu_item(i, is_selected):
-    color = YELLOW if is_selected else WHITE
-    prefix = b'> ' if is_selected else b'  '
-    tft.fill_rect(40, 60 + i*16, 240, 16, 0x2104)
-    tft.draw_gbk(prefix + menu_items[i].encode(), 40, 60 + i*16, color, 0x2104)
+    slot = i - menu_view_start
+    if slot < 0 or slot >= MENU_VISIBLE_ROWS:
+        return
+    unavailable_wifi = i == MENU_WIFI_INDEX and not wifi_module_ok
+    color = RED if unavailable_wifi and is_selected else GRAY if unavailable_wifi else YELLOW if is_selected else WHITE
+    prefix = b'! ' if unavailable_wifi and is_selected else b'> ' if is_selected else b'  '
+    y = 60 + slot * 16
+    tft.fill_rect(40, y, 240, 16, 0x2104)
+    tft.draw_gbk(prefix + menu_items[i].encode(), 40, y, color, 0x2104)
+
+def draw_wifi_settings():
+    global last_screen_layout
+    last_screen_layout = None
+    safe_fill_rect(0, 26, 320, 164, 0x2104)
+    if not wifi_module_ok:
+        tft.draw_gbk(b'--- WIRELESS SETTING ---', 55, 40, CYAN, 0x2104)
+        tft.draw_gbk(b'WIFI MODULE FAILED', 75, 96, RED, 0x2104)
+        tft.draw_gbk(b'[MENU] BACK', 108, 150, GRAY, 0x2104)
+        return
+    status = wifi_portal.get_status()
+    enabled = status["enabled"]
+    retrying = cfg_wifi_enabled and not enabled
+    state_color = GREEN if enabled else YELLOW if retrying else GRAY
+    tft.draw_gbk(b'--- WIRELESS SETTING ---', 55, 40, CYAN, 0x2104)
+    tft.draw_gbk(b'WIFI:', 32, 68, WHITE, 0x2104)
+    state_text = b'ON' if enabled else b'RETRY' if retrying else b'OFF'
+    tft.draw_gbk(state_text, 88, 68, state_color, 0x2104)
+    if enabled:
+        tft.draw_gbk(("IP:" + status["ip"]).encode(), 145, 68, GREEN, 0x2104)
+    elif status["error"]:
+        tft.draw_gbk(status["error"][:24].encode(), 120, 68, RED, 0x2104)
+    tft.draw_gbk(b'HOTSPOT NAME:', 32, 94, GRAY, 0x2104)
+    tft.draw_gbk(AP_SSID.encode(), 32, 111, WHITE, 0x2104)
+    tft.draw_gbk(b'PASSWORD (MACHINE SN):', 32, 136, GRAY, 0x2104)
+    tft.draw_gbk(Serial_Number.encode(), 32, 153, YELLOW, 0x2104)
+    tft.draw_gbk(b'[OK] TOGGLE  [MENU] BACK', 32, 174, GRAY, 0x2104)
 
 def draw_set_date(full=True):
     global last_screen_layout
@@ -684,10 +1088,12 @@ def draw_about():
     safe_fill_rect(0, 26, 320, 164, 0x2104)
     tft.draw_gbk(b'--- ABOUT DEVICE ---', 75, 40, CYAN, 0x2104)
     es_tag = " (ES)" if is_es_ver == 1 else " (Rel)"
-    tft.draw_gbk(f"Version: v{Program_ver}{es_tag}".encode(), 40, 70, RED if is_es_ver == 1 else WHITE, 0x2104)
-    tft.draw_gbk(f"Records: {total_count}/2500".encode(), 40, 95, WHITE, 0x2104)
-    tft.draw_gbk(b"Author: " + Author_Name.encode(), 40, 120, YELLOW, 0x2104)
-    tft.draw_gbk(b"Serial Number: " + Serial_Number.encode(), 40, 145, WHITE, 0x2104)
+    tft.draw_gbk(f"Version: v{Program_ver}{es_tag}".encode(), 40, 65, RED if is_es_ver == 1 else WHITE, 0x2104)
+    fs_mib = FLASH_FS_BYTES / (1024 * 1024)
+    tft.draw_gbk(f"Flash: {PHYSICAL_FLASH_MIB}M (FS {fs_mib:.1f}M)".encode(), 40, 87, CYAN, 0x2104)
+    tft.draw_gbk(f"Records: {total_count}/{MAX_HIST}".encode(), 40, 109, WHITE, 0x2104)
+    tft.draw_gbk(b"Author: " + Author_Name.encode(), 40, 131, YELLOW, 0x2104)
+    tft.draw_gbk(b"Serial Number: " + Serial_Number.encode(), 40, 153, WHITE, 0x2104)
     tft.draw_gbk(b'Press OK to Return', 40, 175, GRAY, 0x2104)
 
 def draw_popup(msg, color=RED):
@@ -742,7 +1148,7 @@ def radio_core_task(receiver_obj, state=radio_state,
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
-    global screen_is_on, last_interaction, need_post_train_gc
+    global screen_is_on, last_interaction, need_post_train_gc, latest_train_record
     
     try:
         msg_type = data.get("type", "")
@@ -768,19 +1174,31 @@ def process_ui_data(data):
             if "rssi" in data:
                 last_rssi_str = str(data["rssi"])
                 
-            queue_history(data)
-            queue_sd_log(data)
+            received_at = rtc.get_time_str(True)
+            received_record = {"t": received_at, "d": data}
+            compact_record = make_history_record(received_at, data)
+            if compact_record is not None:
+                queue_history(compact_record)
+            queue_sd_log(received_record)
             service_buzzer(time.ticks_ms())
             
             last_basic, last_ext = data.get("basic", {}), data.get("extended", {})
             last_is_full = (msg_type != "basic_only")
+            # Web/SSE is a live snapshot, not an internal-history reader.
+            # Publish every parsed fragment, including extended_only.
+            latest_train_record = received_record
+            wifi_portal.set_latest(latest_train_record)
             
             if system_state == "DASHBOARD":
                 # 内存满了强制在右上角显示红色的 MEM FULL
-                if total_count + len(history_queue) >= MAX_HIST:
-                    current_status, current_status_color = b'MEM FULL', RED
+                history_alert = history_alert_status()
+                if history_alert is not None:
+                    current_status, current_status_color = history_alert, RED
                 else:
-                    current_status, current_status_color = (b'FULL DATA', GREEN) if last_is_full else (b'BASIC', YELLOW)
+                    if msg_type == "extended_only":
+                        current_status, current_status_color = b'EXT ONLY', YELLOW
+                    else:
+                        current_status, current_status_color = (b'FULL DATA', GREEN) if last_is_full else (b'BASIC', YELLOW)
                     
                 current_status = current_status[:8]
                 update_top_bar()
@@ -795,14 +1213,34 @@ def process_ui_data(data):
 
 load_config()
 post = SystemPOST(tft, tft_cs)
-boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver)
+boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver, wifi_portal)
+wifi_module_ok = post.wifi_ok
+if not wifi_module_ok:
+    menu_items[MENU_WIFI_INDEX] = "WIRELESS: UNAVAILABLE"
 spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 if boot_status == "HALT":
     while True: pass 
 
 # Potentially slow storage work runs only after the POST is already visible.
 init_history()
-check_sd_startup()
+if total_count > 0:
+    latest_train_record = load_latest_valid_history()
+    wifi_portal.set_latest(latest_train_record)
+if post.sd_obj is not None:
+    # POST already initialized the card; reuse it instead of making startup
+    # wait through the same card handshake twice. A missing card can still be
+    # probed later with the MOUNT SD menu item.
+    check_sd_startup(post.sd_obj)
+
+if not wifi_module_ok:
+    # Keep the user's saved preference.  A one-boot CYW43 probe failure must
+    # disable this boot's menu/AP, but a later healthy POST should restore the
+    # hotspot automatically instead of leaving Wi-Fi permanently switched off.
+    if cfg_wifi_enabled:
+        print("WIFI_DEFERRED_POST_FAILURE")
+elif cfg_wifi_enabled:
+    wifi_retry_at = time.ticks_add(time.ticks_ms(), -1)
+    service_wifi(time.ticks_ms())
 
 receiver = LBJReceiver(ppm_offset=cfg_ppm_offset)
 receiver.set_callback(light_callback) 
@@ -830,6 +1268,7 @@ heartbeat = False
 while True:
     now = time.ticks_ms()
     service_buzzer(now)
+    service_wifi(now)
 
     if time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]) > RADIO_CORE_STALL_MS:
         if time.ticks_diff(now, radio_state[RADIO_LAST_ERROR_LOG]) >= 5000:
@@ -845,7 +1284,12 @@ while True:
               "ui_pending=", ui_pending,
               "ui_dropped=", ui_dropped,
               "history_pending=", len(history_queue),
+              "history_dropped=", history_dropped,
               "sd_pending=", len(sd_log_queue),
+              "sd_dropped=", sd_dropped,
+              "storage_errors=", storage_errors,
+              "storage_forced=", storage_forced_writes,
+              "wifi_errors=", wifi_service_errors,
               "mem_free=", gc.mem_free())
         last_radio_health_log = now
 
@@ -873,8 +1317,15 @@ while True:
     except Exception as exc:
         # Never allow non-essential storage work to exit the main loop.
         print("STORAGE_SERVICE_ERR", repr(exc))
+        storage_errors = (storage_errors + 1) & 0x3FFFFFFF
+        history_dropped = (history_dropped + len(history_queue)) & 0x3FFFFFFF
+        sd_dropped = (sd_dropped + len(sd_log_queue)) & 0x3FFFFFFF
         history_queue.clear()
         sd_log_queue.clear()
+        storage_pending_since = None
+        current_status, current_status_color = b'STOR ERR', RED
+        if system_state == "DASHBOARD":
+            update_top_bar()
             
     if gc.mem_free() < 20000:
         gc.collect()
@@ -900,11 +1351,6 @@ while True:
                 draw_hardware_bar(force=False) 
         last_sec = now
 
-    if system_state == "HISTORY" and time.ticks_diff(now, last_interaction) > 20000:
-        system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True); last_interaction = now
-        if has_received: display_train_data(last_basic, last_ext, last_is_full)
-        else: draw_idle_screen()
-
     wake_event = wake_button.poll(now)
     menu_event = menu_button.poll(now)
     down_event = down_button.poll(now)
@@ -914,77 +1360,75 @@ while True:
 
     if any_button_event:
         last_interaction = now
+        if system_state == "HISTORY":
+            history_last_input = now
         if not screen_is_on:
             pin_bl.value(0) 
             screen_is_on = True
             beep()
             continue 
 
+    # MENU/OK are HISTORY exit commands.  Restore the normal repeat profile
+    # before handling them and consume any direction repeat from this same
+    # loop, otherwise one long hold can also move the menu or flip one more
+    # history page.
+    history_exit_requested = (
+        system_state == "HISTORY" and (menu_event or ok_event)
+    )
+    if history_exit_requested:
+        set_history_navigation_mode(
+            False, suppress_until_release=True, now=now
+        )
+
     if wake_event:
         beep()
 
     if menu_event:
         last_interaction = now; beep()
-        if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID"]:
+        if system_state in ["DASHBOARD", "HISTORY", "ABOUT", "CONFIRM_FORMAT", "CONFIRM_FORMAT_SD", "SET_DATE", "JUMP_ID", "WIFI_SETTINGS"]:
             system_state = "MENU"; draw_menu(full=True) 
         else: 
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
             if has_received: display_train_data(last_basic, last_ext, last_is_full)
             else: draw_idle_screen()
             
-    if down_event:
-        last_interaction = now; navigation_beep()
+    if down_event and not history_exit_requested:
+        last_interaction = now
         if system_state == "DASHBOARD" and total_count > 0:
-            system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
-            # 读取记录时把 RSSI 提取出来，并强制刷新硬件状态栏
-            if entry:
-                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
-                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                draw_hardware_bar(force=True)
+            show_history_index(total_count - 1, announce=True)
         elif system_state == "HISTORY":
-            hist_ptr = (hist_ptr - 1) % total_count; entry = load_history_entry(hist_ptr)
-            # 翻页时同样提取 RSSI 并刷新状态栏 
-            if entry:
-                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
-                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                draw_hardware_bar(force=True)
-        elif system_state == "MENU": 
-            old_idx = menu_index; menu_index = (menu_index - 1) % len(menu_items); draw_menu(full=False, old_idx=old_idx)
-        elif system_state == "SET_DATE":
-            if edit_step == 0: edit_y = (edit_y+1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
-            elif edit_step == 1: edit_m = edit_m%12+1; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
-            else: edit_d = (edit_d%get_max_days(edit_y, edit_m))+1
-            draw_set_date(full=False)
-        elif system_state == "JUMP_ID":
-            edit_id[edit_step] = (edit_id[edit_step]+1)%10; draw_jump_id(full=False)
+            show_history_index((hist_ptr - 1) % total_count, announce=True)
+        else:
+            navigation_beep()
+            if system_state == "MENU":
+                move_menu_selection(-1)
+            elif system_state == "SET_DATE":
+                if edit_step == 0: edit_y = (edit_y+1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
+                elif edit_step == 1: edit_m = edit_m%12+1; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
+                else: edit_d = (edit_d%get_max_days(edit_y, edit_m))+1
+                draw_set_date(full=False)
+            elif system_state == "JUMP_ID":
+                edit_id[edit_step] = (edit_id[edit_step]+1)%10; draw_jump_id(full=False)
 
-    if up_event:
-        last_interaction = now; navigation_beep()
+    if up_event and not history_exit_requested:
+        last_interaction = now
         if system_state == "DASHBOARD" and total_count > 0:
-            system_state = "HISTORY"; hist_ptr = total_count - 1; entry = load_history_entry(hist_ptr)
-            # 读取记录时提取 RSSI 并刷新状态栏 
-            if entry:
-                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
-                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                draw_hardware_bar(force=True)
+            show_history_index(total_count - 1, announce=True)
         elif system_state == "HISTORY":
-            hist_ptr = (hist_ptr + 1) % total_count; entry = load_history_entry(hist_ptr)
-            # 翻页时提取 RSSI 并刷新状态栏 
-            if entry:
-                hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
-                display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                draw_hardware_bar(force=True)
-        elif system_state == "MENU": 
-            old_idx = menu_index; menu_index = (menu_index + 1) % len(menu_items); draw_menu(full=False, old_idx=old_idx)
-        elif system_state == "SET_DATE":
-            if edit_step == 0: edit_y = (edit_y-1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
-            elif edit_step == 1: edit_m = edit_m-1 if edit_m>1 else 12; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
-            else: edit_d = edit_d-1 if edit_d>1 else get_max_days(edit_y, edit_m)
-            draw_set_date(full=False)
-        elif system_state == "JUMP_ID":
-            edit_id[edit_step] = (edit_id[edit_step]-1)%10; draw_jump_id(full=False)
+            show_history_index((hist_ptr + 1) % total_count, announce=True)
+        else:
+            navigation_beep()
+            if system_state == "MENU":
+                move_menu_selection(1)
+            elif system_state == "SET_DATE":
+                if edit_step == 0: edit_y = (edit_y-1)%100; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
+                elif edit_step == 1: edit_m = edit_m-1 if edit_m>1 else 12; edit_d = min(edit_d, get_max_days(edit_y, edit_m))
+                else: edit_d = edit_d-1 if edit_d>1 else get_max_days(edit_y, edit_m)
+                draw_set_date(full=False)
+            elif system_state == "JUMP_ID":
+                edit_id[edit_step] = (edit_id[edit_step]-1)%10; draw_jump_id(full=False)
 
-    if ok_event:
+    if ok_event and not (history_exit_requested and menu_event):
         last_interaction = now; beep()
         if system_state == "HISTORY" or system_state == "ABOUT":
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_hardware_bar(force=True)
@@ -1023,6 +1467,32 @@ while True:
                 cfg_scr_idx = (cfg_scr_idx + 1) % 4
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
                 save_config(); draw_menu_item(7, True)
+            elif menu_index == MENU_WIFI_INDEX:
+                if not wifi_module_ok:
+                    draw_popup(b'WIFI MODULE FAILED', color=RED)
+                    stop_buzzer(); time.sleep(1); draw_menu(full=True)
+                else:
+                    system_state = "WIFI_SETTINGS"
+                    draw_wifi_settings()
+
+        elif system_state == "WIFI_SETTINGS":
+            if not wifi_module_ok:
+                system_state = "MENU"
+                draw_menu(full=True)
+            else:
+                target_enabled = not cfg_wifi_enabled
+                draw_popup(b'WIFI STARTING...' if target_enabled else b'WIFI STOPPING...', color=YELLOW)
+                cfg_wifi_enabled = target_enabled
+                if target_enabled:
+                    wifi_retry_at = time.ticks_add(time.ticks_ms(), -1)
+                    wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
+                    service_wifi(time.ticks_ms())
+                else:
+                    wifi_portal.set_enabled(False)
+                    wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
+                    wifi_retry_at = 0
+                save_config()
+                draw_wifi_settings()
                 
         elif system_state == "SET_DATE":
             edit_step += 1
@@ -1035,31 +1505,35 @@ while True:
             if edit_step > 3:
                 target_id = edit_id[0]*1000 + edit_id[1]*100 + edit_id[2]*10 + edit_id[3] - 1
                 if 0 <= target_id < total_count:
-                    system_state = "HISTORY"; hist_ptr = target_id; entry = load_history_entry(hist_ptr)
-                    # 按 ID 跳转记录时提取 RSSI 并刷新状态栏 
-                    hist_rssi_str = str(entry['d'].get('rssi', 'N/A'))
-                    display_train_data(entry['d'].get('basic',{}), entry['d'].get('extended',{}), entry['d'].get('type')!="basic_only", True, entry['t'], hist_ptr)
-                    draw_hardware_bar(force=True)
+                    if not show_history_index(target_id):
+                        draw_popup(b'HISTORY READ ERR', color=RED)
+                        stop_buzzer(); time.sleep(1); draw_jump_id(full=True); edit_step = 0
                 else: draw_popup(b'INDEX ERROR!'); stop_buzzer(); time.sleep(1); draw_jump_id(full=True); edit_step = 0
             else: draw_jump_id(full=False)
             
         elif system_state == "CONFIRM_FORMAT":
             draw_popup(b'FORMATTING...', color=GREEN)
-            history_queue.clear()
-            sd_log_queue.clear()
-            with ui_lock:
-                ui_queue.clear()
-            open(HIST_FILE, 'w').close()
-            total_count = 0; hist_ptr = -1; history_offsets = array.array('I')
-            has_received = False; last_basic = {}; last_ext = {}; last_is_full = True
-            current_status = b'READY'; current_status_color = GREEN
-            need_post_train_gc = False
-            stop_buzzer(); time.sleep(1)
-            system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+            if history_store.clear():
+                history_queue.clear()
+                with ui_lock:
+                    ui_queue.clear()
+                total_count = 0; hist_ptr = -1; history_write_retries = 0
+                has_received = False; last_basic = {}; last_ext = {}; last_is_full = True
+                latest_train_record = None; wifi_portal.set_latest(None)
+                current_status = b'READY'; current_status_color = GREEN
+                need_post_train_gc = False
+                stop_buzzer(); time.sleep(1)
+                system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+            else:
+                print("HISTORY_CLEAR_ERR", history_store.last_error)
+                draw_popup(b'FORMAT FAIL!', color=RED)
+                stop_buzzer(); time.sleep(1)
+                system_state = "MENU"; draw_menu(full=True)
 
         elif system_state == "CONFIRM_FORMAT_SD":
             draw_popup(b'FORMATTING SD...', color=YELLOW)
             stop_buzzer()
+            sd_log_queue.clear()
             try:
                 if 'sd' in os.listdir('/'): 
                     try: os.umount("/sd")
@@ -1067,10 +1541,30 @@ while True:
                 tft_cs.value(1); spi1.init(baudrate=1000000); sd_obj = sdcard.SDCard(spi1, sd_cs)
                 spi1.init(baudrate=10000000); os.VfsFat.mkfs(sd_obj); os.mount(os.VfsFat(sd_obj), "/sd")
                 draw_popup(b'SD FORMAT OK!', color=GREEN)
-            except:
+            except Exception as exc:
+                print("SD_FORMAT_ERR", repr(exc))
                 sd_obj = None; draw_popup(b'FORMAT FAIL!', color=RED); disable_sd_forever("FORMAT FAIL") 
             spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
             time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+
+    # HISTORY uses a user-input clock of its own. Incoming train messages may
+    # wake the screen and refresh live data, but must not keep a viewer trapped
+    # in history forever when nobody is touching the controls.
+    if (
+        system_state == "HISTORY"
+        and time.ticks_diff(now, history_last_input) > 20000
+    ):
+        set_history_navigation_mode(
+            False, suppress_until_release=True, now=now
+        )
+        system_state = "DASHBOARD"
+        draw_ui_skeleton()
+        draw_hardware_bar(force=True)
+        last_interaction = now
+        if has_received:
+            display_train_data(last_basic, last_ext, last_is_full)
+        else:
+            draw_idle_screen()
 
     time.sleep_ms(1)

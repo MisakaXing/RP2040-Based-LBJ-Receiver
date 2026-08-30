@@ -19,6 +19,8 @@ import time
 
 
 _CMD_TIMEOUT = const(1000)
+_WRITE_TIMEOUT_MS = const(1500)
+_INIT_TIMEOUT_MS = const(5000)
 
 _R1_IDLE_STATE = const(1 << 0)
 # R1_ERASE_RESET = const(1 << 1)
@@ -30,6 +32,60 @@ _R1_ILLEGAL_COMMAND = const(1 << 2)
 _TOKEN_CMD25 = const(0xFC)
 _TOKEN_STOP_TRAN = const(0xFD)
 _TOKEN_DATA = const(0xFE)
+
+
+def _ticks_ms():
+    try:
+        return time.ticks_ms()
+    except AttributeError:
+        return int(time.monotonic() * 1000)
+
+
+def _ticks_diff(new, old):
+    try:
+        return time.ticks_diff(new, old)
+    except AttributeError:
+        return new - old
+
+
+def _sleep_ms(value):
+    try:
+        time.sleep_ms(value)
+    except AttributeError:
+        time.sleep(value / 1000.0)
+
+
+def _sectors_from_csd(csd):
+    """Return the card capacity in 512-byte sectors."""
+    if len(csd) < 16:
+        raise OSError("invalid SD CSD")
+    structure = csd[0] & 0xC0
+    if structure == 0x40:  # CSD version 2.0, SDHC/SDXC
+        c_size = (csd[7] << 16) | (csd[8] << 8) | csd[9]
+        return (c_size + 1) * 1024
+    if structure == 0x00:  # CSD version 1.0, SDSC
+        read_bl_len = csd[5] & 0x0F
+        c_size = (
+            ((csd[6] & 0x03) << 10)
+            | (csd[7] << 2)
+            | ((csd[8] & 0xC0) >> 6)
+        )
+        c_size_mult = ((csd[9] & 0x03) << 1) | (csd[10] >> 7)
+        capacity_bytes = (
+            (c_size + 1)
+            * (1 << (c_size_mult + 2))
+            * (1 << read_bl_len)
+        )
+        return capacity_bytes // 512
+    raise OSError("SD card CSD format not supported")
+
+
+def _cdv_from_ocr(ocr):
+    if len(ocr) < 1:
+        raise OSError("invalid SD OCR")
+    # OCR bit 30 (CCS) is the second-highest bit of the first network-order
+    # byte. SDHC/SDXC use block addressing; v2 SDSC still uses byte addressing.
+    return 1 if (ocr[0] & 0x40) else 512
 
 
 class SDCard:
@@ -56,6 +112,13 @@ class SDCard:
         else:
             # on pyboard
             self.spi.init(master, baudrate=baudrate, phase=0, polarity=0)
+
+    def _release(self):
+        self.cs(1)
+        try:
+            self.spi.write(b"\xff")
+        except Exception:
+            pass
 
     def init_card(self, baudrate):
 
@@ -88,17 +151,11 @@ class SDCard:
         # get the number of sectors
         # CMD9: response R2 (R1 byte + 16-byte block read)
         if self.cmd(9, 0, 0, 0, False) != 0:
+            self._release()
             raise OSError("no response from SD card")
         csd = bytearray(16)
         self.readinto(csd)
-        if csd[0] & 0xC0 == 0x40:  # CSD version 2.0
-            self.sectors = ((csd[8] << 8 | csd[9]) + 1) * 1024
-        elif csd[0] & 0xC0 == 0x00:  # CSD version 1.0 (old, <=2GB)
-            c_size = csd[6] & 0b11 | csd[7] << 2 | (csd[8] & 0b11000000) << 4
-            c_size_mult = ((csd[9] & 0b11) << 1) | csd[10] >> 7
-            self.sectors = (c_size + 1) * (2 ** (c_size_mult + 2))
-        else:
-            raise OSError("SD card CSD format not supported")
+        self.sectors = _sectors_from_csd(csd)
         # print('sectors', self.sectors)
 
         # CMD16: set block length to 512 bytes
@@ -109,118 +166,129 @@ class SDCard:
         self.init_spi(baudrate)
 
     def init_card_v1(self):
-        for i in range(_CMD_TIMEOUT):
+        started = _ticks_ms()
+        while _ticks_diff(_ticks_ms(), started) < _INIT_TIMEOUT_MS:
             self.cmd(55, 0, 0)
             if self.cmd(41, 0, 0) == 0:
                 self.cdv = 512
                 # print("[SDCard] v1 card")
                 return
+            _sleep_ms(10)
         raise OSError("timeout waiting for v1 card")
 
     def init_card_v2(self):
-        for i in range(_CMD_TIMEOUT):
-            time.sleep_ms(50)
-            self.cmd(58, 0, 0, 4)
+        started = _ticks_ms()
+        while _ticks_diff(_ticks_ms(), started) < _INIT_TIMEOUT_MS:
+            _sleep_ms(50)
             self.cmd(55, 0, 0)
             if self.cmd(41, 0x40000000, 0) == 0:
-                self.cmd(58, 0, 0, 4)
-                self.cdv = 1
+                response = self.cmd(58, 0, 0, release=False)
+                try:
+                    if response != 0:
+                        raise OSError("invalid SD OCR response")
+                    ocr = self.spi.read(4, 0xFF)
+                finally:
+                    self._release()
+                self.cdv = _cdv_from_ocr(ocr)
                 # print("[SDCard] v2 card")
                 return
         raise OSError("timeout waiting for v2 card")
 
     def cmd(self, cmd, arg, crc, final=0, release=True, skip1=False):
         self.cs(0)
+        try:
+            # create and send the command
+            buf = self.cmdbuf
+            buf[0] = 0x40 | cmd
+            buf[1] = arg >> 24
+            buf[2] = arg >> 16
+            buf[3] = arg >> 8
+            buf[4] = arg
+            buf[5] = crc
+            self.spi.write(buf)
 
-        # create and send the command
-        buf = self.cmdbuf
-        buf[0] = 0x40 | cmd
-        buf[1] = arg >> 24
-        buf[2] = arg >> 16
-        buf[3] = arg >> 8
-        buf[4] = arg
-        buf[5] = crc
-        self.spi.write(buf)
+            if skip1:
+                self.spi.readinto(self.tokenbuf, 0xFF)
 
-        if skip1:
-            self.spi.readinto(self.tokenbuf, 0xFF)
+            # wait for the response (response[7] == 0)
+            for i in range(_CMD_TIMEOUT):
+                self.spi.readinto(self.tokenbuf, 0xFF)
+                response = self.tokenbuf[0]
+                if not (response & 0x80):
+                    # this could be a big-endian integer that we are getting here
+                    for j in range(final):
+                        self.spi.write(b"\xff")
+                    if release:
+                        self._release()
+                    return response
 
-        # wait for the response (response[7] == 0)
-        for i in range(_CMD_TIMEOUT):
-            self.spi.readinto(self.tokenbuf, 0xFF)
-            response = self.tokenbuf[0]
-            if not (response & 0x80):
-                # this could be a big-endian integer that we are getting here
-                for j in range(final):
-                    self.spi.write(b"\xff")
-                if release:
-                    self.cs(1)
-                    self.spi.write(b"\xff")
-                return response
-
-        # timeout
-        self.cs(1)
-        self.spi.write(b"\xff")
-        return -1
+            # timeout
+            self._release()
+            return -1
+        except Exception:
+            self._release()
+            raise
 
     def readinto(self, buf):
         self.cs(0)
+        try:
+            # read until start byte (0xff)
+            for i in range(_CMD_TIMEOUT):
+                self.spi.readinto(self.tokenbuf, 0xFF)
+                if self.tokenbuf[0] == _TOKEN_DATA:
+                    break
+                time.sleep(0.0001)
+            else:
+                raise OSError("timeout waiting for response")
 
-        # read until start byte (0xff)
-        for i in range(_CMD_TIMEOUT):
-            self.spi.readinto(self.tokenbuf, 0xFF)
-            if self.tokenbuf[0] == _TOKEN_DATA:
-                break
-            time.sleep(0.0001)
-        else:
-            self.cs(1)
-            raise OSError("timeout waiting for response")
+            # read data
+            mv = self.dummybuf_memoryview
+            if len(buf) != len(mv):
+                mv = mv[: len(buf)]
+            self.spi.write_readinto(mv, buf)
 
-        # read data
-        mv = self.dummybuf_memoryview
-        if len(buf) != len(mv):
-            mv = mv[: len(buf)]
-        self.spi.write_readinto(mv, buf)
-
-        # read checksum
-        self.spi.write(b"\xff")
-        self.spi.write(b"\xff")
-
-        self.cs(1)
-        self.spi.write(b"\xff")
+            # read checksum
+            self.spi.write(b"\xff")
+            self.spi.write(b"\xff")
+        finally:
+            self._release()
 
     def write(self, token, buf):
         self.cs(0)
-
-        # send: start of block, data, checksum
-        self.spi.read(1, token)
-        self.spi.write(buf)
-        self.spi.write(b"\xff")
-        self.spi.write(b"\xff")
-
-        # check the response
-        if (self.spi.read(1, 0xFF)[0] & 0x1F) != 0x05:
-            self.cs(1)
+        try:
+            # send: start of block, data, checksum
+            self.spi.read(1, token)
+            self.spi.write(buf)
             self.spi.write(b"\xff")
-            return
+            self.spi.write(b"\xff")
 
-        # wait for write to finish
-        while self.spi.read(1, 0xFF)[0] == 0:
-            pass
+            # check the response
+            if (self.spi.read(1, 0xFF)[0] & 0x1F) != 0x05:
+                raise OSError(5)
 
-        self.cs(1)
-        self.spi.write(b"\xff")
+            # wait for write to finish
+            self._wait_not_busy()
+        finally:
+            # An SPI exception must never leave the SD card selected while the
+            # shared bus is returned to the TFT driver.
+            self._release()
 
     def write_token(self, token):
         self.cs(0)
-        self.spi.read(1, token)
-        self.spi.write(b"\xff")
-        # wait for write to finish
-        while self.spi.read(1, 0xFF)[0] == 0x00:
-            pass
+        try:
+            self.spi.read(1, token)
+            self.spi.write(b"\xff")
+            # wait for write to finish
+            self._wait_not_busy()
+        finally:
+            self._release()
 
-        self.cs(1)
-        self.spi.write(b"\xff")
+    def _wait_not_busy(self):
+        started = _ticks_ms()
+        while self.spi.read(1, 0xFF)[0] == 0x00:
+            if _ticks_diff(_ticks_ms(), started) >= _WRITE_TIMEOUT_MS:
+                raise OSError(110)
+            _sleep_ms(1)
 
     def readblocks(self, block_num, buf):
         nblocks = len(buf) // 512
@@ -229,7 +297,7 @@ class SDCard:
             # CMD17: set read address for single block
             if self.cmd(17, block_num * self.cdv, 0, release=False) != 0:
                 # release the card
-                self.cs(1)
+                self._release()
                 raise OSError(5)  # EIO
             # receive the data and release card
             self.readinto(buf)
@@ -237,7 +305,7 @@ class SDCard:
             # CMD18: set read address for multiple blocks
             if self.cmd(18, block_num * self.cdv, 0, release=False) != 0:
                 # release the card
-                self.cs(1)
+                self._release()
                 raise OSError(5)  # EIO
             offset = 0
             mv = memoryview(buf)

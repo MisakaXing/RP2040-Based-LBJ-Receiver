@@ -16,17 +16,20 @@ class SystemPOST:
     def __init__(self, tft, tft_cs):
         self.tft = tft
         self.tft_cs = tft_cs
-        self.y = 54
+        self.y = 50
         self.row_index = 0
         self.has_warning = False
         self.has_critical_error = False
         self.rtc_error = False 
+        self.wifi_ok = False
+        self.sd_obj = None
         self.current_label = ""
         self.tft.fill(self.BLACK)
         self.tft.fill_rect(0, 0, 320, 42, self.PANEL)
         self.tft.fill_rect(0, 40, 320, 2, self.CYAN)
         self.tft.draw_gbk(b'LBJ', 14, 8, self.WHITE, self.PANEL, scale=2)
         self.tft.draw_gbk(b'RECEIVER', 72, 14, self.CYAN, self.PANEL)
+        self.tft.draw_gbk(b'W', 144, 14, self.YELLOW, self.PANEL)
         self.tft.draw_gbk(b'POWER-ON CHECK', 198, 14, self.MUTED, self.PANEL)
 
     def _check_start(self, msg):
@@ -34,13 +37,16 @@ class SystemPOST:
 
     def _check_end(self, status, msg):
         row_bg = self.PANEL_ALT if self.row_index & 1 else self.BLACK
-        self.tft.fill_rect(8, self.y - 4, 304, 24, row_bg)
+        self.tft.fill_rect(8, self.y - 3, 304, 21, row_bg)
         self.tft.draw_gbk(self.current_label.encode(), 18, self.y, self.WHITE, row_bg)
         if status == "OK":
             tag, color = b'OK', self.GREEN
         elif status == "WARN":
             self.has_warning = True
             tag, color = b'CHECK', self.YELLOW
+        elif status == "WARN_RED":
+            self.has_warning = True
+            tag, color = b'WARN', self.RED
         elif status == "ERR":
             self.has_critical_error = True
             tag, color = b'FAIL', self.RED
@@ -48,13 +54,12 @@ class SystemPOST:
             tag, color = b'OPTIONAL', self.MUTED
         self.tft.draw_gbk(tag, 132, self.y, color, row_bg)
         self.tft.draw_gbk(msg.encode(), 205, self.y, color, row_bg)
-        self.y += 27
+        self.y += 23
         self.row_index += 1
 
     def check_sys_ver(self, ver, is_es):
         self._check_start("FIRMWARE")
-        if is_es == 1: self._check_end("WARN", f"v{ver} (Eng Ver)") 
-        else: self._check_end("OK", f"v{ver} (Release)")
+        self._check_end("WARN" if is_es == 1 else "OK", f"v{ver}")
 
     def check_sx1276(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15):
         self._check_start("RADIO")
@@ -69,6 +74,16 @@ class SystemPOST:
             if ver in [0x12, 0x22]: self._check_end("OK", f"SX1276 (v{ver:02X})"); return True
             else: self._check_end("ERR", "NOT FOUND/DEAD"); return False
         except Exception: self._check_end("ERR", "SPI BUS ERROR"); return False
+
+    def check_wifi(self, wifi_portal):
+        self._check_start("WIRELESS")
+        try:
+            ok, message = wifi_portal.probe_hardware()
+        except Exception:
+            ok, message = False, "CYW43 FAILED"
+        self.wifi_ok = bool(ok)
+        self._check_end("OK" if self.wifi_ok else "WARN_RED", str(message)[:14])
+        return self.wifi_ok
 
     # 电池电压三段式检查
     def check_bat(self, bat_adc, bat_en):
@@ -109,13 +124,18 @@ class SystemPOST:
         self._check_start("SD CARD")
         self.tft_cs.value(1) 
         try:
-            spi1.init(baudrate=1000000); sdcard.SDCard(spi1, sd_cs); self._check_end("OK", "READY")
-        except: self._check_end("OPTIONAL", "NOT INSERTED")
+            spi1.init(baudrate=1000000)
+            self.sd_obj = sdcard.SDCard(spi1, sd_cs)
+            self._check_end("OK", "READY")
+        except:
+            self.sd_obj = None
+            self._check_end("OPTIONAL", "NOT INSERTED")
         finally: spi1.init(baudrate=40000000)
             
-    def run_all(self, bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, p_ver, is_es):
+    def run_all(self, bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, p_ver, is_es, wifi_portal):
         self.check_sys_ver(p_ver, is_es) 
         radio_ok = self.check_sx1276()
+        self.check_wifi(wifi_portal)
         self.check_bat(bat_adc, bat_en) # 运行电池检查
         self.check_temp(sensor_temp)
         self.check_rtc(rtc)
@@ -124,7 +144,7 @@ class SystemPOST:
         footer_y = 218
         # 如果是电压过低或无线电损坏，强制停机
         if not radio_ok or self.has_critical_error:
-            msg = b'SYSTEM HALTED - LOW POWER' if self.has_critical_error else b'SYSTEM HALTED - RADIO DEAD'
+            msg = b'SYSTEM HALTED - RADIO DEAD' if not radio_ok else b'SYSTEM HALTED - LOW POWER'
             self.tft.fill_rect(0, footer_y, 320, 22, self.RED)
             self.tft.draw_gbk(msg, 30, footer_y + 3, self.WHITE, self.RED)
             # 持续鸣叫报警

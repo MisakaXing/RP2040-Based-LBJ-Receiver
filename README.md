@@ -1,4 +1,7 @@
 # RP2040-Based-LBJ-Receiver
+
+> 当前为 `Wireless-Enabled` 分支，目标硬件是 Waveshare RP2350B-Plus-W，程序版本为 `5.2-W`。固件、部署方法、无线功能和实板测试结果请见 [`rp2040-main-program/README_W.md`](rp2040-main-program/README_W.md)。不带 W 的 5.2 版本保留在 `main` 分支。
+
 # 致谢和免责
 
 本项目参考了FLN1021/SX1276_Receive_LBJ  

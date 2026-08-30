@@ -60,12 +60,18 @@ class FixedQueue:
         self._count -= 1
         return item
 
+    def peek(self):
+        if self._count == 0:
+            return None
+        return self._items[self._head]
+
     def clear(self):
         while self._count:
             self.get()
 
 class LBJReceiver:
     COUNTER_MASK = 0x3FFFFFFF
+    MAX_NUMERIC_CHARS = 256
     FXOSC = 32000000
     FRF_SCALE = 524288
     FSTEP_HZ = FXOSC / FRF_SCALE
@@ -184,6 +190,7 @@ class LBJReceiver:
         self.corrupt_since_log = 0
         self.spi_errors = 0
         self.callback_errors = 0
+        self.oversize_messages = 0
         print("BOOT_PPM", self.ppm_offset, "profile=stable_hardware_afc")
         
         self.POCSAG_SYNC  = 0x7CD215D8
@@ -524,6 +531,7 @@ class LBJReceiver:
             "corrupt": self.corrupt_messages,
             "spi_errors": self.spi_errors,
             "callback_errors": self.callback_errors,
+            "oversize_messages": self.oversize_messages,
             "sync_age_ms": time.ticks_diff(now, self.last_sync_time),
             "word_age_ms": time.ticks_diff(now, self.last_word_time),
         }
@@ -817,6 +825,9 @@ class LBJReceiver:
             ext_dict["block_start"] = lbj_start_idx
             if basic_str:
                 basic_dict = self._parse_basic(basic_str)
+                # "--- --- ---" is a placeholder basic half, not a train.
+                # Treat it as extended-only so downstream history does not
+                # reject an otherwise valid extension for lacking a number.
                 if str(basic_dict.get("train_no", "")).isdigit():
                     return {"type": "train_data_full", "raw": msg_clean, "basic": basic_dict, "extended": ext_dict}
                 return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict, "garbage_prefix": basic_str}
@@ -1064,6 +1075,19 @@ class LBJReceiver:
                   "uncorrectable=", self.uncorrectable_codewords)
             self.last_resync_log = now
 
+    def _append_numeric(self, text):
+        if len(self.numeric_output) + len(text) > self.MAX_NUMERIC_CHARS:
+            self.oversize_messages = (
+                self.oversize_messages + 1
+            ) & self.COUNTER_MASK
+            self.numeric_output = ""
+            self.current_address = ""
+            self.pending_fei_hz = None
+            self.pending_afc_hz = None
+            return False
+        self.numeric_output += text
+        return True
+
     def _decode_codeword(self, codeword, now):
         self.codewords_seen = (self.codewords_seen + 1) & self.COUNTER_MASK
         cw_fixed, err_status = self._correct_bch(codeword)
@@ -1075,7 +1099,7 @@ class LBJReceiver:
             ) & self.COUNTER_MASK
             self.bad_codeword_streak += 1
             if self.current_address:
-                self.numeric_output += "XXXXX"
+                self._append_numeric("XXXXX")
             if self.bad_codeword_streak >= self.MAX_BAD_CODEWORDS:
                 self._lose_sync("bch_streak")
             return
@@ -1134,7 +1158,8 @@ class LBJReceiver:
                 | ((nibble & 4) >> 1)
                 | ((nibble & 8) >> 3)
             )
-            self.numeric_output += self.BCD_MAP[nibble_rev]
+            if not self._append_numeric(self.BCD_MAP[nibble_rev]):
+                break
 
     def _process_raw_queue(self):
         processed = 0
@@ -1187,4 +1212,3 @@ class LBJReceiver:
             self._flush_pending_fragments(now)
             self.last_timeout_check = now
         self._service_radio_health(now)
-
