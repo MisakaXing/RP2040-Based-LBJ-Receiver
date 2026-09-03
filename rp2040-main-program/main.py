@@ -56,7 +56,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.2-W"
+Program_ver = "5.3-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -265,9 +265,10 @@ system_state = "DASHBOARD"
 has_received = False
 menu_index = 0
 
-cfg_scr_idx = 3 
-SCR_OFF_OPTS = ["30s", "1min", "5min", "never"]
-SCR_OFF_MS = [30000, 60000, 300000, -1]
+cfg_scr_idx = 3
+SCR_OFF_OPTS = ["30s", "1min", "5min", "never", "on demand"]
+SCR_OFF_MS = [30000, 60000, 300000, -1, -1]
+SCR_OFF_ON_DEMAND_INDEX = 4
 cfg_buzzer = True
 cfg_ppm_offset = 6.0
 cfg_ppm_calibrated = False
@@ -344,6 +345,38 @@ def stop_buzzer():
     _cancel_buzzer_timer()
     buzzer.value(0)
     buzzer_off_at = None
+
+def set_screen_power(enabled):
+    """Set TFT backlight power and keep the software state in sync."""
+    global screen_is_on
+    screen_is_on = bool(enabled)
+    pin_bl.value(0 if screen_is_on else 1)
+
+def handle_screen_button_event(wake_event):
+    """Handle screen-off input and return True when this key is consumed."""
+    if cfg_scr_idx == SCR_OFF_ON_DEMAND_INDEX:
+        if wake_event:
+            set_screen_power(not screen_is_on)
+            print("SCREEN_POWER", "ON" if screen_is_on else "OFF")
+            beep()
+            return True
+        # While manually off, navigation keys must not wake the display or
+        # operate an invisible menu.  The power key is the sole wake source.
+        return not screen_is_on
+
+    if not screen_is_on:
+        set_screen_power(True)
+        beep()
+        return True
+    return False
+
+def wake_screen_for_train():
+    """Keep manual-off mode dark while preserving legacy auto-wake modes."""
+    if (
+        not screen_is_on
+        and cfg_scr_idx != SCR_OFF_ON_DEMAND_INDEX
+    ):
+        set_screen_power(True)
 
 def navigation_beep():
     beep()
@@ -1166,9 +1199,7 @@ def process_ui_data(data):
                 
             has_received = True
             
-            if not screen_is_on:
-                pin_bl.value(0)
-                screen_is_on = True
+            wake_screen_for_train()
             last_interaction = time.ticks_ms()
             
             if "rssi" in data:
@@ -1293,10 +1324,10 @@ while True:
               "mem_free=", gc.mem_free())
         last_radio_health_log = now
 
-    if screen_is_on and cfg_scr_idx != 3: 
-        if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
-            pin_bl.value(1) 
-            screen_is_on = False
+    screen_timeout_ms = SCR_OFF_MS[cfg_scr_idx]
+    if screen_is_on and screen_timeout_ms >= 0:
+        if time.ticks_diff(now, last_interaction) > screen_timeout_ms:
+            set_screen_power(False)
             
     if need_post_train_gc and time.ticks_diff(now, last_interaction) > 1000:
         gc.collect()
@@ -1362,11 +1393,8 @@ while True:
         last_interaction = now
         if system_state == "HISTORY":
             history_last_input = now
-        if not screen_is_on:
-            pin_bl.value(0) 
-            screen_is_on = True
-            beep()
-            continue 
+        if handle_screen_button_event(wake_event):
+            continue
 
     # MENU/OK are HISTORY exit commands.  Restore the normal repeat profile
     # before handling them and consume any direction repeat from this same
@@ -1464,7 +1492,7 @@ while True:
                 else: draw_idle_screen()
             elif menu_index == 6: system_state = "ABOUT"; draw_about()
             elif menu_index == 7: 
-                cfg_scr_idx = (cfg_scr_idx + 1) % 4
+                cfg_scr_idx = (cfg_scr_idx + 1) % len(SCR_OFF_OPTS)
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
                 save_config(); draw_menu_item(7, True)
             elif menu_index == MENU_WIFI_INDEX:
