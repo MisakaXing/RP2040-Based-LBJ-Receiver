@@ -239,6 +239,8 @@ class WirelessPortal:
         self._clients = []
         self._latest_record = None
         self._latest_revision = 0
+        self._battery_percent = None
+        self._core_temp_c = None
         self._enabled = False
         self._last_error = ""
         self._ip = AP_IP
@@ -254,6 +256,34 @@ class WirelessPortal:
         else:
             self._latest_record = None
         self._latest_revision = (self._latest_revision + 1) & 0x7FFFFFFF
+
+    def set_device_status(self, battery_percent, core_temp_c):
+        # Cache only; set_latest() sends these values together with a train.
+        # HTTP fallback reads the same snapshot without sampling the ADC.
+        try:
+            battery_percent = float(battery_percent)
+            battery_percent = int(battery_percent) if 0 <= battery_percent <= 100 else None
+        except (TypeError, ValueError, OverflowError):
+            battery_percent = None
+        try:
+            core_temp_c = float(core_temp_c)
+            core_temp_c = round(core_temp_c, 1) if -100 <= core_temp_c <= 200 else None
+        except (TypeError, ValueError, OverflowError):
+            core_temp_c = None
+        if (battery_percent == self._battery_percent
+                and core_temp_c == self._core_temp_c):
+            return
+        self._battery_percent = battery_percent
+        self._core_temp_c = core_temp_c
+
+    def _device_view(self):
+        battery, temp = self._battery_percent, self._core_temp_c
+        return {
+            "battery_percent": battery,
+            "core_temp_c": temp,
+            "low_battery": battery is not None and battery < 20,
+            "high_temperature": temp is not None and temp > 45,
+        }
 
     def get_status(self):
         return {
@@ -460,6 +490,7 @@ class WirelessPortal:
             return {
                 "available": False,
                 "update_id": str(self._latest_revision),
+                "device": self._device_view(),
                 "time": "---",
                 "type": "WAITING",
                 "train_no": "---",
@@ -517,6 +548,7 @@ class WirelessPortal:
         return {
             "available": True,
             "update_id": str(self._latest_revision),
+            "device": self._device_view(),
             "time": record.get("t", "---"),
             "type": data.get("type", "---"),
             "train_no": train_no,
@@ -536,8 +568,18 @@ class WirelessPortal:
     def _render_page(self):
         view = self._view_model()
         state = "最近一次列车信息" if view["available"] else "等待列车信号"
+        device = view["device"]
+        battery, temp = device["battery_percent"], device["core_temp_c"]
         values = {
             "record_id": _html_escape(view["update_id"]),
+            "battery": "---" if battery is None else "%d%%" % battery,
+            "temperature": "---" if temp is None else "%.1f°C" % temp,
+            "battery_class": " danger" if device["low_battery"] else "",
+            "temp_class": " danger" if device["high_temperature"] else "",
+            "battery_note": "等待有效采样" if battery is None else (
+                "⚠ 低电量警告：低于 20%" if device["low_battery"] else "电量正常"),
+            "temp_note": "等待有效采样" if temp is None else (
+                "⚠ 温度警告：高于 45°C" if device["high_temperature"] else "温度正常"),
             "state": _html_escape(state),
             "train": _html_escape(view["train_no"]),
             "speed": _html_escape(view["speed"]),
@@ -568,6 +610,7 @@ main{max-width:620px;margin:auto;padding:15px}.strip{display:flex;justify-conten
 .route{display:grid;grid-template-columns:70px 1fr auto;align-items:center;gap:10px;background:var(--panel2);border:1px solid #24506b;padding:13px 15px;margin-bottom:11px}.route label{color:var(--muted)}.route strong{font-size:25px;color:var(--white);word-break:break-all}.direction{color:var(--magenta);font-weight:800}
 .location{background:var(--panel);border:1px solid #24506b;margin-bottom:11px}.loc-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid #1d435a}.loc-head span{color:var(--muted);font-size:12px;letter-spacing:.08em}.loc-head strong{color:var(--green);font-size:13px}.coordinate-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:14px}.coordinate{min-width:0;background:#031927;border:1px solid #1d435a;padding:12px}.coordinate span{display:block;color:var(--muted);font-size:11px}.coordinate strong{display:block;color:var(--cyan);font-size:18px;margin-top:6px;overflow-wrap:anywhere}
 .grid{display:grid;grid-template-columns:1fr 1fr;background:var(--panel);border:1px solid #23455c}.cell{min-width:0;padding:11px 13px;border-bottom:1px solid #1b3b50}.cell:nth-child(odd){border-right:1px solid #1b3b50}.cell.wide{grid-column:1/-1;border-right:0}.cell span{display:block;color:var(--muted);font-size:12px}.cell strong{display:block;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.device{margin-bottom:11px}.device .metrics{padding:12px}.device .metric{min-width:0}.device strong{color:var(--green)}.device small{display:block;color:var(--muted);font-size:11px;line-height:1.5;margin-top:6px}.device .danger{border-color:var(--red);background:#2a1017}.device .danger strong,.device .danger small{color:var(--red)}
 .controls{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:11px}.sound{appearance:none;border:1px solid var(--yellow);background:#241f05;color:var(--yellow);padding:11px 13px;font:inherit;font-weight:800}.sound.on{border-color:var(--green);background:#092817;color:var(--green)}
 .refresh{text-align:right;font-size:12px;color:var(--muted)}.refresh strong{display:block;color:var(--cyan);margin-bottom:3px}.notice{min-height:22px;color:var(--green);font-size:13px;margin-top:10px}
 footer{color:#718795;font-size:11px;line-height:1.55;margin-top:8px}.flash{animation:flash 1.2s ease}@keyframes flash{0%%{border-color:var(--yellow);box-shadow:0 0 30px #ffe34299}100%%{border-color:#24506b;box-shadow:inset 0 0 28px #00131f}}
@@ -578,6 +621,9 @@ footer{color:#718795;font-size:11px;line-height:1.55;margin-top:8px}.flash{anima
 <section class=hero id=hero><div class=eyebrow>TRAIN NUMBER / 车次</div><div class=train id=train>%(train)s</div>
 <div class=metrics><div class="metric speed"><span>速度 km/h</span><strong id=speed>%(speed)s</strong></div><div class="metric km"><span>公里标 km</span><strong id=km>%(km)s</strong></div></div></section>
 <section class=route><label>线路</label><strong id=route data-gbk="%(route)s">%(route)s</strong><span class=direction id=direction>%(direction)s</span></section>
+<section class="location device" aria-label="本机状态"><div class=loc-head><span>DEVICE / 本机状态</span><span>随列车信息更新</span></div><div class=metrics aria-live=polite>
+<div class="metric%(battery_class)s" id=batteryCard><span>本机电量</span><strong id=battery>%(battery)s</strong><small id=batteryNote>%(battery_note)s</small></div>
+<div class="metric%(temp_class)s" id=tempCard><span>核心温度</span><strong id=temperature>%(temperature)s</strong><small id=tempNote>%(temp_note)s</small></div></div></section>
 <section class=location id=location data-lon="%(longitude)s" data-lat="%(latitude)s"><div class=loc-head><span>POSITION / 列车经纬度</span><strong id=locationState>检查坐标中</strong></div><div class=coordinate-grid>
 <div class=coordinate><span>经度</span><strong id=longitude>---</strong></div><div class=coordinate><span>纬度</span><strong id=latitude>---</strong></div></div></section>
 <section class=grid>
@@ -589,6 +635,7 @@ footer{color:#718795;font-size:11px;line-height:1.55;margin-top:8px}.flash{anima
 <footer>页面通过 SSE 接收机实时推送，新报文到达即更新；断线时会自动重连并临时使用兼容轮询。声音默认关闭。</footer></main>
 <script>
 const el=id=>document.getElementById(id);let lastId=document.body.dataset.recordId||"",lastRevision=Number(lastId)||0,soundOn=false,audioCtx=null,stream=null,streamErrors=0,fallbackTimer=null,reopenTimer=null,pollPrimed=true;
+function renderDevice(d){d=d||{};const b=d.battery_percent,t=d.core_temp_c,bv=typeof b==="number"&&Number.isFinite(b)&&b>=0&&b<=100,tv=typeof t==="number"&&Number.isFinite(t)&&t>=-100&&t<=200,low=bv&&b<20,hot=tv&&t>45;put("battery",bv?b+"%%":null);put("temperature",tv?t.toFixed(1)+"°C":null);el("batteryCard").classList.toggle("danger",low);el("tempCard").classList.toggle("danger",hot);put("batteryNote",!bv?"等待有效采样":low?"⚠ 低电量警告：低于 20%%":"电量正常");put("tempNote",!tv?"等待有效采样":hot?"⚠ 温度警告：高于 45°C":"温度正常")}
 function put(id,v){el(id).textContent=(v===undefined||v===null||v==="")?"---":v}
 function decodeRoute(hex){if(!hex||hex==="---")return "---";if(hex.length%%2||!/^[0-9a-f]+$/i.test(hex))return "编码 "+hex;try{const pairs=hex.match(/[0-9a-f]{2}/gi),bytes=Uint8Array.from(pairs,x=>parseInt(x,16));const text=new TextDecoder("gbk",{fatal:true}).decode(bytes).replace(/\u0000/g,"").trim();return text||("编码 "+hex)}catch(e){return "编码 "+hex}}
 function asCoordinate(value){if(value===null||value===undefined||value==="")return null;const number=Number(value);return Number.isFinite(number)?number:null}
@@ -596,7 +643,7 @@ function coordinateText(value,positive,negative){return Math.abs(value).toFixed(
 function renderCoordinates(latitude,longitude,available){const lat=asCoordinate(latitude),lon=asCoordinate(longitude);if(lat===null||lon===null||Math.abs(lat)>90||Math.abs(lon)>180){put("longitude",null);put("latitude",null);el("locationState").textContent=available?"本次无有效坐标":"等待定位报文";return}put("longitude",coordinateText(lon,"E","W"));put("latitude",coordinateText(lat,"N","S"));el("locationState").textContent="坐标有效"}
 function tone(){if(!soundOn||!audioCtx)return;try{const t=audioCtx.currentTime,o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.setValueAtTime(880,t);o.frequency.setValueAtTime(1175,t+.09);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.18,t+.015);g.gain.exponentialRampToValueAtTime(.0001,t+.20);o.connect(g);g.connect(audioCtx.destination);o.start(t);o.stop(t+.21)}catch(e){}}
 function announce(){const hero=el("hero");hero.classList.remove("flash");void hero.offsetWidth;hero.classList.add("flash");el("notice").textContent="● 收到新的列车信息  "+new Date().toLocaleTimeString();tone()}
-function render(d,fromLive,resetRevision){const id=String(d.update_id||""),revision=Number(id),numeric=Number.isFinite(revision),wrapped=numeric&&lastRevision>1879048192&&revision<268435456;if(resetRevision&&numeric&&revision<lastRevision&&!wrapped){lastRevision=revision;lastId=id}if(wrapped){lastRevision=-1;lastId=""}else if(fromLive&&!resetRevision&&numeric&&revision<lastRevision)return false;const changed=fromLive&&d.available&&(numeric?revision>lastRevision:id&&id!==lastId);put("state",d.available?"最近一次列车信息":"等待列车信号");put("train",d.train_no);put("speed",d.speed);put("km",d.km);put("route",decodeRoute(d.route));put("direction",d.direction);put("received",d.time);put("loco",d.loco);put("cab",d.cab);put("rssi",d.rssi);put("type",d.type);renderCoordinates(d.latitude,d.longitude,d.available);if(changed)announce();if(id)lastId=id;if(numeric)lastRevision=revision;return true}
+function render(d,fromLive,resetRevision){const id=String(d.update_id||""),revision=Number(id),numeric=Number.isFinite(revision),wrapped=numeric&&lastRevision>1879048192&&revision<268435456;if(resetRevision&&numeric&&revision<lastRevision&&!wrapped){lastRevision=revision;lastId=id}if(wrapped){lastRevision=-1;lastId=""}else if(fromLive&&!resetRevision&&numeric&&revision<lastRevision)return false;const changed=fromLive&&d.available&&(numeric?revision>lastRevision:id&&id!==lastId);put("state",d.available?"最近一次列车信息":"等待列车信号");put("train",d.train_no);put("speed",d.speed);put("km",d.km);put("route",decodeRoute(d.route));put("direction",d.direction);put("received",d.time);put("loco",d.loco);put("cab",d.cab);put("rssi",d.rssi);put("type",d.type);renderCoordinates(d.latitude,d.longitude,d.available);renderDevice(d.device);if(changed)announce();if(id)lastId=id;if(numeric)lastRevision=revision;return true}
 function clearFallback(){if(fallbackTimer!==null){clearTimeout(fallbackTimer);fallbackTimer=null}}
 function scheduleFallback(delay){if(fallbackTimer===null)fallbackTimer=setTimeout(fallbackPoll,delay)}
 function fallbackPoll(){fallbackTimer=null;if(stream&&stream.readyState===1)return;el("refreshState").textContent="兼容模式轮询中";fetch("/api/latest?t="+Date.now(),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error(r.status);return r.json()}).then(d=>{if(stream&&stream.readyState===1)return;const first=pollPrimed;pollPrimed=false;if(render(d,true,first))el("streamDetail").textContent="最近同步 "+new Date().toLocaleTimeString()}).catch(()=>{pollPrimed=true;el("streamDetail").textContent="连接失败，继续重试"}).then(()=>{if(!stream||stream.readyState!==1)scheduleFallback(5000)})}

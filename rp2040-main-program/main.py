@@ -24,9 +24,9 @@ from wireless_portal import WirelessPortal, AP_SSID
 
 # 系统性能配置
 
-# Preserve the original receiver timing/performance.  The Waveshare-specific
-# MicroPython build has been hardware-tested with CYW43 AP mode at 200 MHz.
-CPU_FREQ_HZ = 200000000
+# Use the RP2350 rated clock for long-running stability testing.
+# Keep the configured SPI and PIO receive settings unchanged.
+CPU_FREQ_HZ = 150000000
 TFT_SPI_BAUD = 60000000
 UI_QUEUE_CAPACITY = 16
 HISTORY_QUEUE_CAPACITY = 24
@@ -52,6 +52,7 @@ PHYSICAL_FLASH_MIB = 16
 
 pin_bl = Pin(6, Pin.OUT, value=0)
 machine.freq(CPU_FREQ_HZ)
+print("BOOT_CPU_HZ", machine.freq())
 try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
@@ -84,6 +85,8 @@ wifi_retry_at = 0
 wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
 
 last_hw_update = 0  
+last_hw_draw = None
+HW_SAMPLE_INTERVAL_MS = 30000
 last_rssi_str = "N/A" 
 hist_rssi_str = "N/A" # 用于单独储存历史记录的 RSSI
 screen_is_on = True 
@@ -445,13 +448,40 @@ def get_rtc_date_for_edit():
     return 26, 1, 1
 
 def get_battery_info():
-    bat_en.value(0); time.sleep_ms(5)
-    raw = bat_adc.read_u16()
-    bat_en.value(1)
+    bat_en.value(0)
+    try:
+        time.sleep_ms(5)
+        raw = bat_adc.read_u16()
+    finally:
+        bat_en.value(1)
     raw_volts = (raw / 65535) * 3.3 * 2
     volts = raw_volts + BAT_OFFSET
     percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
+
+def sample_device_status(now, force=False):
+    """Share one bounded ADC sample between the LCD and wireless snapshot."""
+    global last_hw_update, last_battery_v, last_battery_p, last_temp_str
+    if (not force and last_battery_v is not None
+            and time.ticks_diff(now, last_hw_update) < HW_SAMPLE_INTERVAL_MS):
+        return
+    battery_percent = None
+    temp_c = None
+    try:
+        last_battery_v, last_battery_p = get_battery_info()
+        battery_percent = int(last_battery_p.rstrip('%'))
+    except Exception:
+        last_battery_v, last_battery_p = "---", "---"
+    try:
+        reading = sensor_temp.read_u16() * (3.3 / 65535.0)
+        temp_c = round(27 - (reading - 0.706) / 0.001721, 1)
+        if not -100 <= temp_c <= 200:
+            temp_c = None
+    except Exception:
+        pass
+    last_temp_str = "ERR" if temp_c is None else f"{temp_c:.1f}C"
+    last_hw_update = now
+    wifi_portal.set_device_status(battery_percent, temp_c)
 
 def _read_config_dict():
     try:
@@ -808,33 +838,22 @@ def update_top_bar():
     tft.draw_gbk(current_status, 230, 4, current_status_color, 0x01CF)
 
 def draw_hardware_bar(force=False):
-    global last_hw_update, last_rssi_str, hist_rssi_str, system_state
-    global last_battery_v, last_battery_p, last_temp_str
+    global last_hw_draw
     now = time.ticks_ms()
-    sample_due = (
-        last_battery_v is None
-        or time.ticks_diff(now, last_hw_update) >= 30000
-    )
-    if not force and not sample_due:
+    sample_device_status(now)
+    if not force and last_hw_draw == last_hw_update:
         return
-
-    if sample_due:
-        last_battery_v, last_battery_p = get_battery_info()
-        try:
-            reading = sensor_temp.read_u16() * (3.3 / 65535.0)
-            temp_c = 27 - (reading - 0.706) / 0.001721
-            last_temp_str = f"{temp_c:.1f}C"
-        except Exception:
-            last_temp_str = "ERR"
-        last_hw_update = now
+    last_hw_draw = last_hw_update
 
     v, p, t = last_battery_v, last_battery_p, last_temp_str
     
     # 处于 HISTORY 模式时，底部状态栏使用历史 RSSI
     r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
     
-    raw_p = int(p.replace('%', ''))
-    bat_color = RED if raw_p < 20 else WHITE
+    try:
+        bat_color = RED if int(p.rstrip('%')) < 20 else WHITE
+    except (TypeError, ValueError):
+        bat_color = WHITE
     
     tft.fill_rect(45, 218, 70, 16, BLACK)
     tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) 
@@ -1218,6 +1237,7 @@ def process_ui_data(data):
             # Web/SSE is a live snapshot, not an internal-history reader.
             # Publish every parsed fragment, including extended_only.
             latest_train_record = received_record
+            sample_device_status(time.ticks_ms(), force=True)
             wifi_portal.set_latest(latest_train_record)
             
             if system_state == "DASHBOARD":
@@ -1254,6 +1274,7 @@ if boot_status == "HALT":
 
 # Potentially slow storage work runs only after the POST is already visible.
 init_history()
+sample_device_status(time.ticks_ms(), force=True)
 if total_count > 0:
     latest_train_record = load_latest_valid_history()
     wifi_portal.set_latest(latest_train_record)

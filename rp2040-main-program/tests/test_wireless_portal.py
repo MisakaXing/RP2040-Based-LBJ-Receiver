@@ -380,6 +380,8 @@ class WirelessPortalTests(unittest.TestCase):
 
         portal._service_http_client(101)  # Parse and build initial stream.
         portal._service_http_client(102)  # Send headers and initial snapshot.
+        while portal._clients[0][3] is not None:
+            portal._service_http_client(102)
         self.assertFalse(client.closed)
         self.assertEqual(portal._clients[0][5], MODE_SSE)
 
@@ -387,6 +389,8 @@ class WirelessPortalTests(unittest.TestCase):
         portal.set_latest({"t": "newest", "d": {"basic": {"train_no": "2"}}})
         portal._service_http_client(103)  # Queue the current/latest revision.
         portal._service_http_client(104)  # Send it.
+        while portal._clients[0][3] is not None:
+            portal._service_http_client(104)
         sent = b"".join(client.sent_chunks)
         self.assertEqual(sent.count(b"event: train"), 2)
         self.assertIn(b"id: 2", sent)
@@ -495,7 +499,7 @@ class WirelessPortalTests(unittest.TestCase):
         portal._clients = [
             [client, 100, bytearray(), None, 0, MODE_SSE, 0, 100]
         ]
-        portal._latest_revision = 1
+        portal.set_latest({"d": {}})
 
         def fail_event():
             raise MemoryError("injected")
