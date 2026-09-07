@@ -8,8 +8,11 @@ practical on RP2350: one 32-bit offset is stored for every 16 valid records.
 import array
 import errno
 import gc
+import hashlib
 import json
 import os
+import struct
+import time
 
 
 MIB = 1024 * 1024
@@ -21,6 +24,27 @@ SMALL_FLASH_HISTORY_LIMIT = 2500
 DEFAULT_INDEX_STRIDE = 16
 DEFAULT_MAX_RECORD_BYTES = 1024
 DEFAULT_MAX_SCAN_LINE_BYTES = 4096
+CHECKPOINT_RECORD_INTERVAL = 64
+# Bump the schema whenever record validity or the index interpretation changes.
+CHECKPOINT_SCHEMA = 1
+CHECKPOINT_MAGIC = b"LBJIDX01"
+CHECKPOINT_HEADER = "<8s8I"
+CHECKPOINT_HEADER_BYTES = 40
+CHECKPOINT_ANCHOR_BYTES = 512
+
+
+def _ticks_ms():
+    try:
+        return time.ticks_ms()
+    except AttributeError:
+        return int(time.monotonic() * 1000)
+
+
+def _ticks_diff(now, before):
+    try:
+        return time.ticks_diff(now, before)
+    except AttributeError:
+        return now - before
 
 BASIC_HISTORY_FIELDS = ("speed_kmh", "km_post")
 EXTENDED_HISTORY_FIELDS = (
@@ -209,6 +233,157 @@ class HistoryStore:
         self.index_complete = True
         self.read_only = False
         self.full = False
+        self.checkpoint_path = self.path + ".idx"
+        self.checkpoint_error = ""
+        self.checkpoint_writes = 0
+        self._checkpoint_count = -1
+        self._indexed_end = 0
+        self.scan_mode = "full"
+        self.scan_lines = 0
+        self.scan_ms = 0
+
+    def checkpoint_due(self):
+        return (
+            self.index_complete and not self.read_only
+            and not self.tail_needs_separator
+            and (self._checkpoint_count < 0
+                 or self.count - self._checkpoint_count >= CHECKPOINT_RECORD_INTERVAL)
+        )
+
+    @staticmethod
+    def _anchor_hash(source, start, size):
+        source.seek(start)
+        data = source.read(size)
+        if len(data) != size:
+            raise ValueError("SHORT HISTORY")
+        return hashlib.sha256(data).digest()
+
+    def _load_checkpoint(self):
+        """Validate a small disposable index for our append-only history file.
+
+        First/last-prefix anchors detect truncation/replacement and a torn tail.
+        They are not a full-file integrity check: external history edits must
+        remove .idx, or explicitly request scan(use_checkpoint=False).
+        """
+        try:
+            with open(self.checkpoint_path, "rb") as source:
+                header = source.read(CHECKPOINT_HEADER_BYTES)
+                if len(header) != CHECKPOINT_HEADER_BYTES:
+                    raise ValueError("SHORT HEADER")
+                (magic, schema, stride, limit, line_limit, count, invalid,
+                 end, number_offsets) = struct.unpack(CHECKPOINT_HEADER, header)
+                if (magic != CHECKPOINT_MAGIC or schema != CHECKPOINT_SCHEMA
+                        or stride != self.index_stride or limit != self.max_records
+                        or line_limit != self.max_scan_line_bytes):
+                    raise ValueError("SCHEMA/POLICY")
+                if (count > self.max_records
+                        or number_offsets != (count + stride - 1) // stride
+                        or count + invalid > end):
+                    raise ValueError("BOUNDS")
+                expected_size = CHECKPOINT_HEADER_BYTES + 64 + number_offsets * 4 + 32
+                if os.stat(self.checkpoint_path)[6] != expected_size:
+                    raise ValueError("INDEX LENGTH")
+                digest = hashlib.sha256(header)
+                anchors = source.read(64)
+                digest.update(anchors)
+                offsets = array.array("I")
+                previous = -1
+                for first in range(0, number_offsets, 32):
+                    amount = min(32, number_offsets - first)
+                    data = source.read(amount * 4)
+                    if len(data) != amount * 4:
+                        raise ValueError("SHORT OFFSETS")
+                    digest.update(data)
+                    for offset in struct.unpack("<%dI" % amount, data):
+                        if offset <= previous or offset >= end:
+                            raise ValueError("OFFSET BOUNDS")
+                        offsets.append(offset)
+                        previous = offset
+                if source.read(32) != digest.digest():
+                    raise ValueError("INDEX CHECKSUM")
+            if os.stat(self.path)[6] < end:
+                raise ValueError("TRUNCATED HISTORY")
+            with open(self.path, "rb") as history:
+                size = min(end, CHECKPOINT_ANCHOR_BYTES)
+                if (self._anchor_hash(history, 0, size) != anchors[:32]
+                        or self._anchor_hash(history, end - size, size) != anchors[32:]):
+                    raise ValueError("HISTORY ANCHOR")
+                if end:
+                    history.seek(end - 1)
+                    if history.read(1) != b"\n":
+                        raise ValueError("UNCOMMITTED TAIL")
+            # Commit restored state only after every check has passed.
+            self.offsets = offsets
+            self.count = count
+            self.invalid_lines = invalid
+            self._indexed_end = end
+            self._checkpoint_count = count
+            self.scan_mode = "tail"
+            return end
+        except OSError as exc:
+            self.checkpoint_error = "MISSING" if exc.args and exc.args[0] == 2 else str(exc)[:48]
+        except Exception as exc:
+            self.checkpoint_error = str(exc)[:48]
+        return 0
+
+    def save_checkpoint(self, force=False):
+        """Commit a cache only after the JSON file has been flushed/closed.
+
+        A failed cache write must never disable recording or invalidate the
+        existing checkpoint. Normal callers batch this work in radio idle gaps.
+        """
+        if (not self.index_complete or self.read_only or self.tail_needs_separator
+                or (not force and not self.checkpoint_due())):
+            return False
+        temp_path = self.checkpoint_path + ".tmp"
+        try:
+            if not self._refresh_space() or self.free_bytes < self.reserve_bytes + 8192:
+                self.checkpoint_error = "INDEX SPACE"
+                return False
+            end = self._indexed_end
+            if os.stat(self.path)[6] < end:
+                raise ValueError("HISTORY SIZE")
+            with open(self.path, "rb") as history:
+                size = min(end, CHECKPOINT_ANCHOR_BYTES)
+                head = self._anchor_hash(history, 0, size)
+                tail = self._anchor_hash(history, end - size, size)
+                if end:
+                    history.seek(end - 1)
+                    if history.read(1) != b"\n":
+                        raise ValueError("UNCOMMITTED TAIL")
+            header = struct.pack(
+                CHECKPOINT_HEADER, CHECKPOINT_MAGIC, CHECKPOINT_SCHEMA,
+                self.index_stride, self.max_records, self.max_scan_line_bytes,
+                self.count, self.invalid_lines, end, len(self.offsets),
+            )
+            digest = hashlib.sha256()
+            with open(temp_path, "wb") as target:
+                for data in (header, head, tail):
+                    if target.write(data) != len(data):
+                        raise OSError("SHORT INDEX WRITE")
+                    digest.update(data)
+                # Avoid a second whole-index byte buffer on MicroPython.
+                for first in range(0, len(self.offsets), 32):
+                    part = self.offsets[first:first + 32]
+                    data = struct.pack("<%dI" % len(part), *part)
+                    if target.write(data) != len(data):
+                        raise OSError("SHORT INDEX WRITE")
+                    digest.update(data)
+                if target.write(digest.digest()) != 32:
+                    raise OSError("SHORT INDEX CHECKSUM")
+                target.flush()
+            os.rename(temp_path, self.checkpoint_path)
+            self._checkpoint_count = self.count
+            self.checkpoint_writes += 1
+            self.checkpoint_error = ""
+            return True
+        except Exception as exc:
+            self.checkpoint_error = "SAVE " + str(exc)[:43]
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            return False
 
     def _clear_cache(self):
         self._cache_checkpoint = -1
@@ -262,7 +437,8 @@ class HistoryStore:
             had_newline = chunk.endswith(b"\n")
         return None, had_newline, True
 
-    def scan(self, _capacity_rescan=False):
+    def scan(self, _capacity_rescan=False, use_checkpoint=True):
+        started = _ticks_ms()
         self.offsets = array.array("I")
         self._clear_cache()
         self.count = 0
@@ -272,6 +448,11 @@ class HistoryStore:
         self.read_only = False
         self.full = False
         self.last_error = ""
+        self.checkpoint_error = ""
+        self._checkpoint_count = -1
+        self._indexed_end = 0
+        self.scan_mode = "full"
+        self.scan_lines = 0
         if self._refresh_space():
             # A transient statvfs failure during module import must not leave a
             # 16 MiB board locked to the conservative 2500-record fallback.
@@ -279,8 +460,11 @@ class HistoryStore:
             self.last_error = ""
         last_line_had_newline = True
         saw_line = False
+        start_offset = self._load_checkpoint() if use_checkpoint else 0
+        gc.collect()
         try:
             with open(self.path, "rb") as source:
+                source.seek(start_offset)
                 physical_lines = 0
                 while self.count < self.max_records:
                     offset = source.tell()
@@ -290,6 +474,7 @@ class HistoryStore:
                     saw_line = True
                     last_line_had_newline = line_had_newline
                     physical_lines += 1
+                    self.scan_lines += 1
                     record = None if oversized else self._decode_line(
                         line, self.max_scan_line_bytes
                     )
@@ -299,6 +484,7 @@ class HistoryStore:
                         if self.count % self.index_stride == 0:
                             self.offsets.append(offset)
                         self.count += 1
+                    self._indexed_end = source.tell()
                     if physical_lines & 0x7F == 0:
                         gc.collect()
             self.tail_needs_separator = saw_line and not last_line_had_newline
@@ -337,12 +523,13 @@ class HistoryStore:
                     # The filesystem size recovered only after the first pass.
                     # Rebuild using the correct limit so a >2500-record file is
                     # never reported as a full small-board history.
-                    return self.scan(_capacity_rescan=True)
+                    return self.scan(_capacity_rescan=True, use_checkpoint=use_checkpoint)
                 self.index_complete = False
                 self.read_only = True
                 self.last_error = "CAPACITY UNSTABLE"
             elif self.index_complete:
                 self.last_error = ""
+        self.scan_ms = _ticks_diff(_ticks_ms(), started)
         return self.count
 
     def load(self, index):
@@ -482,6 +669,7 @@ class HistoryStore:
             if self.count % self.index_stride == 0:
                 self.offsets.append(record_offset)
             self.count += 1
+            self._indexed_end = record_offset + len(json_bytes) + 1
             self.tail_needs_separator = False
             self.full = self.count >= self.max_records
             self.last_error = ""
@@ -512,6 +700,13 @@ class HistoryStore:
             # needed, so deleted records can never survive in a stale cache.
             empty_offsets = array.array("I")
             empty_cache = []
+            # Invalidate the cache before replacing the log. Power loss here
+            # leaves the old history recoverable by a full scan, never stale IDs.
+            try:
+                os.remove(self.checkpoint_path)
+            except OSError as exc:
+                if not exc.args or exc.args[0] != 2:
+                    raise
             with open(temp_path, "wb") as target:
                 try:
                     target.flush()
@@ -522,6 +717,9 @@ class HistoryStore:
             self._cache_checkpoint = -1
             self._cache_records = empty_cache
             self.count = 0
+            self._indexed_end = 0
+            self._checkpoint_count = -1
+            self.checkpoint_error = ""
             self.invalid_lines = 0
             self.tail_needs_separator = False
             self.index_complete = True

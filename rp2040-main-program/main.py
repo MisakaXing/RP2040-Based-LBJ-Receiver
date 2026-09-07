@@ -80,6 +80,7 @@ history_dropped = 0
 sd_dropped = 0
 storage_errors = 0
 storage_forced_writes = 0
+last_history_checkpoint_attempt = None
 wifi_service_errors = 0
 wifi_retry_at = 0
 wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
@@ -588,7 +589,15 @@ def init_history():
         "checkpoints=", len(history_store.offsets),
         "limit=", MAX_HIST,
         "fs_bytes=", history_store.total_bytes,
+        "mode=", history_store.scan_mode,
+        "parsed=", history_store.scan_lines,
+        "ms=", history_store.scan_ms,
     )
+    if history_store.checkpoint_error not in ("", "MISSING"):
+        print("HISTORY_CHECKPOINT_FALLBACK", history_store.checkpoint_error)
+    if history_store.checkpoint_due():
+        if not history_store.save_checkpoint():
+            print("HISTORY_CHECKPOINT_DEFERRED", history_store.checkpoint_error)
     if not history_store.index_complete:
         current_status, current_status_color = b'HIST ERR', RED
         print("HISTORY_INDEX_ERR", history_store.last_error)
@@ -720,6 +729,24 @@ def service_history_storage(now):
         return
 
     storage_pending_since = None
+
+def service_history_checkpoint(now):
+    global last_history_checkpoint_attempt, last_storage_write
+    # Cache writes are optional. Never force them during a busy radio burst,
+    # pending record writes, or history/menu interaction merely to speed boot.
+    if (system_state != "DASHBOARD" or len(ui_queue) or len(history_queue)
+            or len(sd_log_queue) or len(receiver.raw_queue)
+            or not history_store.checkpoint_due()):
+        return
+    if (time.ticks_diff(now, receiver.last_word_time) < HISTORY_RADIO_QUIET_MS
+            or time.ticks_diff(now, last_storage_write) < STORAGE_WRITE_GAP_MS
+            or (last_history_checkpoint_attempt is not None
+                and time.ticks_diff(now, last_history_checkpoint_attempt) < 30000)):
+        return
+    last_history_checkpoint_attempt = now
+    if not history_store.save_checkpoint():
+        print("HISTORY_CHECKPOINT_DEFERRED", history_store.checkpoint_error)
+    last_storage_write = time.ticks_ms()
 
 def queue_sd_log(record):
     global sd_dropped
@@ -1379,6 +1406,12 @@ while True:
         if system_state == "DASHBOARD":
             update_top_bar()
             
+    try:
+        service_history_checkpoint(time.ticks_ms())
+    except Exception as exc:
+        # Optional boot acceleration cannot discard pending train records.
+        print("HISTORY_CHECKPOINT_ERR", repr(exc))
+
     if gc.mem_free() < 20000:
         gc.collect()
 
