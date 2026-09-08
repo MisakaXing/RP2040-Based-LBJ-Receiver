@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import zipfile
 import shutil
+from urllib.parse import quote
 import requests
 import customtkinter as ctk
 import serial.tools.list_ports
@@ -43,6 +44,237 @@ COLORS = {
     "red": "#E46A6A",
     "red_hover": "#BD5555",
 }
+
+GITHUB_REPO = "MisakaXing/RP2040-Based-LBJ-Receiver"
+TARGET_DIR = "rp2040-main-program"
+
+STANDARD_CHANNEL_LABEL = "标准版（main / RP2040）"
+WIRELESS_CHANNEL_LABEL = "无线 W 版（Wireless-Enabled）"
+DEFAULT_CHANNEL_LABEL = STANDARD_CHANNEL_LABEL
+
+COMMON_RUNTIME_FILES = (
+    "HZK16",
+    "boot_post.py",
+    "ili9341.py",
+    "lbj_receiver.py",
+    "locos.json",
+    "rtc_ds3231.py",
+    "sdcard.py",
+)
+
+FIRMWARE_BRANCHES = {
+    STANDARD_CHANNEL_LABEL: {
+        "label": STANDARD_CHANNEL_LABEL,
+        "branch": "main",
+        "family": "rp2040",
+        "hardware_hint": "仅适用于 RP2040 Pico 标准接收器",
+        "runtime_files": COMMON_RUNTIME_FILES + ("main.py",),
+    },
+    WIRELESS_CHANNEL_LABEL: {
+        "label": WIRELESS_CHANNEL_LABEL,
+        "branch": "Wireless-Enabled",
+        "family": "waveshare_w",
+        "hardware_hint": "仅适用于 Waveshare RP2350B-Plus-W",
+        "runtime_files": COMMON_RUNTIME_FILES + (
+            "history_store.py",
+            "wireless_portal.py",
+            "main.py",
+        ),
+    },
+}
+
+PROGRAM_VERSION_RE = re.compile(
+    r"\bProgram_ver\s*=\s*(?P<value>[\"'][^\"'\r\n]+[\"']|[0-9][A-Za-z0-9._-]*)"
+)
+HARDWARE_PROBE_PREFIX = "LBJ_HW_PROBE_V1"
+MIN_WIRELESS_FS_BYTES = 12 * 1024 * 1024
+
+HARDWARE_PROBE_SCRIPT = """import sys
+import os
+import machine
+
+def safe(value):
+    return str(value).replace("|", " ").replace("\\r", " ").replace("\\n", " ")
+
+implementation = sys.implementation
+build = getattr(implementation, "_build", "")
+impl_machine = getattr(implementation, "_machine", "")
+try:
+    uname_machine = getattr(os.uname(), "machine", "")
+except Exception:
+    uname_machine = ""
+
+network_ok = 0
+try:
+    import network
+    wlan_type = getattr(network.WLAN, "IF_STA", None)
+    if wlan_type is None:
+        wlan_type = getattr(network, "STA_IF", None)
+    if wlan_type is None:
+        raise OSError("STA interface missing")
+    network.WLAN(wlan_type)
+    network_ok = 1
+except Exception:
+    pass
+
+pins_ok = 0
+try:
+    machine.Pin(41)
+    machine.Pin(42)
+    pins_ok = 1
+except Exception:
+    pass
+
+fs_bytes = 0
+try:
+    values = os.statvfs("/")
+    fs_bytes = int(values[0]) * int(values[2])
+except Exception:
+    pass
+
+print("LBJ_HW_PROBE_V1|build=%s|impl_machine=%s|uname_machine=%s|platform=%s|network=%d|pins_41_42=%d|fs_bytes=%d" % (
+    safe(build), safe(impl_machine), safe(uname_machine), safe(sys.platform),
+    network_ok, pins_ok, fs_bytes
+))
+"""
+
+
+def get_firmware_profile(selection):
+    if selection in FIRMWARE_BRANCHES:
+        return FIRMWARE_BRANCHES[selection]
+    for profile in FIRMWARE_BRANCHES.values():
+        if selection == profile["branch"]:
+            return profile
+    raise ValueError("未知固件分支: " + str(selection))
+
+
+def build_github_urls(repo, target_dir, branch):
+    branch_path = quote(str(branch), safe="")
+    target_path = quote(str(target_dir).strip("/"), safe="/")
+    return (
+        f"https://raw.githubusercontent.com/{repo}/{branch_path}/{target_path}/main.py",
+        f"https://api.github.com/repos/{repo}/contents/{target_path}?ref={branch_path}",
+    )
+
+
+def parse_program_version(text, file_names=()):
+    match = PROGRAM_VERSION_RE.search(text or "")
+    if not match:
+        return {"label": "", "version": (), "branch": ""}
+
+    label = match.group("value").strip().strip("\"'")
+    number_match = re.match(r"(\d+(?:\.\d+)*)", label)
+    version = tuple(
+        int(part) for part in number_match.group(1).split(".")
+    ) if number_match else ()
+
+    names = {str(name).lower() for name in file_names}
+    source_lower = (text or "").lower()
+    is_wireless = (
+        label.upper().endswith("-W")
+        or "wireless_portal" in source_lower
+        or "wireless_portal.py" in names
+        or "history_store.py" in names
+    )
+    return {
+        "label": label,
+        "version": version,
+        "branch": "Wireless-Enabled" if is_wireless else "main",
+    }
+
+
+def version_is_at_least(local_info, remote_info):
+    local = tuple(local_info.get("version", ()))
+    remote = tuple(remote_info.get("version", ()))
+    return bool(local and remote and local >= remote)
+
+
+def version_as_number(info):
+    version = tuple(info.get("version", ()))
+    if not version:
+        return 0.0
+    try:
+        return float(".".join(str(part) for part in version[:2]))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def version_display(info, missing="未知"):
+    label = str(info.get("label", ""))
+    return f"v{label}" if label else missing
+
+
+def select_runtime_files(profile, files_data):
+    by_name = {
+        item.get("name"): item
+        for item in files_data
+        if isinstance(item, dict) and item.get("type") == "file"
+    }
+    required = tuple(profile["runtime_files"])
+    missing = [name for name in required if name not in by_name]
+    return [by_name[name] for name in required if name in by_name], missing
+
+
+def parse_hardware_probe(output):
+    for raw_line in reversed((output or "").splitlines()):
+        line = raw_line.strip()
+        if not line.startswith(HARDWARE_PROBE_PREFIX + "|"):
+            continue
+        info = {}
+        for field in line.split("|")[1:]:
+            if "=" not in field:
+                continue
+            key, value = field.split("=", 1)
+            info[key] = value.strip()
+        for key in ("network", "pins_41_42", "fs_bytes"):
+            try:
+                info[key] = int(info.get(key, 0))
+            except (TypeError, ValueError):
+                info[key] = 0
+        return info
+    return None
+
+
+def hardware_identity(info):
+    if not info:
+        return "未知硬件"
+    values = [
+        info.get("build", ""),
+        info.get("impl_machine", ""),
+        info.get("uname_machine", ""),
+    ]
+    return next((str(value) for value in values if value), "未知硬件")
+
+
+def evaluate_hardware_compatibility(profile, info):
+    if not info:
+        return False, "无法读取开发板身份，已阻止刷入"
+
+    identity = " ".join(str(info.get(key, "")) for key in (
+        "build", "impl_machine", "uname_machine", "platform"
+    )).upper()
+    compact = re.sub(r"[^A-Z0-9]+", "", identity)
+    is_waveshare_w = "WAVESHARERP2350BPLUSW" in compact
+
+    if profile["family"] == "rp2040":
+        if is_waveshare_w:
+            return False, "检测到 Waveshare RP2350B-Plus-W，不能刷入标准版"
+        if "RP2040" not in compact:
+            return False, "标准版仅支持 RP2040 Pico，当前板型不兼容"
+        return True, "RP2040 Pico 与标准版兼容"
+
+    if not is_waveshare_w:
+        return False, (
+            "无线 W 版仅支持 Waveshare RP2350B-Plus-W；"
+            "请先刷入仓库提供的 Waveshare 专用 UF2"
+        )
+    if not info.get("network"):
+        return False, "未检测到 CYW43 network.WLAN，无线固件不兼容"
+    if not info.get("pins_41_42"):
+        return False, "专板 GPIO41/42 不可用，无线固件不兼容"
+    if int(info.get("fs_bytes", 0)) < MIN_WIRELESS_FS_BYTES:
+        return False, "文件系统小于 12 MiB，不符合 16 MiB W 版布局"
+    return True, "Waveshare RP2350B-Plus-W 与无线 W 版兼容"
 
 # ================= 嵌入的硬件自检脚本 =================
 HARDWARE_TEST_SCRIPT = """import machine
@@ -243,26 +475,31 @@ class PicoUpdaterApp(ctk.CTk):
         super().__init__()
 
         self.title("Pico LBJ Receiver Updater")
-        self.geometry("1080x740")
-        self.minsize(920, 640)
+        self.geometry("1080x790")
+        self.minsize(920, 700)
         self.configure(fg_color=COLORS["bg"])
 
         # 仓库配置
-        self.github_repo = "MisakaXing/RP2040-Based-LBJ-Receiver"
-        self.target_dir = "rp2040-main-program"
-        self.main_py_url = f"https://raw.githubusercontent.com/{self.github_repo}/main/{self.target_dir}/main.py"
-        self.api_url = f"https://api.github.com/repos/{self.github_repo}/contents/{self.target_dir}"
+        self.github_repo = GITHUB_REPO
+        self.target_dir = TARGET_DIR
+        self.active_profile = get_firmware_profile(DEFAULT_CHANNEL_LABEL)
+        self.main_py_url, self.api_url = build_github_urls(
+            self.github_repo, self.target_dir, self.active_profile["branch"]
+        )
 
         # 状态变量
         self.local_version = 0.0
         self.remote_version = 0.0
+        self.local_firmware_info = {"label": "", "version": (), "branch": ""}
+        self.remote_firmware_info = {"label": "", "version": (), "branch": ""}
         self.is_working = False
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self.setup_ui()
-        self.refresh_ports() 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.refresh_ports()
 
     def setup_ui(self):
         self.sidebar_frame = ctk.CTkFrame(
@@ -343,10 +580,45 @@ class PicoUpdaterApp(ctk.CTk):
             anchor="w",
             padx=12,
         )
-        self.device_status.grid(row=2, column=0, sticky="ew", pady=(8, 24))
+        self.device_status.grid(row=2, column=0, sticky="ew", pady=(8, 16))
+
+        self._section_label(controls, "固件分支").grid(
+            row=3, column=0, sticky="ew", pady=(0, 7)
+        )
+
+        self.branch_var = ctk.StringVar(value=DEFAULT_CHANNEL_LABEL)
+        self.branch_menu = ctk.CTkOptionMenu(
+            controls,
+            variable=self.branch_var,
+            values=list(FIRMWARE_BRANCHES),
+            height=38,
+            corner_radius=6,
+            fg_color=COLORS["surface_alt"],
+            button_color=COLORS["border"],
+            button_hover_color=COLORS["teal_hover"],
+            dropdown_fg_color=COLORS["surface"],
+            dropdown_hover_color=COLORS["surface_alt"],
+            command=self._on_branch_selected,
+        )
+        self.branch_menu.grid(row=4, column=0, sticky="ew")
+
+        self.branch_hint = ctk.CTkLabel(
+            controls,
+            text=self.active_profile["hardware_hint"],
+            height=38,
+            corner_radius=6,
+            fg_color=COLORS["surface"],
+            text_color=COLORS["amber"],
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+            justify="left",
+            wraplength=244,
+            padx=10,
+        )
+        self.branch_hint.grid(row=5, column=0, sticky="ew", pady=(7, 16))
 
         self._section_label(controls, "常用操作").grid(
-            row=3, column=0, sticky="ew", pady=(0, 7)
+            row=6, column=0, sticky="ew", pady=(0, 7)
         )
 
         self.action_btn = ctk.CTkButton(
@@ -359,7 +631,7 @@ class PicoUpdaterApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=lambda: self.start_update_process(force=False),
         )
-        self.action_btn.grid(row=4, column=0, sticky="ew")
+        self.action_btn.grid(row=7, column=0, sticky="ew")
 
         self.offline_zip_btn = ctk.CTkButton(
             controls,
@@ -372,7 +644,7 @@ class PicoUpdaterApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=self.start_offline_zip_update,
         )
-        self.offline_zip_btn.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.offline_zip_btn.grid(row=8, column=0, sticky="ew", pady=(8, 0))
 
         self.test_btn = ctk.CTkButton(
             controls,
@@ -385,13 +657,13 @@ class PicoUpdaterApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=self.start_hardware_test,
         )
-        self.test_btn.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        self.test_btn.grid(row=9, column=0, sticky="ew", pady=(8, 0))
 
         separator = ctk.CTkFrame(controls, height=1, fg_color=COLORS["border"])
-        separator.grid(row=7, column=0, sticky="ew", pady=24)
+        separator.grid(row=10, column=0, sticky="ew", pady=18)
 
         self._section_label(controls, "维护").grid(
-            row=8, column=0, sticky="ew", pady=(0, 7)
+            row=11, column=0, sticky="ew", pady=(0, 7)
         )
         self.force_action_btn = ctk.CTkButton(
             controls,
@@ -406,7 +678,7 @@ class PicoUpdaterApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=lambda: self.start_update_process(force=True),
         )
-        self.force_action_btn.grid(row=9, column=0, sticky="ew")
+        self.force_action_btn.grid(row=12, column=0, sticky="ew")
 
         repo_label = ctk.CTkLabel(
             self.sidebar_frame,
@@ -619,7 +891,44 @@ class PicoUpdaterApp(ctk.CTk):
         if label is not None:
             self.progress_label.configure(text=label)
 
+    def _selected_profile(self):
+        profile = get_firmware_profile(self.branch_var.get())
+        snapshot = dict(profile)
+        snapshot["runtime_files"] = tuple(profile["runtime_files"])
+        return snapshot
+
+    def _on_branch_selected(self, selection):
+        profile = get_firmware_profile(selection)
+        self.active_profile = profile
+        self.main_py_url, self.api_url = build_github_urls(
+            self.github_repo, self.target_dir, profile["branch"]
+        )
+        self.remote_firmware_info = {
+            "label": "", "version": (), "branch": ""
+        }
+        self.remote_version = 0.0
+        self.remote_ver_label.configure(text="未知")
+        self.branch_hint.configure(
+            text=profile["hardware_hint"], text_color=COLORS["amber"]
+        )
+        self.log(
+            f"已选择固件分支: {profile['branch']}；"
+            f"{profile['hardware_hint']}。"
+        )
+
+    def _reset_selected_device_state(self):
+        self.local_version = 0.0
+        self.local_firmware_info = {
+            "label": "", "version": (), "branch": ""
+        }
+        self.local_ver_label.configure(text="未知")
+        profile = self._selected_profile()
+        self.branch_hint.configure(
+            text=profile["hardware_hint"], text_color=COLORS["amber"]
+        )
+
     def _on_port_selected(self, port):
+        self._reset_selected_device_state()
         if port in ("未检测到设备", "请选择端口..."):
             self.connection_value.configure(text="未连接")
             self.device_status.configure(
@@ -657,13 +966,25 @@ class PicoUpdaterApp(ctk.CTk):
         )
         self.refresh_btn.configure(state=state)
         self.port_menu.configure(state=state)
+        self.branch_menu.configure(state=state)
         self.clear_log_btn.configure(state=state)
         self.status_badge.configure(
             text="运行中" if working else "就绪",
             text_color=COLORS["amber"] if working else COLORS["green"],
         )
 
+    def _on_close(self):
+        if self.is_working:
+            messagebox.showwarning(
+                "任务正在进行",
+                "当前正在检查或刷写固件。为避免设备只写入一部分文件，"
+                "请等待任务完成或在确认窗口中取消后再关闭。",
+            )
+            return
+        self.destroy()
+
     def refresh_ports(self):
+        self._reset_selected_device_state()
         PICO_VID = 0x2E8A
         ports = serial.tools.list_ports.comports()
         port_list = [port.device for port in ports]
@@ -727,23 +1048,80 @@ class PicoUpdaterApp(ctk.CTk):
                     
                 process.stdout.close()
                 process.wait(timeout=timeout_sec)
-                return True, "\n".join(full_output)
+                return process.returncode == 0, "\n".join(full_output)
             else:
                 result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                         encoding='utf-8', errors='replace', timeout=timeout_sec, startupinfo=startupinfo)
-                return True, result.stdout
+                return result.returncode == 0, result.stdout
         except subprocess.TimeoutExpired:
             return False, "命令执行超时 (可能 Pico 处于死循环，或文件传输时间过长)"
         except Exception as e:
             return False, str(e)
 
     def extract_version(self, text):
-        ver = 0.0
-        ver_match = re.search(r"Program_ver\s*=\s*([\d\.]+)", text)
-        if ver_match:
-            try: ver = float(ver_match.group(1))
-            except ValueError: pass
-        return ver
+        return version_as_number(parse_program_version(text))
+
+    def _probe_hardware(self, port):
+        success, output = self.run_mpremote(
+            port,
+            ["exec", HARDWARE_PROBE_SCRIPT],
+            timeout_sec=15,
+        )
+        if not success:
+            return None, "硬件身份探测命令失败: " + str(output)[:240]
+        info = parse_hardware_probe(output)
+        if info is None:
+            return None, "硬件身份探测没有返回有效标识"
+        return info, ""
+
+    def _check_hardware_compatibility(self, port, profile, phase="刷入前检查"):
+        self.log(
+            f"{phase}: 正在核对 {profile['branch']} 与开发板硬件..."
+        )
+        info, probe_error = self._probe_hardware(port)
+        if info is None:
+            compatible, reason = False, probe_error
+            identity = "未知硬件"
+        else:
+            compatible, reason = evaluate_hardware_compatibility(profile, info)
+            identity = hardware_identity(info)
+
+        self.log(f"检测到开发板: {identity}")
+        if compatible:
+            self.log(f"[通过] {reason}")
+            self.after(
+                0,
+                lambda text=identity: self.connection_value.configure(
+                    text=text[:26], text_color=COLORS["green"]
+                ),
+            )
+            self.after(
+                0,
+                lambda text=reason: self.branch_hint.configure(
+                    text=text, text_color=COLORS["green"]
+                ),
+            )
+            return True
+
+        self.log(f"[阻止刷入] {reason}")
+        error_message = (
+            f"所选分支：{profile['branch']}\n"
+            f"检测硬件：{identity}\n\n{reason}\n\n"
+            "未执行清空、写入或重启操作。"
+        )
+        self.after(
+            0,
+            lambda msg=error_message: messagebox.showerror(
+                "硬件不兼容，已阻止刷入", msg
+            ),
+        )
+        self.after(
+            0,
+            lambda text=reason: self.branch_hint.configure(
+                text=text, text_color=COLORS["red"]
+            ),
+        )
+        return False
 
     def show_confirm_dialog(self, title, message, yes_text, no_text, on_yes, on_no=None, icon="warning"):
         dialog = ctk.CTkToplevel(self)
@@ -791,6 +1169,10 @@ class PicoUpdaterApp(ctk.CTk):
             if finished["value"]:
                 return
             finished["value"] = True
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
             dialog.destroy()
             if value:
                 on_yes()
@@ -819,6 +1201,7 @@ class PicoUpdaterApp(ctk.CTk):
         ).grid(row=0, column=1, padx=(8, 0), sticky="ew")
 
         dialog.protocol("WM_DELETE_WINDOW", lambda: _finish(False))
+        dialog.grab_set()
 
         try:
             dialog.update_idletasks()
@@ -842,10 +1225,11 @@ class PicoUpdaterApp(ctk.CTk):
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _extract_zip_firmware(self, zip_path, dest_dir):
-        firmware_files = []
+    def _extract_zip_firmware(self, zip_path, dest_dir, profile):
+        extracted_by_name = {}
         main_text = None
         target_marker = f"/{self.target_dir}/"
+        allowed_names = set(profile["runtime_files"])
 
         try:
             archive = zipfile.ZipFile(zip_path, "r")
@@ -881,25 +1265,49 @@ class PicoUpdaterApp(ctk.CTk):
                     continue
                 if rel_name.startswith("._"):
                     continue
+                if rel_name not in allowed_names:
+                    self.log(f"跳过非运行文件: {rel_name}")
+                    continue
 
                 out_path = os.path.join(dest_dir, rel_name)
                 with archive.open(info, "r") as src, open(out_path, "wb") as dst:
                     data = src.read()
                     dst.write(data)
 
-                firmware_files.append({"name": rel_name, "path": out_path})
+                extracted_by_name[rel_name] = {
+                    "name": rel_name,
+                    "path": out_path,
+                }
                 if rel_name == "main.py":
                     main_text = data.decode("utf-8", errors="replace")
 
-        if not firmware_files:
+        if not extracted_by_name:
             raise ValueError(f"ZIP 中没有找到 {self.target_dir} 目录下的固件文件。")
         if main_text is None:
             raise ValueError(f"ZIP 中没有找到 {self.target_dir}/main.py，无法识别固件版本。")
 
-        firmware_files.sort(key=lambda item: (item["name"] == "main.py", item["name"]))
-        return firmware_files, self.extract_version(main_text)
+        missing = [
+            name for name in profile["runtime_files"]
+            if name not in extracted_by_name
+        ]
+        if missing:
+            raise ValueError("ZIP 缺少运行文件: " + ", ".join(missing))
 
-    def _read_device_version(self, port):
+        firmware_info = parse_program_version(main_text, extracted_by_name)
+        if not firmware_info["version"]:
+            raise ValueError("无法识别 ZIP 中的 Program_ver。")
+        if firmware_info["branch"] != profile["branch"]:
+            raise ValueError(
+                f"ZIP 属于 {firmware_info['branch']}，"
+                f"但当前选择的是 {profile['branch']}。"
+            )
+
+        firmware_files = [
+            extracted_by_name[name] for name in profile["runtime_files"]
+        ]
+        return firmware_files, firmware_info
+
+    def _read_device_firmware_info(self, port):
         self.log("正在探测 Pico 文件系统...")
         success, ls_output = self.run_mpremote(
             port,
@@ -911,18 +1319,33 @@ class PicoUpdaterApp(ctk.CTk):
             self.log("正在读取本地版本...")
             success_cat, output = self.run_mpremote(port, ["cat", "main.py"], timeout_sec=15)
             if success_cat and "Program_ver" in output:
-                return self.extract_version(output)
-            return 0.0
+                return parse_program_version(output)
+            return {"label": "", "version": (), "branch": ""}
 
         self.log("未检测到 main.py，识别为全新开发板或空文件系统。")
-        return 0.0
+        return {"label": "", "version": (), "branch": ""}
 
-    def _wipe_device_files(self, port):
+    def _read_device_version(self, port):
+        return version_as_number(self._read_device_firmware_info(port))
+
+    def _wipe_device_files(self, port, profile):
+        if not self._check_hardware_compatibility(
+            port, profile, phase="清空前最终复核"
+        ):
+            return False
         self.log("正在清空 Pico 中的旧文件...")
         wipe_script = "import os; [os.remove(f) for f in os.listdir() if not (os.stat(f)[0] & 0x4000)]"
         success, output = self.run_mpremote(port, ["exec", wipe_script], timeout_sec=20)
         if not success:
-            self.log(f"清空旧文件时出现警告: {output}")
+            self.log(f"[失败] 无法安全清空旧文件: {output}")
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "清空失败", "未能安全清空旧文件，已停止刷入。"
+                ),
+            )
+            return False
+        return True
 
     def _copy_firmware_files(self, port, firmware_files, progress_start=0.65, progress_span=0.30):
         total_files = max(1, len(firmware_files))
@@ -1014,16 +1437,18 @@ class PicoUpdaterApp(ctk.CTk):
             self.log("用户已取消选择离线 ZIP。")
             return
 
+        profile = self._selected_profile()
         self.set_ui_state(True)
         self.clear_log()
         self.set_progress(0, "离线 ZIP 刷入")
+        self.log(f"离线刷入目标分支: {profile['branch']}")
         threading.Thread(
             target=self._offline_zip_prepare_worker,
-            args=(port, zip_path),
+            args=(port, zip_path, profile),
             daemon=True
         ).start()
 
-    def _offline_zip_prepare_worker(self, port, zip_path):
+    def _offline_zip_prepare_worker(self, port, zip_path, profile):
         temp_dir = None
         try:
             self.log(f"离线刷入文件: {zip_path}")
@@ -1040,18 +1465,40 @@ class PicoUpdaterApp(ctk.CTk):
 
             temp_dir = tempfile.mkdtemp(prefix="pico_offline_zip_")
             self.after(0, self.set_progress, 0.15, "解析 ZIP 固件")
-            firmware_files, zip_version = self._extract_zip_firmware(zip_path, temp_dir)
-            self.remote_version = zip_version
-            remote_text = "ZIP 未知" if zip_version == 0.0 else f"ZIP v{zip_version:g}"
+            firmware_files, zip_info = self._extract_zip_firmware(
+                zip_path, temp_dir, profile
+            )
+            self.remote_firmware_info = zip_info
+            self.remote_version = version_as_number(zip_info)
+            remote_text = "ZIP " + version_display(zip_info)
             self.after(0, lambda text=remote_text: self.remote_ver_label.configure(text=text))
             self.log(f"ZIP 解析完成，找到 {len(firmware_files)} 个固件文件。")
-            self.log(f"ZIP 固件版本: {zip_version if zip_version else '未知'}")
+            self.log(
+                f"ZIP 固件: {version_display(zip_info)} / "
+                f"{zip_info['branch']}"
+            )
+
+            if not self._check_hardware_compatibility(
+                port, profile, phase="离线包刷入前检查"
+            ):
+                self._cleanup_temp_dir(temp_dir)
+                temp_dir = None
+                self.after(0, self.set_ui_state, False)
+                return
 
             self.after(0, self.set_progress, 0.28, "读取设备固件")
-            self.local_version = self._read_device_version(port)
-            local_text = "未安装" if self.local_version == 0.0 else f"v{self.local_version:g}"
+            local_info = self._read_device_firmware_info(port)
+            self.local_firmware_info = local_info
+            self.local_version = version_as_number(local_info)
+            local_text = version_display(local_info, missing="未安装")
             self.after(0, lambda text=local_text: self.local_ver_label.configure(text=text))
-            self.log(f"设备当前版本: {self.local_version if self.local_version else '未安装/未知'}")
+            self.log(
+                "设备当前固件: "
+                + (
+                    f"{local_text} / {local_info['branch']}"
+                    if local_info["version"] else "未安装/未知"
+                )
+            )
 
             self.after(
                 0,
@@ -1059,8 +1506,9 @@ class PicoUpdaterApp(ctk.CTk):
                 port,
                 temp_dir,
                 firmware_files,
-                zip_version,
-                self.local_version,
+                zip_info,
+                local_info,
+                profile,
             )
             temp_dir = None
 
@@ -1071,25 +1519,34 @@ class PicoUpdaterApp(ctk.CTk):
             self.after(0, lambda err=error_text: messagebox.showerror("离线刷入失败", f"发生错误: {err}"))
             self.after(0, self.set_ui_state, False)
 
-    def _confirm_offline_zip_update(self, port, temp_dir, firmware_files, zip_version, local_version):
-        zip_text = "未知" if zip_version == 0.0 else f"v{zip_version:g}"
-        local_text = "未知/未安装" if local_version == 0.0 else f"v{local_version:g}"
+    def _confirm_offline_zip_update(
+        self, port, temp_dir, firmware_files, zip_info, local_info, profile
+    ):
+        zip_text = version_display(zip_info)
+        local_text = version_display(local_info, missing="未知/未安装")
+        same_branch = local_info.get("branch") == profile["branch"]
 
-        if local_version != 0.0 and zip_version > local_version:
+        if (
+            local_info["version"]
+            and same_branch
+            and not version_is_at_least(local_info, zip_info)
+        ):
             self.log("等待用户确认：ZIP 版本较新，刷入会清空 Pico 数据。")
             title = "离线刷入确认"
             message = (
-                f"ZIP 固件版本 {zip_text} 高于机器版本 {local_text}。\n\n"
+                f"目标分支：{profile['branch']}\n"
+                f"ZIP 固件 {zip_text} 高于机器版本 {local_text}。\n\n"
                 "刷入过程会清空 Pico 内所有旧文件，历史车次数据将会永久消失。\n\n"
                 "请选择继续刷入，或取消操作。"
             )
             yes_text = "继续刷入"
             cancel_log = "用户已取消离线刷入。"
             continue_log = "版本较新，用户确认后开始正常刷入。"
-        elif local_version == 0.0 and zip_version > 0.0:
+        elif not local_info["version"]:
             self.log("等待用户确认：即将离线刷入并清空 Pico 数据。")
             title = "离线刷入确认"
             message = (
+                f"目标分支：{profile['branch']}\n"
                 f"将刷入 ZIP 固件 {zip_text}。\n\n"
                 "刷入过程会清空 Pico 内所有旧文件，历史车次数据将会永久消失。\n\n"
                 "请选择继续刷入，或取消操作。"
@@ -1097,6 +1554,18 @@ class PicoUpdaterApp(ctk.CTk):
             yes_text = "继续刷入"
             cancel_log = "用户已取消离线刷入。"
             continue_log = "设备未安装或版本未知，用户确认后开始刷入。"
+        elif not same_branch:
+            self.log("等待用户确认：设备中的固件属于另一分支。")
+            title = "切换固件分支"
+            message = (
+                f"设备当前是 {local_info.get('branch') or '未知分支'} "
+                f"{local_text}，将切换到 {profile['branch']} {zip_text}。\n\n"
+                "刷入过程会清空 Pico 内所有旧文件，历史车次数据将会永久消失。\n\n"
+                "请选择切换分支，或取消操作。"
+            )
+            yes_text = "切换并刷入"
+            cancel_log = "用户取消切换固件分支。"
+            continue_log = "用户确认切换固件分支。"
         else:
             self.log("等待用户确认：ZIP 版本小于或等于机器版本，需要选择是否强制刷入。")
             title = "版本较低或相同"
@@ -1119,26 +1588,41 @@ class PicoUpdaterApp(ctk.CTk):
 
         def _continue():
             self.log(continue_log)
-            threading.Thread(
-                target=self._offline_zip_flash_worker,
-                args=(port, temp_dir, firmware_files),
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._offline_zip_flash_worker,
+                    args=(port, temp_dir, firmware_files, profile),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                self.log(f"[失败] 无法启动离线刷入线程: {exc}")
+                self._cleanup_temp_dir(temp_dir)
+                self.set_ui_state(False)
+                messagebox.showerror("离线刷入失败", str(exc))
 
-        self.show_confirm_dialog(
-            title,
-            message,
-            yes_text=yes_text,
-            no_text="取消",
-            on_yes=_continue,
-            on_no=_cancel,
-            icon="warning",
-        )
+        try:
+            self.show_confirm_dialog(
+                title,
+                message,
+                yes_text=yes_text,
+                no_text="取消",
+                on_yes=_continue,
+                on_no=_cancel,
+                icon="warning",
+            )
+        except Exception as exc:
+            self.log(f"[失败] 无法显示离线刷入确认窗口: {exc}")
+            self._cleanup_temp_dir(temp_dir)
+            self.set_ui_state(False)
+            messagebox.showerror("离线刷入失败", str(exc))
 
-    def _offline_zip_flash_worker(self, port, temp_dir, firmware_files):
+    def _offline_zip_flash_worker(
+        self, port, temp_dir, firmware_files, profile
+    ):
         try:
             self.after(0, self.set_progress, 0.55, "准备刷入")
-            self._wipe_device_files(port)
+            if not self._wipe_device_files(port, profile):
+                return
             self.after(0, self.set_progress, 0.65, "写入设备")
 
             if not self._copy_firmware_files(port, firmware_files, 0.65, 0.30):
@@ -1164,32 +1648,26 @@ class PicoUpdaterApp(ctk.CTk):
         if not port or port == "未检测到设备" or port == "请选择端口...":
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
             return
-            
-        if force:
-            confirm = messagebox.askyesno(
-                "强制刷入警告",
-                "您选择了强制刷入！\n\n这将无视版本是否最新，强行格式化 Pico 并重新拉取所有文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续吗？",
-                icon="warning"
-            )
-        else:
-            confirm = messagebox.askyesno(
-                "更新警告",
-                "执行同步更新将会彻底清空 Pico 中的旧文件！\n\n保存在本机的所有【历史车次数据】将会永久消失！\n\n您确定要继续执行更新吗？",
-                icon="warning"
-            )
-            
-        if not confirm:
-            self.log("用户已取消操作。")
+
+        if self.is_working:
             return
 
-        if self.is_working: return
+        profile = self._selected_profile()
         self.set_ui_state(True)
         self.clear_log()
-        self.set_progress(0, "固件更新")
-        
-        threading.Thread(target=self._update_worker, args=(port, force), daemon=True).start()
+        self.set_progress(0, "在线更新预检")
+        self.log(f"在线更新目标分支: {profile['branch']}")
+        self.log(f"目标硬件: {profile['hardware_hint']}")
 
-    def _update_worker(self, port, force):
+        threading.Thread(
+            target=self._update_worker,
+            args=(port, force, profile),
+            daemon=True,
+        ).start()
+
+    def _update_worker(self, port, force, profile):
+        temp_dir = None
+        handed_to_dialog = False
         try:
             self.log(f"正在测试 Pico ({port}) 连接状态...")
             success, output = self.run_mpremote(port, ["exec", "print('PICO_OK')"], timeout_sec=10)
@@ -1203,118 +1681,295 @@ class PicoUpdaterApp(ctk.CTk):
             )
             self.log("[完成] Pico 串口通信正常。")
 
+            if not self._check_hardware_compatibility(
+                port, profile, phase="在线更新刷入前检查"
+            ):
+                return
+
+            main_py_url, api_url = build_github_urls(
+                self.github_repo, self.target_dir, profile["branch"]
+            )
             self.log("正在连接 GitHub 获取远程版本...")
             self.after(0, self.set_progress, 0.1, "获取远程版本")
-            resp = requests.get(self.main_py_url, timeout=15)
+            resp = requests.get(main_py_url, timeout=15)
             if resp.status_code == 200:
-                self.remote_version = self.extract_version(resp.text)
-                self.after(0, lambda rv=self.remote_version: self.remote_ver_label.configure(text=f"v{rv:g}"))
-                self.log(f"成功获取远程版本: {self.remote_version}")
+                remote_info = parse_program_version(resp.text)
+                if not remote_info["version"]:
+                    raise ValueError("无法从远程 main.py 识别 Program_ver。")
+                if remote_info["branch"] != profile["branch"]:
+                    raise ValueError(
+                        f"远程文件属于 {remote_info['branch']}，"
+                        f"与所选 {profile['branch']} 不一致，已阻止刷入。"
+                    )
+                self.remote_firmware_info = remote_info
+                self.remote_version = version_as_number(remote_info)
+                remote_text = version_display(remote_info)
+                self.after(
+                    0,
+                    lambda text=remote_text: self.remote_ver_label.configure(text=text),
+                )
+                self.log(
+                    f"成功获取远程固件: {remote_text} / "
+                    f"{remote_info['branch']}"
+                )
             else:
-                self.log("获取远程文件失败，请检查网络！")
-                return
+                raise RuntimeError(
+                    f"获取远程 main.py 失败: HTTP {resp.status_code}"
+                )
 
-            self.log("正在探测 Pico 文件系统...")
             self.after(0, self.set_progress, 0.2, "读取设备固件")
-            
-            success, ls_output = self.run_mpremote(port, ["exec", "import os; print('main.py' in os.listdir())"], timeout_sec=10)
-            self.local_version = 0.0 
-            
-            if success and "True" in ls_output:
-                self.log("正在读取本地版本...")
-                success_cat, output = self.run_mpremote(port, ["cat", "main.py"], timeout_sec=15)
-                if success_cat and "Program_ver" in output:
-                    self.local_version = self.extract_version(output)
-            else:
-                self.log("未检测到 main.py，识别为全新开发板，将执行初次完整安装。")
-
-            local_version_text = "未安装" if self.local_version == 0.0 else f"v{self.local_version:g}"
-            self.after(0, lambda text=local_version_text: self.local_ver_label.configure(text=text))
+            local_info = self._read_device_firmware_info(port)
+            self.local_firmware_info = local_info
+            self.local_version = version_as_number(local_info)
+            local_text = version_display(local_info, missing="未安装")
+            self.after(
+                0,
+                lambda text=local_text: self.local_ver_label.configure(text=text),
+            )
+            self.log(
+                "设备当前固件: "
+                + (
+                    f"{local_text} / {local_info['branch']}"
+                    if local_info["version"] else "未安装/未知"
+                )
+            )
             self.after(0, self.set_progress, 0.3, "准备更新文件")
 
-            if not force:
-                if self.local_version >= self.remote_version and self.local_version != 0.0:
-                    self.log("\n[完成] 当前已是最新版本，无需更新。")
-                    self.after(0, self.set_progress, 1.0, "已是最新版本")
-                    return
-                self.log("\n准备开始执行同步操作...")
+            same_branch = local_info.get("branch") == profile["branch"]
+            if not force and same_branch and version_is_at_least(
+                local_info, remote_info
+            ):
+                self.log("\n[完成] 当前分支已是最新版本，无需更新。")
+                self.after(0, self.set_progress, 1.0, "已是最新版本")
+                return
+
+            if force:
+                self.log("\n已选择强制刷入；硬件兼容检查仍然有效。")
+            elif local_info["version"] and not same_branch:
+                self.log(
+                    "\n检测到设备固件属于另一分支，将按分支切换处理。"
+                )
             else:
-                self.log("\n用户已选择强制刷入，跳过版本校验拦截...")
+                self.log("\n准备开始执行同步操作...")
 
             self.log("正在解析远程仓库文件列表...")
-            api_resp = requests.get(self.api_url, timeout=15)
+            api_resp = requests.get(api_url, timeout=15)
             if api_resp.status_code != 200:
-                self.log(f"获取目录失败: HTTP {api_resp.status_code}")
-                return
-                
+                raise RuntimeError(
+                    f"获取远程目录失败: HTTP {api_resp.status_code}"
+                )
+
             files_data = api_resp.json()
-            downloadable_files = [f for f in files_data if f.get('type') == 'file']
-            
-            with tempfile.TemporaryDirectory() as temp_dir:
-                total_files = len(downloadable_files)
-                for i, file_info in enumerate(downloadable_files):
-                    file_name = file_info['name']
-                    dl_url = file_info['download_url']
-                    self.log(f"正在下载: {file_name} ...")
-                    
-                    try:
-                        file_resp = requests.get(dl_url, timeout=20)
-                        file_resp.raise_for_status()
-                    except Exception as e:
-                        self.log(f"\n[失败] 下载 {file_name} 失败: {e}")
-                        self.after(0, lambda fn=file_name: messagebox.showerror("网络错误", f"下载文件 {fn} 时发生网络错误！\n可能原因: 网络连接不稳定或超时。"))
-                        return
-                    
-                    with open(os.path.join(temp_dir, file_name), 'wb') as f:
-                        f.write(file_resp.content)
-                        
-                    self.after(
-                        0,
-                        self.set_progress,
-                        0.3 + 0.3 * ((i+1)/total_files),
-                        "下载固件文件",
-                    )
+            if not isinstance(files_data, list):
+                raise ValueError("GitHub 返回的固件目录格式无效。")
 
-                self.log("正在清空 Pico 中的旧文件...")
-                wipe_script = "import os; [os.remove(f) for f in os.listdir() if not (os.stat(f)[0] & 0x4000)]"
-                success, output = self.run_mpremote(port, ["exec", wipe_script], timeout_sec=20)
-                if not success:
-                    self.log(f"清空旧文件时出现警告: {output}")
-                
-                self.after(0, self.set_progress, 0.7, "写入设备")
+            downloadable_files, missing = select_runtime_files(
+                profile, files_data
+            )
+            if missing:
+                raise ValueError(
+                    "远程分支缺少必需运行文件: " + ", ".join(missing)
+                )
 
-                for i, file_info in enumerate(downloadable_files):
-                    file_name = file_info['name']
-                    local_path = os.path.join(temp_dir, file_name)
-                    self.log(f"正在写入到 Pico: {file_name} ...")
-                    
-                    success, output = self.run_mpremote(port, ["fs", "cp", local_path, f":{file_name}"])
-                    if not success:
-                        self.log(f"\n[失败] 写入 {file_name} 失败: {output}")
-                        self.after(0, lambda fn=file_name: messagebox.showerror("写入失败", f"写入文件 {fn} 时发生错误！"))
-                        return
-                    
-                    self.after(
-                        0,
-                        self.set_progress,
-                        0.7 + 0.25 * ((i+1)/total_files),
-                        "写入设备",
-                    )
+            temp_dir = tempfile.mkdtemp(prefix="pico_online_update_")
+            firmware_files = []
+            total_files = len(downloadable_files)
+            for i, file_info in enumerate(downloadable_files):
+                file_name = file_info["name"]
+                dl_url = file_info.get("download_url")
+                if not dl_url:
+                    raise ValueError(f"{file_name} 缺少下载地址。")
+                self.log(f"正在下载: {file_name} ...")
 
-            self.log("正在重启 Pico 生效固件...")
-            self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
-            
-            self.after(0, self.set_progress, 1.0, "更新完成")
-            msg_title = "强制刷入完成" if force else "初次/更新安装完成"
-            self.log(f"\n[完成] {msg_title}，Pico 已加载最新程序。")
-            self.after(0, lambda mt=msg_title: messagebox.showinfo(mt, f"{mt}！操作已成功完成！"))
-            
+                try:
+                    file_resp = requests.get(dl_url, timeout=20)
+                    file_resp.raise_for_status()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"下载 {file_name} 失败: {exc}"
+                    ) from exc
+
+                local_path = os.path.join(temp_dir, file_name)
+                with open(local_path, "wb") as file_handle:
+                    file_handle.write(file_resp.content)
+                firmware_files.append({"name": file_name, "path": local_path})
+
+                self.after(
+                    0,
+                    self.set_progress,
+                    0.3 + 0.3 * ((i + 1) / total_files),
+                    "下载固件文件",
+                )
+
+            downloaded_main = next(
+                item["path"] for item in firmware_files
+                if item["name"] == "main.py"
+            )
+            with open(downloaded_main, "r", encoding="utf-8") as file_handle:
+                downloaded_info = parse_program_version(
+                    file_handle.read(),
+                    (item["name"] for item in firmware_files),
+                )
+            if (
+                downloaded_info["branch"] != profile["branch"]
+                or downloaded_info["label"] != remote_info["label"]
+            ):
+                raise ValueError(
+                    "远程分支在下载过程中发生变化，固件快照不一致；"
+                    "请重新检查更新。"
+                )
+
+            self.after(
+                0,
+                self._confirm_online_update,
+                port,
+                force,
+                temp_dir,
+                firmware_files,
+                remote_info,
+                local_info,
+                profile,
+            )
+            handed_to_dialog = True
+            temp_dir = None
+
         except Exception as e:
             error_text = str(e)
             self.log(f"\n[失败] 处理过程中发生错误: {error_text}")
             self.after(0, lambda err=error_text: messagebox.showerror("错误", f"发生意外错误: {err}"))
-            
+
         finally:
+            self._cleanup_temp_dir(temp_dir)
+            if not handed_to_dialog:
+                self.after(0, self.set_ui_state, False)
+
+    def _confirm_online_update(
+        self,
+        port,
+        force,
+        temp_dir,
+        firmware_files,
+        remote_info,
+        local_info,
+        profile,
+    ):
+        remote_text = version_display(remote_info)
+        local_text = version_display(local_info, missing="未知/未安装")
+        same_branch = local_info.get("branch") == profile["branch"]
+
+        if force:
+            title = "强制刷入警告"
+            lead = (
+                f"将强制刷入 {profile['branch']} {remote_text}。"
+            )
+            yes_text = "强制刷入"
+            continue_log = "用户确认强制在线刷入。"
+        elif local_info["version"] and not same_branch:
+            title = "切换固件分支"
+            lead = (
+                f"设备当前是 {local_info.get('branch') or '未知分支'} "
+                f"{local_text}，将切换到 {profile['branch']} {remote_text}。"
+            )
+            yes_text = "切换并刷入"
+            continue_log = "用户确认在线切换固件分支。"
+        elif not local_info["version"]:
+            title = "初次安装确认"
+            lead = f"将安装 {profile['branch']} {remote_text}。"
+            yes_text = "安装固件"
+            continue_log = "用户确认在线初次安装。"
+        else:
+            title = "固件更新确认"
+            lead = (
+                f"将从 {local_text} 更新到 {profile['branch']} {remote_text}。"
+            )
+            yes_text = "继续更新"
+            continue_log = "用户确认在线更新。"
+
+        message = (
+            f"{lead}\n\n"
+            f"目标硬件：{profile['hardware_hint']}\n\n"
+            "已通过硬件兼容检查。继续后会再次复核，然后清空 Pico 内的旧文件。\n"
+            "所有历史车次数据将会永久消失。"
+        )
+        self.set_progress(0.62, "等待用户确认")
+
+        def _cancel():
+            self.log("用户已取消在线刷入。")
+            self._cleanup_temp_dir(temp_dir)
+            self.set_progress(1.0, "已取消")
+            self.set_ui_state(False)
+
+        def _continue():
+            self.log(continue_log)
+            try:
+                threading.Thread(
+                    target=self._online_flash_worker,
+                    args=(port, force, temp_dir, firmware_files, profile),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                self.log(f"[失败] 无法启动在线刷入线程: {exc}")
+                self._cleanup_temp_dir(temp_dir)
+                self.set_ui_state(False)
+                messagebox.showerror("在线刷入失败", str(exc))
+
+        try:
+            self.show_confirm_dialog(
+                title,
+                message,
+                yes_text=yes_text,
+                no_text="取消",
+                on_yes=_continue,
+                on_no=_cancel,
+                icon="warning",
+            )
+        except Exception as exc:
+            self.log(f"[失败] 无法显示在线刷入确认窗口: {exc}")
+            self._cleanup_temp_dir(temp_dir)
+            self.set_ui_state(False)
+            messagebox.showerror("在线刷入失败", str(exc))
+
+    def _online_flash_worker(
+        self, port, force, temp_dir, firmware_files, profile
+    ):
+        try:
+            self.after(0, self.set_progress, 0.64, "准备刷入")
+            if not self._wipe_device_files(port, profile):
+                return
+
+            self.after(0, self.set_progress, 0.70, "写入设备")
+            if not self._copy_firmware_files(
+                port, firmware_files, 0.70, 0.25
+            ):
+                return
+
+            self.log("正在重启 Pico 生效固件...")
+            self.run_mpremote(
+                port,
+                ["exec", "import machine; machine.reset()"],
+                timeout_sec=10,
+            )
+
+            self.after(0, self.set_progress, 1.0, "更新完成")
+            msg_title = "强制刷入完成" if force else "初次/更新安装完成"
+            self.log(f"\n[完成] {msg_title}，Pico 已加载所选分支程序。")
+            self.after(
+                0,
+                lambda mt=msg_title: messagebox.showinfo(
+                    mt, f"{mt}！操作已成功完成！"
+                ),
+            )
+        except Exception as e:
+            error_text = str(e)
+            self.log(f"\n[失败] 刷入过程中发生错误: {error_text}")
+            self.after(
+                0,
+                lambda err=error_text: messagebox.showerror(
+                    "刷入失败", f"发生意外错误: {err}"
+                ),
+            )
+        finally:
+            self._cleanup_temp_dir(temp_dir)
             self.after(0, self.set_ui_state, False)
 
 if __name__ == "__main__":
