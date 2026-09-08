@@ -13,15 +13,14 @@ if len(sys.argv) > 1 and sys.argv[1] == "mpremote_internal":
 
 import json
 import re
-import time
 import threading
-import subprocess
 import serial
 import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
 import tkintermapview
+from pico_history import download_history, save_history_atomic
 
 # 视觉主题
 ctk.set_appearance_mode("Dark")
@@ -56,6 +55,8 @@ class TrainLogApp(ctk.CTk):
         self.displayed_data = []
         self.current_marker = None
         self.current_raw_json = ""
+        self._pico_busy = False
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -596,59 +597,15 @@ class TrainLogApp(ctk.CTk):
                 self.port_var.set(port_list[0])
                 if show_prompt: messagebox.showwarning("提示", "已刷新列表，但未发现标准 Pico 设备。\n请展开下拉菜单手动选择正确的端口！")
 
-    def _interrupt_pico(self, port):
-        """发送 Ctrl+C 强行打断死循环"""
-        try:
-            with serial.Serial(port, 115200, timeout=1) as ser:
-                ser.write(b'\x03\x03') 
-                time.sleep(0.5) 
-        except Exception as e:
-            print(f"串口打断尝试失败: {e}")
-
-    def _reboot_pico(self, port):
-        """发送 Ctrl+D 触发软重启恢复工作"""
-        try:
-            with serial.Serial(port, 115200, timeout=1) as ser:
-                ser.write(b'\x04')
-        except Exception:
-            pass
-
-    def _run_mpremote_safe(self, cmd, timeout_sec=30):
-        """抓取原始字节，宽容解码"""
-        try:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-            result = subprocess.run(cmd, capture_output=True, timeout=timeout_sec, startupinfo=startupinfo)
-            
-            stdout_bytes = result.stdout if result.stdout else b''
-            stderr_bytes = result.stderr if result.stderr else b''
-            
-            try:
-                out_str = stdout_bytes.decode('utf-8', errors='ignore')
-            except:
-                out_str = stdout_bytes.decode('gbk', errors='ignore')
-                
-            try:
-                err_str = stderr_bytes.decode('utf-8', errors='ignore')
-            except:
-                err_str = stderr_bytes.decode('gbk', errors='ignore')
-                
-            return result.returncode, out_str, err_str
-            
-        except subprocess.TimeoutExpired:
-            return -1, "", "TIMEOUT"
-        except Exception as e:
-            return -2, "", str(e)
-
     def start_pico_read(self):
+        if self._pico_busy:
+            return
         port = self.port_var.get()
         if not port or "未检测" in port or "请选择" in port:
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
             return
 
+        self._pico_busy = True
         self.read_pico_btn.configure(state="disabled", text="读取中，请稍候...")
         self.export_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
@@ -656,6 +613,8 @@ class TrainLogApp(ctk.CTk):
         threading.Thread(target=self._pico_worker, args=(port,), daemon=True).start()
 
     def start_pico_export(self):
+        if self._pico_busy:
+            return
         port = self.port_var.get()
         if not port or "未检测" in port or "请选择" in port:
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
@@ -669,6 +628,7 @@ class TrainLogApp(ctk.CTk):
         )
         if not save_path: return 
             
+        self._pico_busy = True
         self.export_pico_btn.configure(state="disabled", text="导出中，请稍候...")
         self.read_pico_btn.configure(state="disabled")
         self.load_btn.configure(state="disabled")
@@ -676,69 +636,54 @@ class TrainLogApp(ctk.CTk):
         threading.Thread(target=self._export_worker, args=(port, save_path), daemon=True).start()
 
     def _pico_worker(self, port):
-        self.after(0, lambda: self.read_pico_btn.configure(text="正在中断设备..."))
-        self._interrupt_pico(port)
-        self.after(0, lambda: self.read_pico_btn.configure(text="正在读取数据..."))
-
-        if getattr(sys, 'frozen', False):
-            cmd = [sys.executable, "mpremote_internal", "connect", port, "cat", "history.jsonl"]
-        else:
-            cmd = [sys.executable, "-m", "mpremote", "connect", port, "cat", "history.jsonl"]
-            
-        try:
-            returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=30)
-            
-            if returncode == -1: 
-                self.after(0, lambda: messagebox.showerror("超时", "读取超时，请确保串口未被占用且线缆连接正常！"))
-                return
-            elif returncode != 0:
-                final_err = err_msg if err_msg else output
-                self.after(0, lambda err=final_err: messagebox.showerror("读取失败", f"无法读取文件，可能设备忙或文件损坏。\n\n{err}"))
-                return
-
-            lines = output.split('\n')
-            self.after(0, self._process_memory_lines, lines, "Pico 设备")
-            
-        except Exception as e:
-            self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
-        finally:
-            self.after(0, lambda: self.read_pico_btn.configure(text="正在恢复设备..."))
-            self._reboot_pico(port)
-            
-            self.after(0, lambda: self.read_pico_btn.configure(state="normal", text="读取设备记录"))
-            self.after(0, lambda: self.export_pico_btn.configure(state="normal"))
-            self.after(0, lambda: self.load_btn.configure(state="normal"))
+        self._device_history_worker(port)
 
     def _export_worker(self, port, save_path):
-        self.after(0, lambda: self.export_pico_btn.configure(text="正在中断设备..."))
-        self._interrupt_pico(port)
-        self.after(0, lambda: self.export_pico_btn.configure(text="正在导出文件..."))
+        self._device_history_worker(port, save_path)
 
-        if getattr(sys, 'frozen', False):
-            cmd = [sys.executable, "mpremote_internal", "connect", port, "cp", ":history.jsonl", save_path]
-        else:
-            cmd = [sys.executable, "-m", "mpremote", "connect", port, "cp", ":history.jsonl", save_path]
-            
+    def _device_history_worker(self, port, save_path=None):
+        button = self.export_pico_btn if save_path else self.read_pico_btn
+        last_percent = -1
+
+        def status(text):
+            self.after(0, lambda text=text: button.configure(text=text))
+
+        def progress(done, total):
+            nonlocal last_percent
+            percent = done * 100 // total if total else 100
+            # At most 101 queued UI updates, even for large histories.
+            if percent != last_percent:
+                last_percent = percent
+                status(f"传输 {percent}% · {done / 1048576:.2f}/{total / 1048576:.2f} MB")
+
         try:
-            returncode, output, err_msg = self._run_mpremote_safe(cmd, timeout_sec=45)
-            
-            if returncode == 0:
-                 self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已成功导出至：\n{p}"))
-            elif returncode == -1:
-                 self.after(0, lambda: messagebox.showerror("超时", "导出超时！日志文件可能过大或连接断开。"))
+            result = download_history(port, progress=progress, status=status)
+            if result.recovery_warning:
+                self.after(0, lambda warning=result.recovery_warning: messagebox.showwarning("设备恢复提示", warning))
+            if save_path:
+                save_history_atomic(save_path, result.data)
+                self.after(0, lambda p=save_path: messagebox.showinfo("成功", f"日志已完整导出并通过 SHA-256 校验：\n{p}"))
             else:
-                 final_err = err_msg if err_msg else output
-                 self.after(0, lambda err=final_err: messagebox.showerror("导出失败", f"导出失败。\n\n{err}"))
-                 
+                # Decode only after reassembling all blocks; never silently
+                # discard damaged UTF-8 or load a partially received file.
+                lines = result.data.decode("utf-8").splitlines()
+                self.after(0, self._process_memory_lines, lines, "Pico 设备（已校验）")
         except Exception as e:
-            self.after(0, lambda err=str(e): messagebox.showerror("错误", f"发生意外错误: {err}"))
+            self.after(0, lambda err=str(e): messagebox.showerror("设备日志传输失败", f"未加载或覆盖日志文件。\n请确认数据线连接且串口未被其他程序占用。\n\n{err}"))
         finally:
-            self.after(0, lambda: self.export_pico_btn.configure(text="正在恢复设备..."))
-            self._reboot_pico(port)
-            
-            self.after(0, lambda: self.export_pico_btn.configure(state="normal", text="导出日志到电脑"))
-            self.after(0, lambda: self.read_pico_btn.configure(state="normal"))
-            self.after(0, lambda: self.load_btn.configure(state="normal"))
+            self.after(0, self._finish_device_transfer)
+
+    def _finish_device_transfer(self):
+        self._pico_busy = False
+        self.read_pico_btn.configure(state="normal", text="读取设备记录")
+        self.export_pico_btn.configure(state="normal", text="导出日志到电脑")
+        self.load_btn.configure(state="normal")
+
+    def _close_app(self):
+        if self._pico_busy:
+            messagebox.showwarning("传输尚未完成", "正在读取设备日志，请等待设备恢复运行后再关闭软件。")
+            return
+        self.destroy()
 
     def _process_memory_lines(self, lines, source_name="日志文件"):
         self.log_data.clear()
