@@ -9,7 +9,7 @@ import array
 from machine import Pin, ADC, I2C
 from lbj_receiver import LBJReceiver, FixedQueue
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
-from rtc_ds3231 import DS3231
+from rtc_ds3231 import DS3231, format_history_time
 from boot_post import SystemPOST
 
 # 系统性能配置
@@ -32,7 +32,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = 5.2
+Program_ver = 5.3
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -337,12 +337,12 @@ def init_history():
     except: 
         total_count = 0; history_offsets = array.array('I')
 
-def save_history(data):
+def save_history(data, received_at=None):
     global total_count, history_offsets
     if total_count >= MAX_HIST:
         return False
     try:
-        t_str = rtc.get_time_str(True)
+        t_str = received_at if received_at is not None else rtc.get_history_time_str()
         record = {"t": t_str, "d": data}
         json_str = json.dumps(record) 
         with open(HIST_FILE, 'a') as f:
@@ -362,7 +362,7 @@ def queue_history(data):
         return False
     if len(history_queue) >= HISTORY_QUEUE_CAPACITY:
         return False
-    history_queue.put(data)
+    history_queue.put((data, rtc.get_history_time_str()))
     return True
 
 def service_history_storage(now):
@@ -379,7 +379,7 @@ def service_history_storage(now):
     # One physical write per quiet gap keeps the PIO/decoder side real-time.
     data = history_queue.get()
     if data is not None:
-        save_history(data)
+        save_history(data[0], data[1])
         last_storage_write = now
         return
 
@@ -533,7 +533,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
 
     if is_history:
         if is_partial: tft.fill_rect(0, 30, 320, 16, bg_color) 
-        header = f"HISTORY [{hist_idx+1}/{total_count}]  {hist_time}"
+        header = f"HISTORY [{hist_idx+1}/{total_count}]  {format_history_time(hist_time)}"
         tft.draw_gbk(header.encode(), 5, 30, YELLOW, bg_color, scale=1)
         y_offset = 20
     else: y_offset = 0
