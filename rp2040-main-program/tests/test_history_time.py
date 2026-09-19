@@ -103,10 +103,9 @@ class HistoryTimeTests(unittest.TestCase):
     def test_main_wires_history_only(self):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         ast.parse(source)
-        self.assertIn('Program_ver = 5.3', source)
+        self.assertIn('Program_ver = 5.4', source)
         self.assertIn('{format_history_time(hist_time)}', source)
 
 
 if __name__ == "__main__":
     unittest.main()
-
