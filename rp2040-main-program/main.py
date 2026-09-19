@@ -57,7 +57,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.4-W"
+Program_ver = "5.5-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -1233,6 +1233,10 @@ def process_ui_data(data):
         msg_type = data.get("type", "")
         if msg_type == "time_sync":
             hh, mm = map(int, data.get('time').split(':'))
+            # Let the RTC cross midnight naturally; time-only messages carry no date.
+            if hh == 0 and mm == 0:
+                print("TIME_SYNC_SKIP midnight")
+                return
             if 0 <= hh < 24 and 0 <= mm < 60:
                 rtc.sync_time(hh, mm)
                 if system_state == "DASHBOARD": 
