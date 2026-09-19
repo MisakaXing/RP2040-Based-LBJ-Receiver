@@ -1,3 +1,14 @@
+def format_history_time(value):
+    """Keep legacy time-only records readable without inventing a date."""
+    value = str(value or "")
+    if (len(value) >= 16 and value[4] == "-" and value[7] == "-"
+            and value[10] == " " and value[13] == ":"):
+        return value[:16]
+    if len(value) >= 5 and value[2] == ":":
+        return "----/--/-- " + value[:5]
+    return "----/--/-- --:--"
+
+
 class DS3231:
     """Unified DS3231/PCF8563 RTC driver.
 
@@ -105,6 +116,29 @@ class DS3231:
         if show_seconds:
             return f"{hour:02}:{minute:02}:{second:02}"
         return f"{hour:02}:{minute:02}"
+
+    def get_history_time_str(self):
+        """Read one RTC snapshot so the date and minute agree at midnight."""
+        try:
+            if self.model not in ("DS3231", "PCF8563"):
+                return format_history_time(None)
+            is_ds = self.model == "DS3231"
+            data = self.i2c.readfrom_mem(self.addr, 0x00 if is_ds else 0x02, 7)
+            minute = self._decode_bcd(data[1], 0x7F, 0, 59)
+            if is_ds and data[2] & 0x40:
+                hour = self._decode_bcd(data[2], 0x1F, 1, 12)
+                if hour is not None:
+                    hour = hour % 12 + (12 if data[2] & 0x20 else 0)
+            else:
+                hour = self._decode_bcd(data[2], 0x3F, 0, 23)
+            day = self._decode_bcd(data[4 if is_ds else 3], 0x3F, 1, 31)
+            month = self._decode_bcd(data[5], 0x1F, 1, 12)
+            year = self._decode_bcd(data[6], 0xFF, 0, 99)
+            if None in (hour, minute, day, month, year):
+                return format_history_time(None)
+            return f"20{year:02}-{month:02}-{day:02} {hour:02}:{minute:02}"
+        except Exception:
+            return format_history_time(None)
 
     def get_date(self):
         """Return (year, month, day), where year is the two-digit 20xx year."""

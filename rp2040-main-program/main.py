@@ -18,7 +18,7 @@ from history_store import (
     storage_write_due,
 )
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
-from rtc_ds3231 import DS3231
+from rtc_ds3231 import DS3231, format_history_time
 from boot_post import SystemPOST
 from wireless_portal import WirelessPortal, AP_SSID
 
@@ -57,7 +57,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.3-W"
+Program_ver = "5.4-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -921,7 +921,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False,
     if is_history:
         if is_partial: tft.fill_rect(0, 30, 320, 16, bg_color) 
         page_name = "EXT ONLY" if record_type == "extended_only" else "HISTORY"
-        header = f"{page_name} [{hist_idx+1}/{total_count}]  {hist_time}"
+        header = f"{page_name} [{hist_idx+1}/{total_count}]  {format_history_time(hist_time)}"
         tft.draw_gbk(header.encode(), 5, 30, YELLOW, bg_color, scale=1)
         y_offset = 20
     else: y_offset = 0
@@ -1253,7 +1253,7 @@ def process_ui_data(data):
                 
             received_at = rtc.get_time_str(True)
             received_record = {"t": received_at, "d": data}
-            compact_record = make_history_record(received_at, data)
+            compact_record = make_history_record(rtc.get_history_time_str(), data)
             if compact_record is not None:
                 queue_history(compact_record)
             queue_sd_log(received_record)
