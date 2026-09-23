@@ -4,6 +4,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "pico_updater.py"
@@ -35,12 +36,104 @@ WIRELESS_RUNTIME_FILES = (
 )
 
 
+class EmbeddedInspectionTests(unittest.TestCase):
+    def test_active_inspection_cannot_be_dismissed(self):
+        app=SimpleNamespace(inspection_window=mock.Mock(finished=False))
+        updater.PicoUpdaterApp.dismiss_inspection(app)
+        app.inspection_window.destroy.assert_not_called()
+
+    def test_finished_inspection_restores_log_and_main_layout(self):
+        panel=mock.Mock(finished=True)
+        app=SimpleNamespace(inspection_window=panel,log_textbox=mock.Mock(),
+            inspection_summary=mock.Mock(),inspection_progress=mock.Mock(),clear_log_btn=mock.Mock())
+        updater.PicoUpdaterApp.dismiss_inspection(app)
+        panel.destroy.assert_called_once()
+        self.assertIsNone(app.inspection_window)
+        for widget in (app.log_textbox,app.inspection_summary,app.inspection_progress,app.clear_log_btn):
+            widget.grid.assert_called_once()
+
+
 class DummyWidget:
     def __init__(self):
         self.options = {}
 
     def configure(self, **kwargs):
         self.options.update(kwargs)
+
+
+class PortSafetyTests(unittest.TestCase):
+    def app(self):
+        app = updater.PicoUpdaterApp.__new__(updater.PicoUpdaterApp)
+        app.is_working = False
+        value = ["请选择端口..."]
+        app.port_var = SimpleNamespace(get=lambda:value[0], set=lambda v:value.__setitem__(0,v))
+        for name in ("port_menu","connection_value","device_status","action_btn",
+                     "force_action_btn","offline_zip_btn","test_btn"):
+            setattr(app,name,DummyWidget())
+        app._reset_selected_device_state = mock.Mock()
+        app.log = mock.Mock()
+        return app
+
+    def test_other_ports_are_not_selected_automatically(self):
+        app=self.app()
+        ports=[SimpleNamespace(device="/dev/cu.Bluetooth",vid=None)]
+        with mock.patch.object(updater.serial.tools.list_ports,"comports",return_value=ports):
+            app.refresh_ports()
+        self.assertEqual(app.port_var.get(),"请选择端口...")
+        self.assertEqual(app.connection_value.options["text"],"未检测到 Pico")
+        for name in ("action_btn","force_action_btn","offline_zip_btn","test_btn"):
+            self.assertEqual(getattr(app,name).options["state"],"disabled")
+
+    def test_empty_port_list_disables_actions(self):
+        app=self.app()
+        with mock.patch.object(updater.serial.tools.list_ports,"comports",return_value=[]):
+            app.refresh_ports()
+        self.assertEqual(app.port_var.get(),"未检测到设备")
+        self.assertEqual(app.action_btn.options["state"],"disabled")
+
+    def test_pico_is_selected_instead_of_first_non_pico(self):
+        app=self.app()
+        ports=[SimpleNamespace(device="other",vid=None),SimpleNamespace(device="pico",vid=0x2E8A)]
+        with mock.patch.object(updater.serial.tools.list_ports,"comports",return_value=ports):
+            app.refresh_ports()
+            self.assertTrue(app._confirm_selected_port("在线更新"))
+        self.assertEqual(app.port_var.get(),"pico")
+        self.assertEqual(app.action_btn.options["state"],"normal")
+
+    def test_unknown_manual_port_requires_explicit_confirmation(self):
+        app=self.app();app.port_var.set("other")
+        ports=[SimpleNamespace(device="other",vid=None,description="Bluetooth")]
+        with mock.patch.object(updater.serial.tools.list_ports,"comports",return_value=ports), mock.patch.object(updater.messagebox,"askyesno",return_value=False) as prompt:
+            self.assertFalse(app._confirm_selected_port("刷入"))
+            self.assertEqual(prompt.call_args.kwargs["default"],"no")
+            prompt.return_value=True
+            self.assertTrue(app._confirm_selected_port("刷入"))
+
+    def test_disconnected_port_cannot_start(self):
+        app=self.app();app.port_var.set("pico")
+        with mock.patch.object(updater.serial.tools.list_ports,"comports",return_value=[]),mock.patch.object(updater.messagebox,"showwarning") as warn:
+            self.assertFalse(app._confirm_selected_port("刷入"))
+            warn.assert_called_once()
+        self.assertEqual(app.action_btn.options["state"],"disabled")
+
+    def test_placeholder_blocks_before_serial_enumeration(self):
+        app=self.app()
+        with mock.patch.object(updater.serial.tools.list_ports,"comports") as ports,mock.patch.object(updater.messagebox,"showwarning"):
+            self.assertFalse(app._confirm_selected_port("刷入"))
+            ports.assert_not_called()
+
+    def test_every_entry_gate_runs_before_worker_or_file_dialog(self):
+        for name,kwargs in (("start_update_process",{}),("start_update_process",{"force":True}),("start_offline_zip_update",{}),("start_hardware_test",{})):
+            app=self.app();app._confirm_selected_port=mock.Mock(return_value=False)
+            with mock.patch.object(updater.threading,"Thread") as thread,mock.patch.object(updater.filedialog,"askopenfilename") as dialog:
+                getattr(app,name)(**kwargs)
+                app._confirm_selected_port.assert_called_once()
+                thread.assert_not_called();dialog.assert_not_called()
+
+    def test_working_state_never_enables_selected_port_actions(self):
+        app=self.app();app.port_var.set("pico");app.is_working=True
+        app._sync_port_actions()
+        self.assertEqual(app.action_btn.options["state"],"disabled")
 
 
 def profile_for(label):

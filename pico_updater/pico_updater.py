@@ -795,6 +795,10 @@ class PicoUpdaterApp(ctk.CTk):
         console_panel.grid(row=3, column=0, sticky="nsew")
         console_panel.grid_columnconfigure(0, weight=1)
         console_panel.grid_rowconfigure(1, weight=1)
+        self.console_panel = console_panel
+        self.inspection_summary = summary
+        self.inspection_progress = progress_panel
+        self.inspection_window = None
 
         console_header = ctk.CTkFrame(console_panel, fg_color="transparent")
         console_header.grid(row=0, column=0, sticky="ew", padx=16)
@@ -929,16 +933,55 @@ class PicoUpdaterApp(ctk.CTk):
 
     def _on_port_selected(self, port):
         self._reset_selected_device_state()
+        self._sync_port_actions()
         if port in ("未检测到设备", "请选择端口..."):
             self.connection_value.configure(text="未连接")
             self.device_status.configure(
                 text="未检测到可用设备", text_color=COLORS["muted"]
             )
             return
-        self.connection_value.configure(text="已选择")
+        known = port in getattr(self, "pico_candidate_ports", set())
+        self.connection_value.configure(text="Pico 串口已选择" if known else "未识别的串口")
         self.device_status.configure(
-            text=port, text_color=COLORS["teal"]
+            text=port if known else "非自动识别 Pico：" + port,
+            text_color=COLORS["teal"] if known else COLORS["amber"]
         )
+
+    def _sync_port_actions(self):
+        selected = self.port_var.get()
+        enabled = not self.is_working and selected not in (
+            "", "未检测到设备", "请选择端口..."
+        )
+        for widget in (self.action_btn, self.force_action_btn,
+                       self.offline_zip_btn, self.test_btn):
+            widget.configure(state="normal" if enabled else "disabled")
+
+    def _confirm_selected_port(self, action):
+        """Re-enumerate immediately before starting, before touching any serial port."""
+        port = self.port_var.get()
+        if not port or port in ("未检测到设备", "请选择端口..."):
+            messagebox.showwarning("未选择 Pico", "未检测到或尚未选择 Pico。请连接设备后扫描，不会开始" + action + "。")
+            return False
+        try:
+            device = next((p for p in serial.tools.list_ports.comports()
+                           if p.device == port), None)
+        except Exception as exc:
+            messagebox.showwarning("无法检查串口", str(exc))
+            return False
+        if device is None:
+            self.refresh_ports()
+            messagebox.showwarning("设备已断开", "所选串口已不存在，请重新连接并扫描。不会自动改用其他串口执行操作。")
+            return False
+        if device.vid != 0x2E8A:
+            return messagebox.askyesno(
+                "所选串口未识别为 Pico",
+                f"串口：{port}\n设备描述：{device.description or '未知'}\n\n"
+                "这可能是蓝牙或其他设备，不应当作 Pico 使用。\n"
+                "只有确认它确实连接你的接收器时才继续。继续会尝试连接并可能软复位设备；"
+                "刷入前仍必须通过硬件兼容检查。\n\n是否确认使用这个串口？",
+                default="no",
+            )
+        return True
 
     def log(self, text):
         self.after(0, self._append_log, text)
@@ -950,6 +993,10 @@ class PicoUpdaterApp(ctk.CTk):
         self.log_textbox.configure(state="disabled")
 
     def set_ui_state(self, working):
+        if working:
+            panel = getattr(self, "inspection_window", None)
+            if panel is not None and panel.finished:
+                self.dismiss_inspection()
         self.is_working = working
         state = "disabled" if working else "normal"
         self.action_btn.configure(
@@ -972,6 +1019,7 @@ class PicoUpdaterApp(ctk.CTk):
             text="运行中" if working else "就绪",
             text_color=COLORS["amber"] if working else COLORS["green"],
         )
+        self._sync_port_actions()
 
     def _on_close(self):
         if self.is_working:
@@ -988,6 +1036,7 @@ class PicoUpdaterApp(ctk.CTk):
         PICO_VID = 0x2E8A
         ports = serial.tools.list_ports.comports()
         port_list = [port.device for port in ports]
+        self.pico_candidate_ports = {port.device for port in ports if port.vid == PICO_VID}
         
         auto_detected_port = None
 
@@ -1016,12 +1065,14 @@ class PicoUpdaterApp(ctk.CTk):
                 )
                 self.log(f"已自动识别并选中 Pico 设备: {auto_detected_port}")
             else:
-                self.port_var.set(port_list[0])
-                self.connection_value.configure(text="串口已选择")
+                self.port_menu.configure(values=["请选择端口..."] + port_list)
+                self.port_var.set("请选择端口...")
+                self.connection_value.configure(text="未检测到 Pico")
                 self.device_status.configure(
-                    text=port_list[0], text_color=COLORS["amber"]
+                    text="未发现 Pico，请连接后扫描", text_color=COLORS["amber"]
                 )
-                self.log("已刷新串口列表，但未发现标准 Pico 设备，请手动确认。")
+                self.log("未检测到 Pico：不会默认使用蓝牙或其他串口，刷入按钮已禁用。")
+        self._sync_port_actions()
 
     # [改进版] 支持实时流式输出的 run_mpremote
     def run_mpremote(self, port, args_list, timeout_sec=60, live_stream=False):
@@ -1369,7 +1420,21 @@ class PicoUpdaterApp(ctk.CTk):
         return True
     
     # ================= 硬件自检逻辑 =================
+    def dismiss_inspection(self):
+        panel = self.inspection_window
+        if panel is not None:
+            if not panel.finished:
+                return
+            panel.destroy()
+            self.inspection_window = None
+        self.log_textbox.grid()
+        self.inspection_summary.grid()
+        self.inspection_progress.grid()
+        self.clear_log_btn.grid()
+
     def start_hardware_test(self):
+        if self.is_working: return
+        if not self._confirm_selected_port("硬件检查"): return
         port = self.port_var.get()
         if not port or port == "未检测到设备" or port == "请选择端口...":
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
@@ -1377,10 +1442,22 @@ class PicoUpdaterApp(ctk.CTk):
             
         if self.is_working: return
         self.set_ui_state(True)
-        self.clear_log()
-        self.set_progress(0, "硬件自检")
-        
-        threading.Thread(target=self._test_worker, args=(port,), daemon=True).start()
+        try:
+            from solder_check import InspectionWindow
+            self.inspection_window = InspectionWindow(
+                self, port, HARDWARE_TEST_SCRIPT, master=self.console_panel)
+            self.log_textbox.grid_remove()
+            self.inspection_summary.grid_remove()
+            self.inspection_progress.grid_remove()
+            self.clear_log_btn.grid_remove()
+            self.inspection_window.grid(row=1, column=0, sticky="nsew", padx=1, pady=1)
+        except Exception as exc:
+            self.set_ui_state(False)
+            self.log_textbox.grid()
+            self.inspection_summary.grid()
+            self.inspection_progress.grid()
+            self.clear_log_btn.grid()
+            messagebox.showerror("无法打开检查单", str(exc))
 
     def _test_worker(self, port):
         try:
@@ -1419,6 +1496,8 @@ class PicoUpdaterApp(ctk.CTk):
     # ================= 固件更新逻辑 =================
     def start_offline_zip_update(self):
         if self.is_working:
+            return
+        if not self._confirm_selected_port("离线刷入"):
             return
 
         port = self.port_var.get()
@@ -1644,6 +1723,10 @@ class PicoUpdaterApp(ctk.CTk):
             self.after(0, self.set_ui_state, False)
 
     def start_update_process(self, force=False):
+        if self.is_working:
+            return
+        if not self._confirm_selected_port("强制刷入" if force else "在线更新"):
+            return
         port = self.port_var.get()
         if not port or port == "未检测到设备" or port == "请选择端口...":
             messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")

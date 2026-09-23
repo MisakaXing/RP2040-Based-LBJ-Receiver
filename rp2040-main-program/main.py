@@ -32,7 +32,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = 5.4
+Program_ver = 5.5
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -121,6 +121,9 @@ def safe_fill_rect(x, y, w, h, color):
     tft.fill_rect(x, y, w, h, color)
 
 LOCO_NAME_GBK = {
+    "轨道探伤车": b"\xb9\xec\xb5\xc0\xcc\xbd\xc9\xcb\xb3\xb5",
+    "起重轨道车": b"\xc6\xf0\xd6\xd8\xb9\xec\xb5\xc0\xb3\xb5",
+    "轨道打磨车": b"\xb9\xec\xb5\xc0\xb4\xf2\xc4\xa5\xb3\xb5",
     "解放": b"\xbd\xe2\xb7\xc5",
     "前进": b"\xc7\xb0\xbd\xf8",
     "建设": b"\xbd\xa8\xc9\xe8",
@@ -197,8 +200,9 @@ has_received = False
 menu_index = 0
 
 cfg_scr_idx = 3 
-SCR_OFF_OPTS = ["30s", "1min", "5min", "never"]
-SCR_OFF_MS = [30000, 60000, 300000, -1]
+SCR_OFF_OPTS = ["30s", "1min", "5min", "never", "on demand"]
+SCR_OFF_MS = [30000, 60000, 300000, -1, -1]
+SCR_OFF_ON_DEMAND_INDEX = 4
 cfg_buzzer = True
 cfg_ppm_offset = 6.0
 cfg_ppm_calibrated = False
@@ -284,6 +288,31 @@ def get_battery_info():
     percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
     return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
 
+def set_screen_power(enabled):
+    """Keep the active-low backlight and software state in sync."""
+    global screen_is_on
+    screen_is_on = bool(enabled)
+    pin_bl.value(0 if screen_is_on else 1)
+
+def handle_screen_button_event(wake_event):
+    if cfg_scr_idx == SCR_OFF_ON_DEMAND_INDEX:
+        if wake_event:
+            set_screen_power(not screen_is_on)
+            print("SCREEN_POWER", "ON" if screen_is_on else "OFF")
+            beep()
+            return True
+        # Manual-off blocks navigation without waking or changing menus.
+        return not screen_is_on
+    if not screen_is_on:
+        set_screen_power(True)
+        beep()
+        return True
+    return False
+
+def wake_screen_for_train():
+    if not screen_is_on and cfg_scr_idx != SCR_OFF_ON_DEMAND_INDEX:
+        set_screen_power(True)
+
 def _read_config_dict():
     try:
         with open(CONFIG_FILE, 'r') as f:
@@ -296,7 +325,11 @@ def load_config():
     try:
         config = _read_config_dict()
         cfg_buzzer = config.get("buzzer", True)
-        cfg_scr_idx = config.get("scr_idx", 3)
+        try:
+            loaded_scr_idx = int(config.get("scr_idx", 3))
+        except (TypeError, ValueError):
+            loaded_scr_idx = 3
+        cfg_scr_idx = loaded_scr_idx if 0 <= loaded_scr_idx < len(SCR_OFF_OPTS) else 3
         ppm_value = float(config.get("ppm_offset", 6.0))
         ppm_valid = -25.0 <= ppm_value <= 25.0
         ppm_version_ok = config.get("ppm_calibration_version", 0) == PPM_CALIBRATION_VERSION
@@ -764,9 +797,7 @@ def process_ui_data(data):
                 
             has_received = True
             
-            if not screen_is_on:
-                pin_bl.value(0)
-                screen_is_on = True
+            wake_screen_for_train()
             last_interaction = time.ticks_ms()
             
             if "rssi" in data:
@@ -853,10 +884,10 @@ while True:
               "mem_free=", gc.mem_free())
         last_radio_health_log = now
 
-    if screen_is_on and cfg_scr_idx != 3: 
-        if time.ticks_diff(now, last_interaction) > SCR_OFF_MS[cfg_scr_idx]:
-            pin_bl.value(1) 
-            screen_is_on = False
+    screen_timeout_ms = SCR_OFF_MS[cfg_scr_idx]
+    if screen_is_on and screen_timeout_ms >= 0:
+        if time.ticks_diff(now, last_interaction) > screen_timeout_ms:
+            set_screen_power(False)
             
     if need_post_train_gc and time.ticks_diff(now, last_interaction) > 1000:
         gc.collect()
@@ -918,11 +949,8 @@ while True:
 
     if any_button_event:
         last_interaction = now
-        if not screen_is_on:
-            pin_bl.value(0) 
-            screen_is_on = True
-            beep()
-            continue 
+        if handle_screen_button_event(wake_event):
+            continue
 
     if wake_event:
         beep()
@@ -1024,7 +1052,7 @@ while True:
                 else: draw_idle_screen()
             elif menu_index == 6: system_state = "ABOUT"; draw_about()
             elif menu_index == 7: 
-                cfg_scr_idx = (cfg_scr_idx + 1) % 4
+                cfg_scr_idx = (cfg_scr_idx + 1) % len(SCR_OFF_OPTS)
                 menu_items[7] = f"SCREEN OFF AFTER: {SCR_OFF_OPTS[cfg_scr_idx]}"
                 save_config(); draw_menu_item(7, True)
                 
