@@ -57,7 +57,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.5-W"
+Program_ver = "5.6-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -191,6 +191,9 @@ def safe_fill_rect(x, y, w, h, color):
     tft.fill_rect(x, y, w, h, color)
 
 LOCO_NAME_GBK = {
+    "轨道探伤车": b"\xb9\xec\xb5\xc0\xcc\xbd\xc9\xcb\xb3\xb5",
+    "起重轨道车": b"\xc6\xf0\xd6\xd8\xb9\xec\xb5\xc0\xb3\xb5",
+    "轨道打磨车": b"\xb9\xec\xb5\xc0\xb4\xf2\xc4\xa5\xb3\xb5",
     "解放": b"\xbd\xe2\xb7\xc5",
     "前进": b"\xc7\xb0\xbd\xf8",
     "建设": b"\xbd\xa8\xc9\xe8",
