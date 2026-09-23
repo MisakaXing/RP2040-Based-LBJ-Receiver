@@ -57,7 +57,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.6-W"
+Program_ver = "5.7-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -910,6 +910,25 @@ def draw_idle_screen():
     safe_fill_rect(0, 26, 320, 164, BLACK) 
     tft.draw_gbk(b'WAITING FOR SIGNAL', 15, 95, GRAY, BLACK, scale=2)
 
+def draw_km_post(km, x, y, preferred_scale, row_height, bg_color, spaced=False):
+    """Fit the entire kilometre marker into the remaining LCD row."""
+    value = str(km)
+    if (not spaced and preferred_scale == 2 and len(value) == 6
+            and value[:4].isdigit() and value[4] == '.'
+            and value[5].isdigit()):
+        # Preserve large digits with 14 px pitch and a smaller K at the end.
+        for index, char in enumerate(value):
+            tft.draw_gbk(char.encode(), x + index * 14, y,
+                         GREEN, bg_color, scale=2)
+        tft.draw_gbk(b'K', x + 88, y + 16, GREEN, bg_color, scale=1)
+        return
+    label = (value + (' K' if spaced else 'K')).encode()
+    scale = preferred_scale
+    while scale > 1 and x + len(label) * 8 * scale > 320:
+        scale -= 1
+    tft.draw_gbk(label, x, y + (row_height - 16 * scale) // 2,
+                 GREEN, bg_color, scale=scale)
+
 def display_train_data(basic, ext, is_full_mode=True, is_history=False,
                        hist_time="", hist_idx=0, record_type=""):
     global last_screen_layout
@@ -955,7 +974,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False,
 
         tft.draw_gbk(full_train.encode(), 20+lbl_w, y_start, CYAN, bg_color, scale=sc)
         tft.draw_gbk(speed.encode() + b' K/H', 20+lbl_w, y_start+y_step, YELLOW, bg_color, scale=sc)
-        tft.draw_gbk(km.encode() + b' K', 20+lbl_w, y_start+y_step*2, GREEN, bg_color, scale=sc)
+        draw_km_post(km, 20+lbl_w, y_start+y_step*2, sc, h, bg_color, spaced=True)
 
     else:
         y1 = 35 + y_offset
@@ -991,7 +1010,7 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False,
             direction = b'--'
         tft.draw_gbk(direction, 180, y2, MAGENTA, bg_color, scale=2)
 
-        tft.draw_gbk(km.encode() + b'K', 220, y2, GREEN, bg_color, scale=2)
+        draw_km_post(km, 220, y2, 2, 32, bg_color)
 
         loco = str(ext.get('loco_type', '----'))
         cab = str(ext.get('cab_end', ''))
