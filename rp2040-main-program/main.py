@@ -32,7 +32,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = 5.6
+Program_ver = 5.7
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -56,6 +56,7 @@ screen_is_on = True
 last_battery_v = None
 last_battery_p = None
 last_temp_str = None
+last_vbus_display = None
 
 # 1. 硬件 IO 初始化
 
@@ -67,6 +68,7 @@ spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
 bat_adc = ADC(Pin(27)) 
+vbus_sense = Pin(24, Pin.IN)
 buzzer = Pin(22, Pin.OUT, value=0)
 
 i2c0 = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
@@ -511,13 +513,14 @@ def update_top_bar():
 
 def draw_hardware_bar(force=False):
     global last_hw_update, last_rssi_str, hist_rssi_str, system_state
-    global last_battery_v, last_battery_p, last_temp_str
+    global last_battery_v, last_battery_p, last_temp_str, last_vbus_display
     now = time.ticks_ms()
+    usb_powered = bool(vbus_sense.value())
     sample_due = (
         last_battery_v is None
         or time.ticks_diff(now, last_hw_update) >= 30000
     )
-    if not force and not sample_due:
+    if not force and not sample_due and usb_powered == last_vbus_display:
         return
 
     if sample_due:
@@ -538,8 +541,12 @@ def draw_hardware_bar(force=False):
     raw_p = int(p.replace('%', ''))
     bat_color = RED if raw_p < 20 else WHITE
     
-    tft.fill_rect(45, 218, 70, 16, BLACK)
-    tft.draw_gbk(f"{v} {p}".encode(), 45, 218, bat_color, BLACK) 
+    # CHRG is four characters; clear up to, but not over, the RSSI label.
+    tft.fill_rect(45, 218, 75, 16, BLACK)
+    tft.draw_gbk(v.encode(), 45, 218, WHITE if usb_powered else bat_color, BLACK)
+    tft.draw_gbk(b'CHRG' if usb_powered else p.encode(), 85, 218,
+                 GREEN if usb_powered else bat_color, BLACK)
+    last_vbus_display = usb_powered
     
     tft.fill_rect(170, 218, 70, 16, BLACK)
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
@@ -655,11 +662,10 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
         elif cab == '32': loco += 'B'
         tft.draw_gbk(encode_loco_gbk(loco), 53, y3, WHITE, bg_color, scale=2)
 
-    if not is_history: 
-        lon = ext.get('lon', '---').replace('°', ' ')
-        lat = ext.get('lat', '---').replace('°', ' ')
-        tft.fill_rect(0, 192, 320, 18, BLACK) 
-        tft.draw_gbk(b'GPS: ' + lon.encode() + b' / ' + lat.encode(), 5, 195, GRAY, BLACK, scale=1)
+    lon = str(ext.get('lon') or '---').replace('°', ' ')
+    lat = str(ext.get('lat') or '---').replace('°', ' ')
+    tft.fill_rect(0, 192, 320, 18, BLACK)
+    tft.draw_gbk(b'GPS: ' + lon.encode() + b' / ' + lat.encode(), 5, 195, GRAY, BLACK, scale=1)
         
     last_screen_layout = current_layout
 
@@ -952,8 +958,8 @@ while True:
                 current_sd_status = "NO SD CARD"
                 update_top_bar() 
                 
-            if not has_received: 
-                draw_hardware_bar(force=False) 
+        if screen_is_on and system_state in ("DASHBOARD", "HISTORY"):
+            draw_hardware_bar(force=False)
         last_sec = now
 
     if system_state == "HISTORY" and time.ticks_diff(now, last_interaction) > 20000:
