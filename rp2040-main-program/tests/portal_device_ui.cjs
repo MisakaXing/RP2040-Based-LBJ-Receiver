@@ -50,6 +50,15 @@ process.stdin.on('end', async () => {
     assert.equal(el('battery').textContent, '---');
     assert.equal(el('temperature').textContent, '---');
     assert.equal(announcements, 2); // No new-train alert for unchanged ID.
+    const charging = snapshot(2, null, 30);
+    Object.assign(charging.device, {usb_power: true, battery_voltage: 3.44});
+    push(charging);
+    assert.equal(el('battery').textContent, 'CHRG');
+    assert.ok(el('batteryCard').classList.contains('charging'));
+    assert.ok(!el('batteryCard').classList.contains('danger'));
+    assert.match(el('batteryNote').textContent, /3.44 V/);
+    push(snapshot(2, null, null));
+    assert.ok(!el('batteryCard').classList.contains('charging'));
     push(snapshot(1, 1, 80)); // An older response must not restore warnings.
     assert.equal(el('battery').textContent, '---');
     eventSource.readyState = 2; eventSource.onerror();
@@ -62,6 +71,13 @@ process.stdin.on('end', async () => {
     assert.equal(el('temperature').textContent, '50.0°C');
     assert.ok(el('tempCard').classList.contains('danger'));
     assert.equal(announcements, 3);
+    nextPoll = snapshot(3, null, 30);
+    Object.assign(nextPoll.device, {usb_power: true, battery_voltage: 4.1});
+    vm.runInContext('fallbackPoll()', context);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(el('battery').textContent, 'CHRG');
+    assert.ok(el('batteryCard').classList.contains('charging'));
+    assert.match(el('batteryNote').textContent, /4.10 V/);
     console.log('PASS: thresholds, recovery, unknown, stale response, shared SSE/polling');
   } catch (error) { console.error(error); process.exitCode = 1; }
 });

@@ -139,6 +139,15 @@ class ErrorSocket:
 
 
 class WirelessPortalTests(unittest.TestCase):
+    def test_ap_always_requests_full_firmware_power_on_restart(self):
+        portal = NoSocketPortal("test-password", network_module=FakeNetwork)
+        for _ in range(2):
+            self.assertTrue(portal.set_enabled(True))
+            self.assertEqual(portal._ap.config_values["txpower"], 31)
+            self.assertEqual(portal.get_status()["txpower_dbm"], 31)
+            portal.set_enabled(False)
+        self.assertFalse(hasattr(portal, "set_txpower"))
+
     def test_dns_a_wildcard_response(self):
         response = _dns_response(dns_query("example.com"))
         self.assertIsNotNone(response)
@@ -223,7 +232,14 @@ class WirelessPortalTests(unittest.TestCase):
         self.assertNotIn("接入地址".encode(), response)
         self.assertNotIn("若页面未自动打开".encode(), response)
         self.assertNotIn(b"192.168.4.1", response)
-        self.assertIn(b'class="cell wide"', response)
+        self.assertIn(b'class=train-line', response)
+        self.assertIn(b'class=loco-chip id=loco', response)
+        self.assertLess(response.index(b'id=train>'), response.index(b'id=loco>'))
+        self.assertLess(response.index(b'id=loco>'), response.index(b'id=speed>'))
+        self.assertLess(response.index(b'id=tempCard>'), response.index(b'id=location '))
+        self.assertLess(response.index(b'id=location '), response.index(b'id=soundBtn '))
+        self.assertLess(response.index(b'id=soundBtn '), response.index(b'id=notice '))
+        self.assertNotIn(b'<footer>', response)
         self.assertNotIn(b"id=lon>", response)
         self.assertNotIn(b"id=lat>", response)
         self.assertNotIn(b"class=plot", response)

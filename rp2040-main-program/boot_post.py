@@ -2,6 +2,13 @@ import time
 import machine
 import sdcard
 
+BATTERY_ADC_GAIN = 1.04
+BATTERY_EMPTY_V = 3.45
+
+def battery_voltage_from_raw(raw):
+    """Apply the measured W-board ADC gain correction to its 1:1 divider."""
+    return (raw / 65535.0) * 3.3 * 2.0 * BATTERY_ADC_GAIN
+
 class SystemPOST:
     BLACK = 0x0000
     PANEL = 0x1082
@@ -22,6 +29,7 @@ class SystemPOST:
         self.has_critical_error = False
         self.rtc_error = False 
         self.wifi_ok = False
+        self.low_battery = False
         self.sd_obj = None
         self.current_label = ""
         self.tft.fill(self.BLACK)
@@ -88,11 +96,17 @@ class SystemPOST:
     # 电池电压三段式检查
     def check_bat(self, bat_adc, bat_en):
         self._check_start("BATTERY")
-        bat_en.value(0); time.sleep_ms(10); raw = bat_adc.read_u16(); bat_en.value(1)
-        volts = (raw / 65535.0) * 3.3 * 2 + 0.174
-        if volts < 3.5:
-            self._check_end("ERR", f"{volts:.2f}V (CRITICAL)")
-        elif volts < 3.7:
+        bat_en.value(0)
+        try:
+            time.sleep_ms(10)
+            raw = bat_adc.read_u16()
+        finally:
+            bat_en.value(1)
+        volts = battery_voltage_from_raw(raw)
+        self.low_battery = volts <= BATTERY_EMPTY_V
+        if volts <= BATTERY_EMPTY_V:
+            self._check_end("WARN_RED", f"{volts:.2f}V (EMPTY)")
+        elif volts < 3.9:
             self._check_end("WARN", f"{volts:.2f}V (LOW)")
         else:
             self._check_end("OK", f"{volts:.2f}V (Good)")
@@ -133,16 +147,21 @@ class SystemPOST:
         finally: spi1.init(baudrate=40000000)
             
     def run_all(self, bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, p_ver, is_es, wifi_portal):
-        self.check_sys_ver(p_ver, is_es) 
+        self.check_sys_ver(p_ver, is_es)
         radio_ok = self.check_sx1276()
         self.check_wifi(wifi_portal)
-        self.check_bat(bat_adc, bat_en) # 运行电池检查
         self.check_temp(sensor_temp)
         self.check_rtc(rtc)
         self.check_sd(spi1, sd_cs)
+        self.check_bat(bat_adc, bat_en)
         
         footer_y = 218
-        # 如果是电压过低或无线电损坏，强制停机
+        if self.low_battery:
+            self.tft.fill_rect(0, footer_y, 320, 22, self.RED)
+            self.tft.draw_gbk(b'LOW BATTERY - POWER OFF', 55, footer_y + 3, self.WHITE, self.RED)
+            time.sleep(1)
+            return "LOW_BATTERY"
+        # Radio failure still halts POST when the supply is healthy.
         if not radio_ok or self.has_critical_error:
             msg = b'SYSTEM HALTED - RADIO DEAD' if not radio_ok else b'SYSTEM HALTED - LOW POWER'
             self.tft.fill_rect(0, footer_y, 320, 22, self.RED)

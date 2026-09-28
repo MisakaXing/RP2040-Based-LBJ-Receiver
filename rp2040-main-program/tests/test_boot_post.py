@@ -2,6 +2,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -71,6 +72,53 @@ class NonHardwarePOST(SystemPOST):
 
 
 class BootPostTests(unittest.TestCase):
+    def test_post_empty_threshold_is_3_45v(self):
+        for voltage, empty in ((3.44, True), (3.46, False)):
+            raw = round(voltage / (6.6 * boot_post.BATTERY_ADC_GAIN) * 65535)
+            post = SystemPOST(FakeTFT(), object())
+            post.check_bat(types.SimpleNamespace(read_u16=lambda: raw),
+                           types.SimpleNamespace(value=lambda _: None))
+            self.assertEqual(post.low_battery, empty)
+
+    def test_post_and_main_share_w_board_battery_calibration(self):
+        raw = 39737
+        self.assertAlmostEqual(boot_post.battery_voltage_from_raw(raw), 4.162, places=2)
+        post = SystemPOST(FakeTFT(), object())
+        adc = types.SimpleNamespace(read_u16=lambda: raw)
+        enable = types.SimpleNamespace(value=lambda _: None)
+        post.check_bat(adc, enable)
+        self.assertTrue(any(b"4.16V" in call[0] for call in post.tft.draws))
+
+    def test_empty_battery_waits_for_complete_checklist(self):
+        checks = []
+
+        class EmptyBatteryPOST(NonHardwarePOST):
+            def check_bat(self, bat_adc, bat_en):
+                checks.append("battery")
+                self.low_battery = True
+
+            def check_sx1276(self):
+                checks.append("radio")
+                return True
+
+            def check_wifi(self, portal):
+                checks.append("wifi")
+                self.wifi_ok = True
+                return True
+
+            def check_sd(self, spi1, sd_cs):
+                checks.append("sd")
+
+        post = EmptyBatteryPOST(FakeTFT(), object())
+        with patch.object(boot_post.time, "sleep", return_value=None):
+            result = post.run_all(
+                object(), object(), object(), object(), object(), object(),
+                FakeBuzzer(), "5.8-W", 0, PortalResult(True),
+            )
+        self.assertEqual(result, "LOW_BATTERY")
+        self.assertEqual(checks, ["radio", "wifi", "sd", "battery"])
+        self.assertTrue(any(call[0] == b"LOW BATTERY - POWER OFF" for call in post.tft.draws))
+
     def test_title_has_w_suffix(self):
         tft = FakeTFT()
         SystemPOST(tft, object())

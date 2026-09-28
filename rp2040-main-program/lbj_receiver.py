@@ -176,6 +176,12 @@ class LBJReceiver:
         self.last_fei_ppm = 0.0
         self.last_afc_hz = 0.0
         self.words_seen = 0
+        self.fifo_highwater = 0
+        self.fifo_full_hits = 0
+        self._last_tick_entry_ms = None
+        self.max_tick_gap_ms = 0
+        self.tick_gaps_over_200ms = 0
+        self.max_tick_us = 0
         self.sync_count = 0
         self.corrected_sync_words = 0
         self.soft_sync_locks = 0
@@ -515,6 +521,11 @@ class LBJReceiver:
             "synced": self.synced,
             "ppm": self.ppm_offset,
             "words": self.words_seen,
+            "fifo_highwater": self.fifo_highwater,
+            "fifo_full_hits": self.fifo_full_hits,
+            "max_tick_gap_ms": self.max_tick_gap_ms,
+            "tick_gaps_over_200ms": self.tick_gaps_over_200ms,
+            "max_tick_us": self.max_tick_us,
             "syncs": self.sync_count,
             "corrected_syncs": self.corrected_sync_words,
             "soft_sync_locks": self.soft_sync_locks,
@@ -1188,16 +1199,51 @@ class LBJReceiver:
 
     def tick(self):
         now = time.ticks_ms()
+        started_us = time.ticks_us()
+        sync_word = self.POCSAG_SYNC
+        if self._last_tick_entry_ms is not None:
+            tick_gap_ms = time.ticks_diff(now, self._last_tick_entry_ms)
+            if tick_gap_ms > self.max_tick_gap_ms:
+                self.max_tick_gap_ms = tick_gap_ms
+            if tick_gap_ms > 200:
+                self.tick_gaps_over_200ms = (
+                    self.tick_gaps_over_200ms + 1
+                ) & self.COUNTER_MASK
+        self._last_tick_entry_ms = now
 
-        while self.sm.rx_fifo() > 0:
+        # Bound each visit so a continuously clocked FIFO cannot keep this
+        # thread inside tick() indefinitely. The outer loop calls us again.
+        drained = 0
+        fifo_depth = self.sm.rx_fifo()
+        if fifo_depth > self.fifo_highwater:
+            self.fifo_highwater = fifo_depth
+        if fifo_depth >= 8:
+            self.fifo_full_hits = (self.fifo_full_hits + 1) & self.COUNTER_MASK
+        while drained < 8 and fifo_depth > 0:
             word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF
             self.words_seen = (self.words_seen + 1) & self.COUNTER_MASK
             self.last_word_time = now
+            drained += 1
+            fifo_depth = self.sm.rx_fifo()
             for i in range(31, -1, -1):
                 bit = (word >> i) & 1
                 if not self.synced:
                     self.sync_window = ((self.sync_window << 1) | bit) & 0xFFFFFFFF
-                    self._try_acquire_sync(now)
+                    difference = self.sync_window ^ sync_word
+                    if difference == 0:
+                        self._record_sync(now)
+                    else:
+                        difference &= difference - 1
+                        if difference:
+                            difference &= difference - 1
+                        if difference == 0:
+                            self.corrected_sync_words = (
+                                self.corrected_sync_words + 1
+                            ) & self.COUNTER_MASK
+                            self.soft_sync_locks = (
+                                self.soft_sync_locks + 1
+                            ) & self.COUNTER_MASK
+                            self._record_sync(now)
                 else:
                     self.current_cw = ((self.current_cw << 1) | bit) & 0xFFFFFFFF
                     self.bit_count += 1
@@ -1212,3 +1258,6 @@ class LBJReceiver:
             self._flush_pending_fragments(now)
             self.last_timeout_check = now
         self._service_radio_health(now)
+        elapsed_us = time.ticks_diff(time.ticks_us(), started_us)
+        if elapsed_us > self.max_tick_us:
+            self.max_tick_us = elapsed_us

@@ -229,6 +229,10 @@ def _sse_headers():
 
 
 class WirelessPortal:
+    # Request the full firmware-controlled power budget; the radio still
+    # enforces its board calibration and country limits (not 31 dBm RF output).
+    AP_TXPOWER_DBM = 31
+
     def __init__(self, password, ssid=AP_SSID, network_module=None):
         self.ssid = ssid
         self.password = str(password)
@@ -241,10 +245,14 @@ class WirelessPortal:
         self._latest_revision = 0
         self._battery_percent = None
         self._core_temp_c = None
+        self._usb_power = False
+        self._battery_voltage = None
         self._enabled = False
         self._last_error = ""
         self._ip = AP_IP
         self._health_at = 0
+        self.txpower_dbm = self.AP_TXPOWER_DBM
+        self._txpower_error = ""
 
     def is_enabled(self):
         return self._enabled
@@ -257,9 +265,9 @@ class WirelessPortal:
             self._latest_record = None
         self._latest_revision = (self._latest_revision + 1) & 0x7FFFFFFF
 
-    def set_device_status(self, battery_percent, core_temp_c):
-        # Cache only; set_latest() sends these values together with a train.
-        # HTTP fallback reads the same snapshot without sampling the ADC.
+    def set_device_status(self, battery_percent, core_temp_c, usb_power=False, battery_voltage=None):
+        # Regular telemetry follows trains; USB transitions refresh the same
+        # snapshot immediately. HTTP fallback never samples the ADC itself.
         try:
             battery_percent = float(battery_percent)
             battery_percent = int(battery_percent) if 0 <= battery_percent <= 100 else None
@@ -270,18 +278,31 @@ class WirelessPortal:
             core_temp_c = round(core_temp_c, 1) if -100 <= core_temp_c <= 200 else None
         except (TypeError, ValueError, OverflowError):
             core_temp_c = None
-        if (battery_percent == self._battery_percent
-                and core_temp_c == self._core_temp_c):
-            return
+        try:
+            battery_voltage = float(battery_voltage)
+            battery_voltage = round(battery_voltage, 2) if 0 <= battery_voltage <= 6 else None
+        except (TypeError, ValueError, OverflowError):
+            battery_voltage = None
+        usb_changed = self._usb_power != bool(usb_power)
+        self._usb_power = bool(usb_power)
+        self._battery_voltage = battery_voltage
         self._battery_percent = battery_percent
         self._core_temp_c = core_temp_c
+        if usb_changed:
+            # Refresh charging immediately without changing the train ID or
+            # triggering the page's new-train sound/flash notification.
+            for state in self._clients:
+                if state[CLIENT_MODE] == MODE_SSE:
+                    state[CLIENT_REVISION] = -1
 
     def _device_view(self):
         battery, temp = self._battery_percent, self._core_temp_c
         return {
-            "battery_percent": battery,
+            "battery_percent": None if self._usb_power else battery,
+            "usb_power": self._usb_power,
+            "battery_voltage": self._battery_voltage,
             "core_temp_c": temp,
-            "low_battery": battery is not None and battery < 20,
+            "low_battery": not self._usb_power and battery is not None and battery < 20,
             "high_temperature": temp is not None and temp > 45,
         }
 
@@ -292,6 +313,8 @@ class WirelessPortal:
             "ip": self._ip if self._enabled else "---",
             "clients": len(self._clients),
             "error": self._last_error,
+            "txpower_dbm": self.txpower_dbm,
+            "txpower_error": self._txpower_error,
         }
 
     def probe_hardware(self):
@@ -372,6 +395,15 @@ class WirelessPortal:
                 )
 
             self._ap.active(True)
+            try:
+                self._ap.config(txpower=self.txpower_dbm)
+                self._txpower_error = ""
+                print("WIFI_TXPOWER", self.txpower_dbm)
+            except Exception as exc:
+                # Leave the AP usable even if a firmware does not implement
+                # this optional CYW43 setting; report it in Wireless Setting.
+                self._txpower_error = str(exc)[:40]
+                print("WIFI_TXPOWER_ERR", repr(exc))
             deadline = _ticks_ms() + 2500
             while not self._ap.active() and _ticks_diff(deadline, _ticks_ms()) > 0:
                 _sleep_ms(25)
@@ -572,12 +604,13 @@ class WirelessPortal:
         battery, temp = device["battery_percent"], device["core_temp_c"]
         values = {
             "record_id": _html_escape(view["update_id"]),
-            "battery": "---" if battery is None else "%d%%" % battery,
+            "battery": "CHRG" if device["usb_power"] else ("---" if battery is None else "%d%%" % battery),
             "temperature": "---" if temp is None else "%.1f°C" % temp,
-            "battery_class": " danger" if device["low_battery"] else "",
+            "battery_class": " charging" if device["usb_power"] else (" danger" if device["low_battery"] else ""),
             "temp_class": " danger" if device["high_temperature"] else "",
-            "battery_note": "等待有效采样" if battery is None else (
-                "⚠ 低电量警告：低于 20%" if device["low_battery"] else "电量正常"),
+            "battery_note": (("" if device["battery_voltage"] is None else "%.2f V · " % device["battery_voltage"])
+                + ("USB 供电" if device["usb_power"] else ("等待有效采样" if battery is None else (
+                "⚠ 低电量警告：低于 20%" if device["low_battery"] else "电量正常")))),
             "temp_note": "等待有效采样" if temp is None else (
                 "⚠ 温度警告：高于 45°C" if device["high_temperature"] else "温度正常"),
             "state": _html_escape(state),
@@ -601,41 +634,39 @@ class WirelessPortal:
 <style>
 :root{--black:#000;--panel:#082033;--panel2:#102b40;--cyan:#29e7ff;--yellow:#ffe342;--green:#38ef82;--magenta:#ff58d0;--red:#ff4b55;--muted:#91a7b8;--white:#f3f8ff}
 *{box-sizing:border-box}body{margin:0;background:var(--black);color:var(--white);font-family:ui-monospace,SFMono-Regular,Menlo,"PingFang SC",sans-serif}
-header{background:#031927;border-bottom:3px solid var(--cyan);padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
-.logo{font-weight:900;letter-spacing:.08em}.logo b{color:var(--cyan)}.online{font-size:12px;color:var(--green);white-space:nowrap}.dot{display:inline-block;width:8px;height:8px;border-radius:50vw;background:var(--green);box-shadow:0 0 10px var(--green);margin-right:6px}
-main{max-width:620px;margin:auto;padding:15px}.strip{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px;margin:2px 1px 10px}.strip strong{color:var(--green)}
-.hero{position:relative;background:var(--panel);border:1px solid #24506b;border-left:5px solid var(--cyan);padding:16px;margin-bottom:11px;box-shadow:inset 0 0 28px #00131f}
-.eyebrow{font-size:12px;color:var(--muted);letter-spacing:.12em}.train{font-size:48px;line-height:1.1;color:var(--cyan);font-weight:900;margin:6px 0 14px;word-break:break-all;text-shadow:0 0 12px #00c8e866}
-.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px}.metric{background:#031927;border:1px solid #1d435a;padding:10px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;font-size:27px;margin-top:3px}.speed strong{color:var(--yellow)}.km strong{color:var(--green)}
-.route{display:grid;grid-template-columns:70px 1fr auto;align-items:center;gap:10px;background:var(--panel2);border:1px solid #24506b;padding:13px 15px;margin-bottom:11px}.route label{color:var(--muted)}.route strong{font-size:25px;color:var(--white);word-break:break-all}.direction{color:var(--magenta);font-weight:800}
-.location{background:var(--panel);border:1px solid #24506b;margin-bottom:11px}.loc-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid #1d435a}.loc-head span{color:var(--muted);font-size:12px;letter-spacing:.08em}.loc-head strong{color:var(--green);font-size:13px}.coordinate-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:14px}.coordinate{min-width:0;background:#031927;border:1px solid #1d435a;padding:12px}.coordinate span{display:block;color:var(--muted);font-size:11px}.coordinate strong{display:block;color:var(--cyan);font-size:18px;margin-top:6px;overflow-wrap:anywhere}
-.grid{display:grid;grid-template-columns:1fr 1fr;background:var(--panel);border:1px solid #23455c}.cell{min-width:0;padding:11px 13px;border-bottom:1px solid #1b3b50}.cell:nth-child(odd){border-right:1px solid #1b3b50}.cell.wide{grid-column:1/-1;border-right:0}.cell span{display:block;color:var(--muted);font-size:12px}.cell strong{display:block;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.device{margin-bottom:11px}.device .metrics{padding:12px}.device .metric{min-width:0}.device strong{color:var(--green)}.device small{display:block;color:var(--muted);font-size:11px;line-height:1.5;margin-top:6px}.device .danger{border-color:var(--red);background:#2a1017}.device .danger strong,.device .danger small{color:var(--red)}
-.controls{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:11px}.sound{appearance:none;border:1px solid var(--yellow);background:#241f05;color:var(--yellow);padding:11px 13px;font:inherit;font-weight:800}.sound.on{border-color:var(--green);background:#092817;color:var(--green)}
-.refresh{text-align:right;font-size:12px;color:var(--muted)}.refresh strong{display:block;color:var(--cyan);margin-bottom:3px}.notice{min-height:22px;color:var(--green);font-size:13px;margin-top:10px}
-footer{color:#718795;font-size:11px;line-height:1.55;margin-top:8px}.flash{animation:flash 1.2s ease}@keyframes flash{0%%{border-color:var(--yellow);box-shadow:0 0 30px #ffe34299}100%%{border-color:#24506b;box-shadow:inset 0 0 28px #00131f}}
-@media(max-width:430px){.train{font-size:40px}.metric strong{font-size:23px}.route{grid-template-columns:58px 1fr}.direction{grid-column:2}.coordinate-grid,.grid{grid-template-columns:1fr}.cell:nth-child(odd){border-right:0}.controls{align-items:stretch;flex-direction:column}.refresh{text-align:left}}
-</style></head>
+header{background:#031927;border-bottom:2px solid var(--cyan);padding:9px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.logo{font-weight:900;letter-spacing:.08em}.logo b{color:var(--cyan)}.online{font-size:11px;color:var(--green);white-space:nowrap}.dot{display:inline-block;width:7px;height:7px;border-radius:50vw;background:var(--green);box-shadow:0 0 8px var(--green);margin-right:5px}
+main{max-width:620px;margin:auto;padding:9px}.strip{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:11px;margin:1px 1px 7px}.strip strong{color:var(--green)}
+.hero{position:relative;background:var(--panel);border:1px solid #24506b;border-left:4px solid var(--cyan);padding:10px;margin-bottom:7px;box-shadow:inset 0 0 22px #00131f}
+.eyebrow{font-size:11px;color:var(--muted);letter-spacing:.1em}.train-line{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:3px 0 8px}.train{font-size:clamp(31px,9vw,46px);line-height:1.1;color:var(--cyan);font-weight:900;word-break:break-all;text-shadow:0 0 12px #00c8e866}.loco-chip{max-width:100%%;padding:4px 7px;border:1px solid #326685;background:#071d2b;color:var(--white);font-size:13px;font-weight:800;overflow-wrap:anywhere}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px}.metric{min-width:0;background:#031927;border:1px solid #1d435a;padding:7px 9px}.metric span{display:block;color:var(--muted);font-size:11px}.metric strong{display:block;font-size:23px;line-height:1.12;margin-top:2px}.speed strong{color:var(--yellow)}.km strong{color:var(--green)}
+.route{display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:7px;background:var(--panel2);border:1px solid #24506b;padding:8px 10px;margin-bottom:7px}.route label{color:var(--muted);font-size:11px}.route strong{font-size:18px;color:var(--white);overflow-wrap:anywhere}.direction{color:var(--magenta);font-size:12px;font-weight:800}
+.grid{display:grid;grid-template-columns:1fr 1fr;background:var(--panel);border:1px solid #23455c;margin-bottom:7px}.cell{min-width:0;padding:6px 9px;border-bottom:1px solid #1b3b50}.cell:nth-child(odd){border-right:1px solid #1b3b50}.cell:nth-last-child(-n+2){border-bottom:0}.cell span{display:block;color:var(--muted);font-size:10px}.cell strong{display:block;margin-top:2px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.location{background:var(--panel);border:1px solid #24506b;margin-bottom:7px}.loc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 9px;border-bottom:1px solid #1d435a}.loc-head span{color:var(--muted);font-size:10px;letter-spacing:.08em}.loc-head strong{color:var(--green);font-size:11px}.coordinate-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:7px}.coordinate{min-width:0;background:#031927;border:1px solid #1d435a;padding:6px 8px}.coordinate span{display:block;color:var(--muted);font-size:10px}.coordinate strong{display:block;color:var(--cyan);font-size:13px;margin-top:2px;overflow-wrap:anywhere}
+.device .metrics{padding:7px}.device strong{color:var(--green)}.device small{display:block;color:var(--muted);font-size:10px;line-height:1.25;margin-top:2px}.device .danger{border-color:var(--red);background:#2a1017}.device .danger strong,.device .danger small{color:var(--red)}
+.controls{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0}.sound{appearance:none;border:1px solid var(--yellow);background:#241f05;color:var(--yellow);padding:8px 10px;font:inherit;font-size:12px;font-weight:800;min-height:38px}.sound.on{border-color:var(--green);background:#092817;color:var(--green)}
+.refresh{text-align:right;font-size:10px;color:var(--muted)}.refresh strong{display:block;color:var(--cyan);margin-bottom:2px}.notice{min-height:16px;color:var(--green);font-size:11px;margin-bottom:6px}
+.flash{animation:flash 1.2s ease}@keyframes flash{0%%{border-color:var(--yellow);box-shadow:0 0 30px #ffe34299}100%%{border-color:#24506b;box-shadow:inset 0 0 28px #00131f}}
+@media(max-width:360px){.train{font-size:31px}.loco-chip{font-size:12px}.route strong{font-size:16px}.metric strong{font-size:20px}.refresh{max-width:135px}}
+ .metric.charging strong{color:#4ade80}</style></head>
 <body data-record-id="%(record_id)s"><header><div class=logo>LBJ RECEIVER <b>W</b></div><div class=online><i class=dot></i>AP ONLINE</div></header>
 <main><div class=strip><span id=state>%(state)s</span><strong id=live>实时监视中</strong></div>
-<section class=hero id=hero><div class=eyebrow>TRAIN NUMBER / 车次</div><div class=train id=train>%(train)s</div>
+<section class=hero id=hero><div class=eyebrow>TRAIN NUMBER / 车次 · 车型</div><div class=train-line><div class=train id=train>%(train)s</div><div class=loco-chip id=loco>%(loco)s</div></div>
 <div class=metrics><div class="metric speed"><span>速度 km/h</span><strong id=speed>%(speed)s</strong></div><div class="metric km"><span>公里标 km</span><strong id=km>%(km)s</strong></div></div></section>
 <section class=route><label>线路</label><strong id=route data-gbk="%(route)s">%(route)s</strong><span class=direction id=direction>%(direction)s</span></section>
+<section class=grid>
+<div class=cell><span>接收时间</span><strong id=received>%(time)s</strong></div><div class=cell><span>端位</span><strong id=cab>%(cab)s</strong></div>
+<div class=cell><span>RSSI</span><strong id=rssi>%(rssi)s</strong></div><div class=cell><span>数据类型</span><strong id=type>%(type)s</strong></div></section>
 <section class="location device" aria-label="本机状态"><div class=loc-head><span>DEVICE / 本机状态</span><span>随列车信息更新</span></div><div class=metrics aria-live=polite>
 <div class="metric%(battery_class)s" id=batteryCard><span>本机电量</span><strong id=battery>%(battery)s</strong><small id=batteryNote>%(battery_note)s</small></div>
 <div class="metric%(temp_class)s" id=tempCard><span>核心温度</span><strong id=temperature>%(temperature)s</strong><small id=tempNote>%(temp_note)s</small></div></div></section>
 <section class=location id=location data-lon="%(longitude)s" data-lat="%(latitude)s"><div class=loc-head><span>POSITION / 列车经纬度</span><strong id=locationState>检查坐标中</strong></div><div class=coordinate-grid>
 <div class=coordinate><span>经度</span><strong id=longitude>---</strong></div><div class=coordinate><span>纬度</span><strong id=latitude>---</strong></div></div></section>
-<section class=grid>
-<div class=cell><span>接收时间</span><strong id=received>%(time)s</strong></div><div class=cell><span>机车</span><strong id=loco>%(loco)s</strong></div>
-<div class=cell><span>端位</span><strong id=cab>%(cab)s</strong></div><div class=cell><span>RSSI</span><strong id=rssi>%(rssi)s</strong></div>
-<div class="cell wide"><span>数据类型</span><strong id=type>%(type)s</strong></div></section>
 <div class=controls><button class=sound id=soundBtn type=button>声音提醒：关闭</button><div class=refresh><strong id=refreshState>正在建立实时通道</strong><span id=streamDetail>收到新报文即更新</span></div></div>
-<div class=notice id=notice aria-live=polite></div>
-<footer>页面通过 SSE 接收机实时推送，新报文到达即更新；断线时会自动重连并临时使用兼容轮询。声音默认关闭。</footer></main>
+<div class=notice id=notice aria-live=polite></div></main>
 <script>
 const el=id=>document.getElementById(id);let lastId=document.body.dataset.recordId||"",lastRevision=Number(lastId)||0,soundOn=false,audioCtx=null,stream=null,streamErrors=0,fallbackTimer=null,reopenTimer=null,pollPrimed=true;
-function renderDevice(d){d=d||{};const b=d.battery_percent,t=d.core_temp_c,bv=typeof b==="number"&&Number.isFinite(b)&&b>=0&&b<=100,tv=typeof t==="number"&&Number.isFinite(t)&&t>=-100&&t<=200,low=bv&&b<20,hot=tv&&t>45;put("battery",bv?b+"%%":null);put("temperature",tv?t.toFixed(1)+"°C":null);el("batteryCard").classList.toggle("danger",low);el("tempCard").classList.toggle("danger",hot);put("batteryNote",!bv?"等待有效采样":low?"⚠ 低电量警告：低于 20%%":"电量正常");put("tempNote",!tv?"等待有效采样":hot?"⚠ 温度警告：高于 45°C":"温度正常")}
+function renderDevice(d){d=d||{};const b=d.battery_percent,t=d.core_temp_c,bv=typeof b==="number"&&Number.isFinite(b)&&b>=0&&b<=100,tv=typeof t==="number"&&Number.isFinite(t)&&t>=-100&&t<=200,chg=d.usb_power===true,low=!chg&&bv&&b<20,hot=tv&&t>45;put("battery",chg?"CHRG":bv?b+"%%":null);put("temperature",tv?t.toFixed(1)+"°C":null);el("batteryCard").classList.toggle("danger",low);el("batteryCard").classList.toggle("charging",chg);el("tempCard").classList.toggle("danger",hot);put("batteryNote",(typeof d.battery_voltage==="number"?d.battery_voltage.toFixed(2)+" V · ":"")+(chg?"USB 供电":!bv?"等待有效采样":low?"⚠ 低电量警告：低于 20%%":"电量正常"));put("tempNote",!tv?"等待有效采样":hot?"⚠ 温度警告：高于 45°C":"温度正常")}
 function put(id,v){el(id).textContent=(v===undefined||v===null||v==="")?"---":v}
 function decodeRoute(hex){if(!hex||hex==="---")return "---";if(hex.length%%2||!/^[0-9a-f]+$/i.test(hex))return "编码 "+hex;try{const pairs=hex.match(/[0-9a-f]{2}/gi),bytes=Uint8Array.from(pairs,x=>parseInt(x,16));const text=new TextDecoder("gbk",{fatal:true}).decode(bytes).replace(/\u0000/g,"").trim();return text||("编码 "+hex)}catch(e){return "编码 "+hex}}
 function asCoordinate(value){if(value===null||value===undefined||value==="")return null;const number=Number(value);return Number.isFinite(number)?number:null}
