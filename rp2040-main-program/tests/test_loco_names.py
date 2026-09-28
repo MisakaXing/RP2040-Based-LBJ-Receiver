@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED = {'260':'FXD1C','344':'轨道探伤车','361':'起重轨道车',
+EXPECTED = {'260':'FXD1C','263':'FXD1BA','344':'轨道探伤车','361':'起重轨道车',
             '400':'起重轨道车','401':'起重轨道车','403':'轨道探伤车',
             '411':'起重轨道车','413':'起重轨道车','415':'轨道打磨车','422':'轨道探伤车'}
 
@@ -29,3 +29,7 @@ class LocoNameTests(unittest.TestCase):
         # All existing names must still have the correct device encoding.
         for name in mapping.values():
             self.assertEqual(ns['encode_loco_gbk'](name+'-1234B'),(name+'-1234B').encode('gb2312'))
+
+        label = ns['encode_loco_gbk'](mapping['263'] + '-0001A')
+        self.assertEqual(label, b'FXD1BA-0001A')
+        self.assertEqual(53 + len(label) * 8 * 2, 245)
