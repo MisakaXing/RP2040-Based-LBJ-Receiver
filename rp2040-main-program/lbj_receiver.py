@@ -701,7 +701,8 @@ class LBJReceiver:
         cleaned_parts = []
         i = 0
         while i < len(parts):
-            if parts[i] in ['-', '+'] and i + 1 < len(parts):
+            if (i > 0 and parts[i] in ['-', '+'] and i + 1 < len(parts)
+                    and parts[i+1][:1].isdigit()):
                 cleaned_parts.append(parts[i] + parts[i+1]); i += 2
             else:
                 cleaned_parts.append(parts[i]); i += 1
@@ -712,7 +713,11 @@ class LBJReceiver:
             return {}
 
         train_no, speed_raw, km_raw = cleaned_parts
-        if train_no == '---' and speed_raw == '---' and km_raw == '---':
+        missing_train = (1 <= len(train_no) <= 8 and
+                         all(char == '-' for char in train_no))
+        missing_speed = bool(speed_raw) and all(char == '-' for char in speed_raw)
+        missing_km = bool(km_raw) and all(char == '-' for char in km_raw)
+        if missing_train and missing_speed and missing_km:
             return {
                 "train_no": "---",
                 "speed_kmh": "---",
@@ -720,7 +725,8 @@ class LBJReceiver:
                 "placeholder": True
             }
 
-        if not train_no.isdigit() or not 1 <= len(train_no) <= 8:
+        has_train_no = train_no.isdigit() and 1 <= len(train_no) <= 8
+        if not has_train_no and not missing_train:
             return {}
 
         speed_out = "---"
@@ -741,17 +747,29 @@ class LBJReceiver:
         except:
             pass
 
+        # The all-placeholder frame was handled above.  Other missing
+        # train numbers need at least one measurement to be meaningful.
+        if not has_train_no and speed_out == '---' and km_out == '---':
+            return {}
+
         # A valid numeric train number is sufficient to keep the basic frame.
         # Speed and kilometre post are independent optional measurements; both
         # may legitimately be unavailable and must remain visible as "---".
         result = {
-            "train_no": train_no,
+            "train_no": train_no if has_train_no else '---',
             "speed_kmh": speed_out,
             "km_post": km_out
         }
         if speed_out == "---" or km_out == "---":
             result["partial"] = True
         return result
+
+    def _has_usable_basic(self, basic):
+        train_no = str(basic.get("train_no", ""))
+        if train_no.isdigit() and 1 <= len(train_no) <= 8:
+            return True
+        return (train_no == '---' and
+                "speed_kmh" in basic and "km_post" in basic)
 
     def _parse_ext(self, s):
         if len(s) < self.LBJ_BLOCK_LEN:
@@ -828,13 +846,13 @@ class LBJReceiver:
             ext_dict["block_start"] = lbj_start_idx
             if basic_str:
                 basic_dict = self._parse_basic(basic_str)
-                if str(basic_dict.get("train_no", "")).isdigit():
+                if self._has_usable_basic(basic_dict):
                     return {"type": "train_data_full", "raw": msg_clean, "basic": basic_dict, "extended": ext_dict}
                 return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict, "garbage_prefix": basic_str}
             return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict}
         else:
             basic_dict = self._parse_basic(msg_clean)
-            if str(basic_dict.get("train_no", "")).isdigit():
+            if self._has_usable_basic(basic_dict):
                 return {"type": "basic_only", "raw": msg_clean, "basic": basic_dict}
             x_count = msg_clean.count('X')
             if x_count:
@@ -862,7 +880,7 @@ class LBJReceiver:
         ric = self._ric_number(msg.get("ric"))
         if msg_type == "basic_only" and ric == self.LBJ_BASIC_RIC:
             basic = msg.get("basic", {})
-            if str(basic.get("train_no", "")).isdigit():
+            if self._has_usable_basic(basic):
                 return "basic"
         elif msg_type == "extended_only" and ric == self.LBJ_EXTENDED_RIC:
             if msg.get("extended"):
