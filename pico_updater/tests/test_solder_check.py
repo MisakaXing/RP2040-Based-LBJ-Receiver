@@ -2,6 +2,7 @@ import ast
 import importlib.util
 from pathlib import Path
 import queue
+import sys
 import unittest
 from types import SimpleNamespace, MethodType
 from unittest.mock import Mock, patch
@@ -73,8 +74,23 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("test_results['Battery']",built)
         self.assertNotIn('所有核心硬件模块均工作在最佳状态',built)
 
+    def test_board_variants_select_distinct_adc_and_wireless_check(self):
+        source=(ROOT/'pico_updater.py').read_text()
+        tree=ast.parse(source)
+        legacy=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='HARDWARE_TEST_SCRIPT' for t in n.targets))
+        standard=check.core_script(legacy,False)
+        wireless=check.core_script(legacy,True)
+        ast.parse(standard)
+        ast.parse(wireless)
+        self.assertIn('machine.ADC(machine.Pin(27))',standard)
+        self.assertNotIn("_core_step('Wireless'",standard)
+        self.assertIn('machine.ADC(machine.Pin(41))',wireless)
+        self.assertIn("_core_step('Wireless','running')",wireless)
+        self.assertTrue(check.is_wireless_board('Waveshare RP2350B PLUS W with RP2350'))
+        self.assertFalse(check.is_wireless_board('Raspberry Pi Pico with RP2040'))
+
     def test_scripts_compile(self):
-        for script in (check.screen_script(),check.sd_script(),check.BATTERY_SCRIPT,check.BUZZER_SCRIPT):
+        for script in (check.screen_script(),check.sd_script(),check.BATTERY_SCRIPT,check.battery_script(41),check.WIRELESS_SCRIPT,check.BUZZER_SCRIPT):
             ast.parse(script)
 
     def test_sd_probe_does_not_write_or_mount(self):
@@ -154,6 +170,14 @@ class WorkerTests(unittest.TestCase):
         t.exec_raw_no_follow.assert_called_once()
         t.close.assert_called_once()
 
+    def test_w_board_connect_selects_wireless_diagnostics(self):
+        t=Mock()
+        t.exec_raw.return_value=(b'LBJ_CHECK_JSON:{"board":"Waveshare RP2350B PLUS W with RP2350"}\n',b'')
+        w=check.InspectionWorker('test','',transport_factory=lambda *a,**k:t)
+        w.jobs.put('connect');w.jobs.put('close');w.start();w.join(3)
+        self.assertTrue(w.wireless)
+        self.assertFalse(w.is_alive())
+
     def test_errors_are_reported_and_close_still_runs(self):
         t=Mock();t.enter_raw_repl.side_effect=OSError("USB disconnected")
         events=self.run_jobs(t,"connect","close")
@@ -214,8 +238,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(dict(check.BUTTONS)['UP'],4)
         self.assertEqual(dict(check.BUTTONS)['DOWN'],3)
         self.assertEqual(check.BUTTON_PINS,(2,4,3,5,28))
+        self.assertEqual(tuple(pin for _,pin in check.button_mapping(False)),(2,4,3,5,28))
+        self.assertEqual(tuple(pin for _,pin in check.button_mapping(True)),(2,4,3,5,42))
+
+    def test_w_button_report_uses_gp42(self):
+        w=self.window(1);w.wireless=True
+        w.handle('buttons',[True,True,True,True,False])
+        self.assertEqual(w.results[1]['status'],'fail')
+        self.assertIn('POWER/GP42：未识别',w.results[1]['detail'])
     def window(self,index=0):
-        window=SimpleNamespace(index=index,busy=False,closing=False,connected=True,
+        window=SimpleNamespace(index=index,busy=False,closing=False,connected=True,wireless=False,
             skip_pending=False,results=[{"status":"pending","detail":""} for _ in check.STEPS],
             worker=SimpleNamespace(cancel=Mock(),jobs=queue.Queue()),
             primary=Mock(),skip_btn=Mock(),fail_btn=Mock(),confirm_btn=Mock(),note=Mock(),diagram=Mock(),buzzer_count=0,
@@ -285,6 +317,17 @@ class WorkflowTests(unittest.TestCase):
         w.continue_core()
         w.advance.assert_called_once()
 
+    def test_w_core_requires_wireless_result(self):
+        w=self.window(0);w.wireless=True
+        base={'RTC':True,'SX1276_SPI':True,'SX1276_Signal':True,
+              'Battery':True,'Battery_V':4.1}
+        w.handle('core',(base,'log'))
+        self.assertEqual(w.results[0]['status'],'fail')
+        w.advance.assert_not_called()
+        w.handle('core',({**base,'Wireless':True},'log'))
+        self.assertEqual(w.results[0]['status'],'pass')
+        w.advance.assert_not_called()
+
     def test_core_failure_cannot_continue_as_passed(self):
         w=self.window(0);w.results[0]['status']='fail'
         w.continue_core();w.advance.assert_not_called()
@@ -339,6 +382,42 @@ class ElectricalTests(unittest.TestCase):
         self.assertAlmostEqual(ns['test_results']['Battery_V'],36000/65535*6.6+.174,places=3)
         self.assertEqual(pin.value.call_args_list[-1].args,(1,))
         self.assertEqual(adc.read_u16.call_count,8)
+
+    def test_w_battery_uses_gp41_and_restores_gate(self):
+        machine,pin,adc=self.hardware()
+        ns=dict(machine=machine,time=Mock(),test_results={})
+        exec(check.battery_script(41),ns)
+        self.assertEqual(machine.ADC.call_args.args[0],pin)
+        self.assertIn(41,[call.args[0] for call in machine.Pin.call_args_list])
+        self.assertTrue(ns['test_results']['Battery'])
+        self.assertEqual(pin.value.call_args_list[-1].args,(1,))
+
+    def test_wireless_probe_starts_and_stops_sta(self):
+        wlan=Mock()
+        wlan.active.side_effect=lambda enabled=None: enabled if enabled is not None else True
+        network=SimpleNamespace(WLAN=Mock(return_value=wlan),STA_IF=0)
+        events=[]
+        ns={'_core_step':lambda *args:events.append(args),
+            'test_results':{},'time':SimpleNamespace(ticks_ms=lambda:0,
+            ticks_add=lambda a,b:a+b,ticks_diff=lambda a,b:a-b,sleep_ms=lambda n:None)}
+        with patch.dict(sys.modules,{'network':network}):
+            exec(check.WIRELESS_SCRIPT,ns)
+        self.assertTrue(ns['test_results']['Wireless'])
+        self.assertEqual([call.args for call in wlan.active.call_args_list],[(True,),(),(),(False,)])
+        self.assertEqual(events[-1][:2],('Wireless','pass'))
+
+    def test_wireless_probe_failure_is_not_pass_and_stops_sta(self):
+        wlan=Mock();wlan.active.side_effect=[None,False,False,None]
+        network=SimpleNamespace(WLAN=Mock(return_value=wlan),STA_IF=0)
+        events=[]
+        ns={'_core_step':lambda *args:events.append(args),'test_results':{},
+            'time':SimpleNamespace(ticks_ms=lambda:0,ticks_add=lambda a,b:a+b,
+            ticks_diff=lambda a,b:-1,sleep_ms=lambda n:None)}
+        with patch.dict(sys.modules,{'network':network}):
+            exec(check.WIRELESS_SCRIPT,ns)
+        self.assertFalse(ns['test_results']['Wireless'])
+        wlan.active.assert_called_with(False)
+        self.assertEqual(events[-1][:2],('Wireless','fail'))
 
     def test_battery_failure_restores_gate_and_is_reported(self):
         machine,pin,adc=self.hardware();adc.read_u16.side_effect=OSError('ADC unavailable')

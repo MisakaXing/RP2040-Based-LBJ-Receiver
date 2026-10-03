@@ -61,8 +61,16 @@ last_vbus_display = None
 # 1. 硬件 IO 初始化
 
 tft_cs = Pin(9, Pin.OUT, value=1) 
-spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
-tft = ILI9341(spi1, cs=9, dc=12, rst=13)
+_boot_display = globals().pop('_boot_display', None)
+boot_started_ms = None
+boot_first_frame_ms = None
+if _boot_display is not None:
+    spi1, tft, boot_started_ms, boot_first_frame_ms = _boot_display
+else:
+    # Older installations without boot.py keep the original startup path.
+    spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
+    tft = ILI9341(spi1, cs=9, dc=12, rst=13)
+del _boot_display
 spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 
 sd_cs = Pin(7, Pin.OUT, value=1)
@@ -656,11 +664,26 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False, hist_tim
 
         draw_km_post(km, 220, y2, 2, 32, bg_color)
 
-        loco = ext.get('loco_type', '----')
+        loco = str(ext.get('loco_type', '----'))
         cab = ext.get('cab_end', '')
-        if cab == '31': loco += 'A'
+        small_cab = b''
+        loco_raw = str(ext.get('loco_raw', ''))
+        separator = loco.rfind('-')
+        number = loco[separator + 1:] if separator >= 0 else ''
+        has_five_digit_raw = (len(loco_raw) == 8 and loco_raw[:3].isdigit()
+                              and int(loco_raw[:3]) >= 344)
+        if has_five_digit_raw or (len(number) == 5 and number.isdigit()):
+            # Old ordinary history retains raw digits; correct its label too.
+            if has_five_digit_raw and separator >= 0:
+                loco = loco[:separator + 1] + loco_raw[3:8]
+            small_cab = b'A' if cab == '31' else b'B' if cab == '32' else b''
+        elif cab == '31': loco += 'A'
         elif cab == '32': loco += 'B'
-        tft.draw_gbk(encode_loco_gbk(loco), 53, y3, WHITE, bg_color, scale=2)
+        loco_bytes = encode_loco_gbk(loco)
+        tft.draw_gbk(loco_bytes, 53, y3, WHITE, bg_color, scale=2)
+        if small_cab:
+            tft.draw_gbk(small_cab, 53 + len(loco_bytes) * 16, y3 + 8,
+                         WHITE, bg_color, scale=1)
 
     lon = str(ext.get('lon') or '---').replace('°', ' ')
     lat = str(ext.get('lat') or '---').replace('°', ' ')
@@ -857,6 +880,10 @@ def process_ui_data(data):
 
 load_config()
 post = SystemPOST(tft, tft_cs)
+if boot_started_ms is not None:
+    print('BOOT_UI_TIMING', 'first_frame_ms=', boot_first_frame_ms,
+          'post_ms=', time.ticks_diff(time.ticks_ms(), boot_started_ms),
+          'screen_reused=', True)
 boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver)
 spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 if boot_status == "HALT":

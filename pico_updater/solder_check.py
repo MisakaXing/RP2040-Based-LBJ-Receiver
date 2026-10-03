@@ -15,11 +15,16 @@ import customtkinter as ctk
 # Physical key names follow the user's observed assembly, not firmware aliases.
 BUTTONS = (("MENU", 2), ("UP", 4), ("DOWN", 3), ("OK", 5), ("POWER", 28))
 BUTTON_PINS = tuple(pin for _, pin in BUTTONS)
+
+
+def button_mapping(wireless):
+    return BUTTONS[:-1] + (("POWER", 42 if wireless else 28),)
 STEPS = ("核心硬件", "五键检查", "屏幕检查", "蜂鸣器", "SD 卡检查")
 PREFIX = "LBJ_CHECK_JSON:"
 CORE_PREFIX = "LBJ_CORE_STEP:"
 CORE_ITEMS = (("RTC","RTC 时钟"),("SX1276_SPI","射频 SPI 通信"),
               ("SX1276_Signal","射频时钟 / 数据线"),("Battery","电池电压"))
+WIRELESS_ITEM = ("Wireless", "CYW43 无线模块")
 LABELS = {"pending": "未检查", "pass": "通过", "fail": "失败",
           "skip": "已跳过", "running": "检查中"}
 
@@ -41,6 +46,11 @@ def identity_text(device):
     return (f"S/N：{device.get('SN', '待读取')}  ·  {device.get('board', '等待连接设备')}"
             f"  ·  MicroPython {device.get('micropython', '—')}"
             f"  ·  CPU {device.get('cpu_mhz', '—')} MHz")
+
+
+def is_wireless_board(board):
+    """Select diagnostic pins from the attached board, not the menu branch."""
+    return "RP2350" in str(board).upper()
 
 
 def result_json(output):
@@ -113,12 +123,15 @@ def driver_source(name):
     return (Path(__file__).resolve().parent / "diagnostic_drivers" / name).read_text(encoding="utf-8")
 
 
-BATTERY_SCRIPT = '''
+def battery_script(adc_pin):
+    if adc_pin not in (27, 41):
+        raise ValueError("不支持的电池 ADC 引脚")
+    return '''
 _battery_gate=machine.Pin(14,machine.Pin.OUT,value=1)
 try:
  _battery_gate.value(0)
  time.sleep_ms(5)
- _battery_adc=machine.ADC(machine.Pin(27))
+ _battery_adc=machine.ADC(machine.Pin(%d))
  _battery_raw=sum(_battery_adc.read_u16() for _ in range(8))/8
  _battery_voltage=_battery_raw/65535*3.3*2+0.174
  test_results['Battery']=0<_battery_raw<65535 and 0.5<_battery_voltage<5.0
@@ -129,6 +142,37 @@ except Exception as _battery_error:
  test_results['Battery_Error']=str(_battery_error)
 finally:
  _battery_gate.value(1)
+''' % adc_pin
+
+
+BATTERY_SCRIPT = battery_script(27)
+
+WIRELESS_SCRIPT = '''
+_core_step('Wireless','running')
+_wireless_station=None
+try:
+ import network
+ _wireless_type=getattr(network.WLAN,'IF_STA',None)
+ if _wireless_type is None: _wireless_type=getattr(network,'STA_IF',None)
+ if _wireless_type is None: raise OSError('STA interface missing')
+ _wireless_station=network.WLAN(_wireless_type)
+ _wireless_station.active(True)
+ _wireless_deadline=time.ticks_add(time.ticks_ms(),1500)
+ while not _wireless_station.active() and time.ticks_diff(_wireless_deadline,time.ticks_ms())>0:
+  time.sleep_ms(25)
+ if not _wireless_station.active(): raise OSError('CYW43 did not start')
+ test_results['Wireless']=True
+ test_results['Wireless_Detail']='CYW43 STA ready'
+except Exception as _wireless_error:
+ test_results['Wireless']=False
+ test_results['Wireless_Detail']=str(_wireless_error)
+finally:
+ if _wireless_station is not None:
+  try: _wireless_station.active(False)
+  except Exception as _wireless_stop_error:
+   test_results['Wireless']=False
+   test_results['Wireless_Detail']='STA shutdown: '+str(_wireless_stop_error)
+_core_step('Wireless','pass' if test_results['Wireless'] else 'fail',test_results['Wireless_Detail'])
 '''
 
 BUZZER_SCRIPT = '''
@@ -143,7 +187,7 @@ print('LBJ_CHECK_JSON:'+json.dumps({'pulse_ms':120}))
 '''
 
 
-def core_script(legacy):
+def core_script(legacy, wireless=False):
     # Keep the existing RTC/radio checks, but replace their old "all passed"
     # footer with one structured result that also includes the battery.
     checks=legacy.split("# ================= 最终裁决报告",1)[0]
@@ -154,8 +198,9 @@ def core_script(legacy):
     return ("import machine,time,json\ndef _core_step(key,state,detail=''):\n print('LBJ_CORE_STEP:'+json.dumps({'key':key,'state':state,'detail':detail}))\ntest_results={}\ntry:\n" +
             "\n".join(" "+line for line in checks.splitlines()) +
             "\nexcept Exception as _core_error:\n test_results['Core_Error']=str(_core_error)\n" +
-            "\n_core_step('Battery','running')\n"+BATTERY_SCRIPT +
+            "\n_core_step('Battery','running')\n"+battery_script(41 if wireless else 27) +
             "\n_core_step('Battery','pass' if test_results.get('Battery') else 'fail',str(test_results.get('Battery_V','读取失败'))+' V')\n"+
+            (WIRELESS_SCRIPT if wireless else "") +
             "\ntry: test_results['SN']=get_serial_number()\nexcept Exception: pass\n" +
             "print('LBJ_CHECK_JSON:'+json.dumps(test_results))")
 
@@ -213,6 +258,7 @@ class InspectionWorker(threading.Thread):
         self.cancel = threading.Event()
         self.transport = None
         self.transport_factory = transport_factory
+        self.wireless = False
 
     def execute(self, script, timeout=20, live=False):
         chunks=[]
@@ -241,7 +287,7 @@ class InspectionWorker(threading.Thread):
                 if line.startswith(CORE_PREFIX):
                     try:
                         event=json.loads(line[len(CORE_PREFIX):])
-                        if event.get('key') in dict(CORE_ITEMS) and event.get('state') in LABELS:
+                        if event.get('key') in dict(CORE_ITEMS + (WIRELESS_ITEM,)) and event.get('state') in LABELS:
                             flush_log()
                             self.events.put(('core_step',event))
                     except (ValueError,AttributeError): pass
@@ -290,14 +336,16 @@ class InspectionWorker(threading.Thread):
                     device = result_json(out)
                     if "RP2040" not in device["board"] and "RP2350" not in device["board"]:
                         raise RuntimeError("只支持本项目 RP2040/RP2350 接线，不运行引脚测试")
+                    self.wireless = is_wireless_board(device["board"])
                     self.events.put((action, device))
                 elif self.transport is None:
                     raise RuntimeError("设备尚未连接")
                 elif action == "core":
-                    out = self.execute(core_script(self.legacy_script), 20, live=True)
+                    out = self.execute(core_script(self.legacy_script, self.wireless), 25, live=True)
                     self.events.put((action, (result_json(out), out)))
                 elif action == "buttons":
-                    self.execute("import machine\n_check_keys=[machine.Pin(n,machine.Pin.IN,machine.Pin.PULL_UP) for n in %r]" % (BUTTON_PINS,))
+                    pins=tuple(pin for _,pin in button_mapping(self.wireless))
+                    self.execute("import machine\n_check_keys=[machine.Pin(n,machine.Pin.IN,machine.Pin.PULL_UP) for n in %r]" % (pins,))
                     progress = ButtonProgress()
                     deadline = time.monotonic() + 90
                     while not self.cancel.is_set() and time.monotonic() < deadline:
@@ -322,10 +370,13 @@ class CoreChecklist(ctk.CTkScrollableFrame):
     def __init__(self,parent):
         super().__init__(parent,fg_color="#15191e")
         self.rows={}
+        self.row_frames={}
+        self.wireless=False
         self.expanded=False
-        for key,title in CORE_ITEMS:
+        for key,title in CORE_ITEMS + (WIRELESS_ITEM,):
             row=ctk.CTkFrame(self,fg_color="#202830",corner_radius=10)
             row.pack(fill='x',padx=8,pady=5)
+            self.row_frames[key]=row
             row.grid_columnconfigure(1,weight=1)
             ctk.CTkLabel(row,text=title,font=ctk.CTkFont(size=14,weight='bold'),width=145,anchor='w').grid(row=0,column=0,padx=8,pady=9)
             bar=ctk.CTkProgressBar(row,mode='indeterminate',width=60,height=4)
@@ -337,6 +388,15 @@ class CoreChecklist(ctk.CTkScrollableFrame):
         self.toggle.pack(fill='x',padx=8,pady=(12,6))
         self.logs=ctk.CTkTextbox(self,height=160,wrap='word')
         self.logs.configure(state='disabled')
+        self.row_frames['Wireless'].pack_forget()
+
+    def set_wireless(self, enabled):
+        self.wireless=bool(enabled)
+        row=self.row_frames['Wireless']
+        if self.wireless:
+            row.pack(fill='x',padx=8,pady=5,before=self.toggle)
+        else:
+            row.pack_forget()
 
     def toggle_log(self):
         self.expanded=not self.expanded
@@ -350,7 +410,8 @@ class CoreChecklist(ctk.CTkScrollableFrame):
 
     def reset(self):
         self.logs.configure(state='normal');self.logs.delete('1.0','end');self.logs.configure(state='disabled')
-        for key,_ in CORE_ITEMS:self.update_step(key,'pending')
+        for key,_ in CORE_ITEMS + ((WIRELESS_ITEM,) if self.wireless else ()):
+            self.update_step(key,'pending')
 
     def update_step(self,key,state,detail=''):
         if key not in self.rows:return
@@ -364,9 +425,10 @@ class CoreChecklist(ctk.CTkScrollableFrame):
         label.configure(text=({'pending':'等待检查','running':'检查中…'}.get(state,LABELS.get(state,state)))+(' · '+detail if detail else ''),text_color=color)
 
     def finish(self,result):
-        for key,_ in CORE_ITEMS:
+        for key,_ in CORE_ITEMS + ((WIRELESS_ITEM,) if self.wireless else ()):
             detail=str(result.get('Battery_V',''))+' V' if key=='Battery' and 'Battery_V' in result else ''
             if key=='RTC':detail=result.get('RTC_Model','')
+            if key=='Wireless':detail=result.get('Wireless_Detail','')
             state='pass' if result.get(key) is True else 'fail'
             if key=='SX1276_Signal' and result.get('SX1276_SPI') is False:state='skip'
             self.update_step(key,state,detail)
@@ -382,8 +444,13 @@ class CaseDiagram(tk.Canvas):
     """V13 orthographic outline; topology-derived dimensions, not a stock board icon."""
     def __init__(self, parent):
         super().__init__(parent, width=550, height=285, bg="#15191e", highlightthickness=0)
+        self.buttons = BUTTONS
         self.passed = [False] * 5
         self.bind("<Configure>", lambda event: self.draw())
+
+    def set_wireless(self, enabled):
+        self.buttons = button_mapping(enabled)
+        self.draw()
 
     def draw(self):
         self.delete("all")
@@ -402,7 +469,7 @@ class CaseDiagram(tk.Canvas):
             for dy in (6,59):
                 self.create_oval(x+dx*scale-3,y+dy*scale-3,x+dx*scale+3,y+dy*scale+3,outline="#96a1ac")
         for position,i in enumerate((3,1,2,0,4)):
-            name,pin=BUTTONS[i]
+            name,pin=self.buttons[i]
             color = "#45b97c" if self.passed[i] else "#6a7683"
             if position<4:
                 cy=y+(10,24,43,55)[position]*scale
@@ -411,7 +478,7 @@ class CaseDiagram(tk.Canvas):
             else:
                 cy=y+10*scale
                 self.create_rectangle(x+w-4,cy-7,x+w+7,cy+7,fill=color,outline=color)
-                self.create_text(x+w+14,cy,text="POWER\nGP28",anchor="w",fill=color,font=("Arial",11))
+                self.create_text(x+w+14,cy,text=f"POWER\nGP{pin}",anchor="w",fill=color,font=("Arial",11))
 
 
 class InspectionWindow(ctk.CTkFrame):
@@ -423,6 +490,7 @@ class InspectionWindow(ctk.CTkFrame):
         self.configure(fg_color="#101317")
         self.results = [{"status":"pending","detail":""} for _ in STEPS]
         self.device = {}
+        self.wireless = False
         self.index, self.busy, self.connected = 0, False, False
         self.skip_pending, self.closing = False, False
         self.finished = False
@@ -517,7 +585,9 @@ class InspectionWindow(ctk.CTkFrame):
             self.show_report()
             return
         self.heading.configure(text=f"{self.index+1} / {len(STEPS)}  ·  {STEPS[self.index]}")
-        hints=("自动检查 RTC、SX1276 SPI、时钟/数据线及电池电压（GP27，沿用固件换算）。读数不是精密校准结果，射频信号检查不代表灵敏度合格。",
+        adc_pin=41 if self.wireless else 27
+        wifi_hint="；W 版还检查 CYW43 无线模块" if self.wireless else ""
+        hints=(f"自动检查 RTC、SX1276 SPI、时钟/数据线及电池电压（GP{adc_pin}，沿用固件换算）{wifi_hint}。读数不是精密校准结果，射频信号检查不代表灵敏度合格。",
                "先松开全部按键，再依次按住各键约半秒。识别成功后保持绿色；五个全绿自动进入屏幕检查。90 秒未完成可重试或跳过。",
                "进入本项后自动显示红、绿、蓝、白、黑、网格和边框文字。观察缺色、坏点、横纹及显示范围，完成后请确认画面。",
                "点击“响一下”，蜂鸣器短响一次（120 ms），可重复点击。听到声音后点击“听到了”；未听到请标记异常。不会自动循环鸣响。",
@@ -660,6 +730,9 @@ class InspectionWindow(ctk.CTkFrame):
         if action=="connect":
             self.connected=True
             self.device=value
+            self.wireless=is_wireless_board(value.get('board',''))
+            self.core_panel.set_wireless(self.wireless)
+            self.diagram.set_wireless(self.wireless)
             self.identity.configure(text=identity_text(value))
         if self.skip_pending:
             self.core_panel.interrupt()
@@ -676,13 +749,18 @@ class InspectionWindow(ctk.CTkFrame):
             self.results[self.index]={"status":"fail","detail":detail}
             self.render()
             self.note.configure(text="检查失败，可重试或跳过。若串口断连，请结束后重新连接设备。")
-        elif action=="connect": self.start_step()
+        elif action=="connect":
+            self.render()
+            self.start_step()
         elif action=="core":
             result,log=value
             self.core_panel.finish(result)
-            passed=not result.get('Core_Error') and all(result.get(k) is True for k in ("RTC","SX1276_SPI","SX1276_Signal","Battery"))
+            required=[key for key,_ in CORE_ITEMS]
+            if self.wireless: required.append(WIRELESS_ITEM[0])
+            passed=not result.get('Core_Error') and all(result.get(k) is True for k in required)
             voltage=result.get('Battery_V','读取失败')
-            self.results[0]={"status":"pass" if passed else "fail","detail":f"电池电压：{voltage} V（固件换算，需万用表核对）\n"+json.dumps(result,ensure_ascii=False)+"\n"+log}
+            adc_pin=41 if self.wireless else 27
+            self.results[0]={"status":"pass" if passed else "fail","detail":f"电池电压（GP{adc_pin}）：{voltage} V（固件换算，需万用表核对）\n"+json.dumps(result,ensure_ascii=False)+"\n"+log}
             self.subtitle.configure(text=f"{self.port}  ·  电池：{voltage} V")
             # Keep checklist/log widgets mounted through final confirmation.
             self.step_labels[0].configure(text="1. 核心硬件\n"+("通过" if passed else "失败"),text_color="#45b97c" if passed else "#e46a6a")
@@ -696,7 +774,7 @@ class InspectionWindow(ctk.CTkFrame):
                 self.note.configure(text="核心硬件检查通过。可展开下方日志查看详情，确认后继续按键检查。")
         elif action=="buttons":
             passed=all(value)
-            self.results[1]={"status":"pass" if passed else "fail","detail":"；".join(f"{name}/GP{pin}：{'通过' if ok else '未识别'}" for (name,pin),ok in zip(BUTTONS,value))}
+            self.results[1]={"status":"pass" if passed else "fail","detail":"；".join(f"{name}/GP{pin}：{'通过' if ok else '未识别'}" for (name,pin),ok in zip(button_mapping(self.wireless),value))}
             if passed:
                 self.busy=True
                 self.skip_btn.configure(state="disabled")

@@ -245,6 +245,18 @@ class FirmwareSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(missing, [profile["runtime_files"][0]])
 
+    def test_optional_ordinary_boot_file_is_included_before_main(self):
+        standard = profile_for(updater.STANDARD_CHANNEL_LABEL)
+        items = [{"name": name, "type": "file"} for name in standard["runtime_files"]]
+        items.append({"name": "boot.py", "type": "file"})
+        selected, missing = updater.select_runtime_files(standard, items)
+        self.assertEqual([item['name'] for item in selected][-2:], ['boot.py', 'main.py'])
+        self.assertEqual(missing, [])
+        wireless = profile_for(updater.WIRELESS_CHANNEL_LABEL)
+        items += [{"name": name, "type": "file"} for name in wireless['runtime_files']]
+        selected, missing = updater.select_runtime_files(wireless, items)
+        self.assertNotIn('boot.py', [item['name'] for item in selected])
+
     def test_online_w_prepare_uses_frozen_branch_and_exact_allowlist(self):
         app = updater.PicoUpdaterApp.__new__(updater.PicoUpdaterApp)
         app.github_repo = updater.GITHUB_REPO
@@ -488,6 +500,18 @@ class OfflineZipTests(unittest.TestCase):
         app.target_dir = updater.TARGET_DIR
         app.log = mock.Mock()
         return app
+
+    def test_zip_keeps_optional_ordinary_boot_file(self):
+        profile = profile_for(updater.STANDARD_CHANNEL_LABEL)
+        with tempfile.TemporaryDirectory() as temp:
+            zip_path = Path(temp) / 'firmware.zip'
+            output_dir = Path(temp) / 'out'
+            output_dir.mkdir()
+            write_firmware_zip(zip_path, profile, 'Program_ver = 5.9\n')
+            with zipfile.ZipFile(zip_path, 'a') as archive:
+                archive.writestr('rp2040-main-program/boot.py', '# early startup\n')
+            files, _ = self.make_app()._extract_zip_firmware(zip_path, output_dir, profile)
+            self.assertEqual([item['name'] for item in files][-2:], ['boot.py', 'main.py'])
 
     def test_zip_extracts_only_selected_runtime_files_for_both_branches(self):
         for label, version_line in (

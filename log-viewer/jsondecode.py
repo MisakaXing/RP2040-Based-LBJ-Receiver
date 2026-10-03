@@ -42,6 +42,18 @@ COLORS = {
     "red": "#E46A6A",
 }
 
+def is_pico_port(port):
+    description = " ".join(str(getattr(port, name, "") or "")
+                           for name in ("description", "product", "interface")).lower()
+    return port.vid == 0x2E8A and "debug" not in description and "cmsis-dap" not in description
+
+
+def require_pico_port(port):
+    if not any(p.device == port and is_pico_port(p)
+               for p in serial.tools.list_ports.comports()):
+        raise ValueError("所选串口未识别为 Pico 或设备已断开，请连接 Pico 后重新扫描。")
+
+
 class TrainLogApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -574,35 +586,44 @@ class TrainLogApp(ctk.CTk):
             self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png", max_zoom=19)
 
     def refresh_ports(self, show_prompt=False):
-        PICO_VID = 0x2E8A
-        ports = serial.tools.list_ports.comports()
-        port_list = [p.device for p in ports]
-        
-        auto_port = None
-        for p in ports:
-            if p.vid == PICO_VID:
-                auto_port = p.device
-                break
-                
-        if not port_list:
-            self.port_menu.configure(values=["未检测到设备"])
-            self.port_var.set("未检测到设备")
-            if show_prompt: messagebox.showwarning("提示", "未检测到任何串口设备，请检查数据线连接！")
-        else:
-            self.port_menu.configure(values=port_list)
-            if auto_port:
-                self.port_var.set(auto_port)
-                if show_prompt: messagebox.showinfo("成功", f"扫描完成！\n已自动识别并选中 Pico 设备：{auto_port}")
+        if self._pico_busy:
+            return
+        try:
+            port_list = [p.device for p in serial.tools.list_ports.comports() if is_pico_port(p)]
+        except Exception as exc:
+            port_list = []
+            if show_prompt:
+                messagebox.showerror("扫描失败", str(exc))
+                show_prompt = False
+        selected = self.port_var.get()
+        self.port_menu.configure(values=port_list or ["未识别到 Pico"],
+                                 state="normal" if port_list else "disabled")
+        self.port_var.set(selected if selected in port_list else
+                          (port_list[0] if port_list else "未识别到 Pico"))
+        state = "normal" if port_list else "disabled"
+        self.read_pico_btn.configure(state=state)
+        self.export_pico_btn.configure(state=state)
+        if show_prompt:
+            if port_list:
+                messagebox.showinfo("成功", f"已识别 Pico：{self.port_var.get()}")
             else:
-                self.port_var.set(port_list[0])
-                if show_prompt: messagebox.showwarning("提示", "已刷新列表，但未发现标准 Pico 设备。\n请展开下拉菜单手动选择正确的端口！")
+                messagebox.showwarning("未识别到 Pico", "读取和导出已禁用。请连接运行 MicroPython 的 Pico 后重新扫描。")
+
+    def _validated_pico_port(self):
+        port = self.port_var.get()
+        try:
+            require_pico_port(port)
+        except Exception as exc:
+            self.refresh_ports()
+            messagebox.showwarning("无法读取 Pico", str(exc))
+            return None
+        return port
 
     def start_pico_read(self):
         if self._pico_busy:
             return
-        port = self.port_var.get()
-        if not port or "未检测" in port or "请选择" in port:
-            messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
+        port = self._validated_pico_port()
+        if port is None:
             return
 
         self._pico_busy = True
@@ -615,9 +636,8 @@ class TrainLogApp(ctk.CTk):
     def start_pico_export(self):
         if self._pico_busy:
             return
-        port = self.port_var.get()
-        if not port or "未检测" in port or "请选择" in port:
-            messagebox.showwarning("警告", "请先选择有效的 Pico 串口！")
+        port = self._validated_pico_port()
+        if port is None:
             return
             
         save_path = filedialog.asksaveasfilename(
@@ -657,6 +677,7 @@ class TrainLogApp(ctk.CTk):
                 status(f"传输 {percent}% · {done / 1048576:.2f}/{total / 1048576:.2f} MB")
 
         try:
+            require_pico_port(port)
             result = download_history(port, progress=progress, status=status)
             if result.recovery_warning:
                 self.after(0, lambda warning=result.recovery_warning: messagebox.showwarning("设备恢复提示", warning))
@@ -678,6 +699,7 @@ class TrainLogApp(ctk.CTk):
         self.read_pico_btn.configure(state="normal", text="读取设备记录")
         self.export_pico_btn.configure(state="normal", text="导出日志到电脑")
         self.load_btn.configure(state="normal")
+        self.refresh_ports()
 
     def _close_app(self):
         if self._pico_busy:

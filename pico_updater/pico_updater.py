@@ -69,6 +69,7 @@ FIRMWARE_BRANCHES = {
         "family": "rp2040",
         "hardware_hint": "仅适用于 RP2040 Pico 标准接收器",
         "runtime_files": COMMON_RUNTIME_FILES + ("main.py",),
+        "optional_runtime_files": ("boot.py",),
     },
     WIRELESS_CHANNEL_LABEL: {
         "label": WIRELESS_CHANNEL_LABEL,
@@ -204,6 +205,12 @@ def version_display(info, missing="未知"):
     return f"v{label}" if label else missing
 
 
+def runtime_file_order(profile):
+    required = tuple(profile["runtime_files"])
+    optional = tuple(profile.get("optional_runtime_files", ()))
+    return tuple(name for name in required if name != "main.py") + optional + ("main.py",)
+
+
 def select_runtime_files(profile, files_data):
     by_name = {
         item.get("name"): item
@@ -212,7 +219,7 @@ def select_runtime_files(profile, files_data):
     }
     required = tuple(profile["runtime_files"])
     missing = [name for name in required if name not in by_name]
-    return [by_name[name] for name in required if name in by_name], missing
+    return [by_name[name] for name in runtime_file_order(profile) if name in by_name], missing
 
 
 def parse_hardware_probe(output):
@@ -1280,7 +1287,7 @@ class PicoUpdaterApp(ctk.CTk):
         extracted_by_name = {}
         main_text = None
         target_marker = f"/{self.target_dir}/"
-        allowed_names = set(profile["runtime_files"])
+        allowed_names = set(runtime_file_order(profile))
 
         try:
             archive = zipfile.ZipFile(zip_path, "r")
@@ -1354,7 +1361,8 @@ class PicoUpdaterApp(ctk.CTk):
             )
 
         firmware_files = [
-            extracted_by_name[name] for name in profile["runtime_files"]
+            extracted_by_name[name] for name in runtime_file_order(profile)
+            if name in extracted_by_name
         ]
         return firmware_files, firmware_info
 

@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import jsondecode as viewer
@@ -22,6 +23,14 @@ class ViewerTransferTests(unittest.TestCase):
         self.app.read_pico_btn = Widget()
         self.app.export_pico_btn = Widget()
         self.app.load_btn = Widget()
+        self.app.port_menu = Widget()
+        self.app.port_var = mock.Mock()
+        self.app.port_var.get.return_value = "PORT"
+        self.app._pico_busy = False
+        self.ports = mock.patch.object(viewer.serial.tools.list_ports, "comports",
+                                      return_value=[SimpleNamespace(device="PORT", vid=0x2E8A)])
+        self.comports = self.ports.start()
+        self.addCleanup(self.ports.stop)
         self.app._process_memory_lines = mock.Mock()
         self.app.after = lambda delay, callback, *args: callback(*args)
         self.messages = mock.patch.object(viewer, "messagebox")
@@ -100,6 +109,35 @@ class ViewerTransferTests(unittest.TestCase):
         self.app._finish_device_transfer()
         self.app._close_app()
         self.app.destroy.assert_called_once()
+
+    def test_debug_only_disables_read_and_export(self):
+        self.comports.return_value = [SimpleNamespace(device="DEBUG", vid=0x1234),
+                                     SimpleNamespace(device="PROBE", vid=0x2E8A,
+                                                     product="Debug Probe")]
+        self.app.refresh_ports()
+        self.assertEqual(self.app.read_pico_btn.options["state"], "disabled")
+        self.assertEqual(self.app.export_pico_btn.options["state"], "disabled")
+        self.assertEqual(self.app.port_menu.options["values"], ["未识别到 Pico"])
+
+    def test_scan_lists_only_pico(self):
+        self.comports.return_value.append(SimpleNamespace(device="DEBUG", vid=None))
+        self.app.refresh_ports()
+        self.assertEqual(self.app.port_menu.options["values"], ["PORT"])
+
+    def test_stale_selection_never_starts_read_or_export(self):
+        self.comports.return_value = []
+        with mock.patch.object(viewer.threading, "Thread") as worker, mock.patch.object(viewer.filedialog, "asksaveasfilename") as dialog:
+            self.app.start_pico_read()
+            self.app.start_pico_export()
+        worker.assert_not_called()
+        dialog.assert_not_called()
+
+    def test_disconnect_before_worker_never_opens_transport(self):
+        self.comports.return_value = [SimpleNamespace(device="PORT", vid=0x1234)]
+        with mock.patch.object(viewer, "download_history") as download:
+            self.app._device_history_worker("PORT")
+        download.assert_not_called()
+        self.assertEqual(self.app.read_pico_btn.options["state"], "disabled")
 
 
 if __name__ == "__main__":

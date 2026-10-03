@@ -3,6 +3,9 @@ import time
 import rp2
 import json
 
+# Injected by the RAM loader; the production filesystem is not required.
+LOCO_TYPES = {}
+
 # 使用 jmp_pin 进行相对映射
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,
@@ -170,6 +173,8 @@ class LBJReceiver:
         self.last_fei_ppm = 0.0
         self.last_afc_hz = 0.0
         self.words_seen = 0
+        self.bits_total = 0
+        self.bits_one = 0
         self.fifo_highwater = 0
         self.fifo_full_hits = 0
         self._last_tick_entry_ms = None
@@ -243,10 +248,7 @@ class LBJReceiver:
             print("LBJ_CALLBACK_ERR", repr(exc))
 
     def _load_loco_types(self):
-        try:
-            with open(self.loco_file, 'r') as f: self.loco_types = json.load(f)
-        except Exception as exc:
-            print("LOCO_DB_ERR", repr(exc))
+        self.loco_types = LOCO_TYPES
 
     def _init_radio(self, spi_id, sck, mosi, miso, cs, rst):
         self.spi = machine.SPI(spi_id, baudrate=2000000, polarity=0, phase=0,
@@ -514,6 +516,8 @@ class LBJReceiver:
             "synced": self.synced,
             "ppm": self.ppm_offset,
             "words": self.words_seen,
+            "bits_total": self.bits_total,
+            "bits_one": self.bits_one,
             "fifo_highwater": self.fifo_highwater,
             "fifo_full_hits": self.fifo_full_hits,
             "max_tick_gap_ms": self.max_tick_gap_ms,
@@ -635,17 +639,9 @@ class LBJReceiver:
             return False
 
     def _loco_number_raw(self, loco_raw, type_code):
-        if self._is_five_digit_loco_code(type_code):
-            return loco_raw[3:8]
         if self._is_emu_loco_code(type_code):
             return loco_raw[3:7]
         return loco_raw[4:8]
-
-    def _is_five_digit_loco_code(self, type_code):
-        try:
-            return int(type_code) >= 344
-        except:
-            return False
 
     def _score_lbj_candidate(self, block):
         # 失败码字已经由 XXXXX 占满 5 个字符；不足 47 字符表示消息被截断，
@@ -1223,6 +1219,11 @@ class LBJReceiver:
         while drained < 8 and fifo_depth > 0:
             word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF
             self.words_seen = (self.words_seen + 1) & self.COUNTER_MASK
+            self.bits_total = (self.bits_total + 32) & self.COUNTER_MASK
+            bits = word
+            while bits:
+                bits &= bits - 1
+                self.bits_one = (self.bits_one + 1) & self.COUNTER_MASK
             self.last_word_time = now
             drained += 1
             fifo_depth = self.sm.rx_fifo()
