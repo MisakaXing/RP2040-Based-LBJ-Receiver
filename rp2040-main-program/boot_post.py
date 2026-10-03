@@ -2,11 +2,11 @@ import time
 import machine
 import sdcard
 
-BATTERY_ADC_GAIN = 1.04
+BATTERY_ADC_GAIN = 1.07
 BATTERY_EMPTY_V = 3.45
 
 def battery_voltage_from_raw(raw):
-    """Apply the measured W-board ADC gain correction to its 1:1 divider."""
+    """Apply the W receiver's voltage gain to the ADC reading."""
     return (raw / 65535.0) * 3.3 * 2.0 * BATTERY_ADC_GAIN
 
 class SystemPOST:

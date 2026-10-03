@@ -74,7 +74,7 @@ class NonHardwarePOST(SystemPOST):
 class BootPostTests(unittest.TestCase):
     def test_post_empty_threshold_is_3_45v(self):
         for voltage, empty in ((3.44, True), (3.46, False)):
-            raw = round(voltage / (6.6 * boot_post.BATTERY_ADC_GAIN) * 65535)
+            raw = round(voltage / boot_post.BATTERY_ADC_GAIN / 6.6 * 65535)
             post = SystemPOST(FakeTFT(), object())
             post.check_bat(types.SimpleNamespace(read_u16=lambda: raw),
                            types.SimpleNamespace(value=lambda _: None))
@@ -82,12 +82,13 @@ class BootPostTests(unittest.TestCase):
 
     def test_post_and_main_share_w_board_battery_calibration(self):
         raw = 39737
-        self.assertAlmostEqual(boot_post.battery_voltage_from_raw(raw), 4.162, places=2)
+        self.assertAlmostEqual(boot_post.battery_voltage_from_raw(raw),
+                               raw / 65535.0 * 6.6 * 1.07, places=8)
         post = SystemPOST(FakeTFT(), object())
         adc = types.SimpleNamespace(read_u16=lambda: raw)
         enable = types.SimpleNamespace(value=lambda _: None)
         post.check_bat(adc, enable)
-        self.assertTrue(any(b"4.16V" in call[0] for call in post.tft.draws))
+        self.assertTrue(any(b"4.28V" in call[0] for call in post.tft.draws))
 
     def test_empty_battery_waits_for_complete_checklist(self):
         checks = []
