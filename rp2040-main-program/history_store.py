@@ -26,7 +26,7 @@ DEFAULT_MAX_RECORD_BYTES = 1024
 DEFAULT_MAX_SCAN_LINE_BYTES = 4096
 CHECKPOINT_RECORD_INTERVAL = 64
 # Bump the schema whenever record validity or the index interpretation changes.
-CHECKPOINT_SCHEMA = 1
+CHECKPOINT_SCHEMA = 2
 CHECKPOINT_MAGIC = b"LBJIDX01"
 CHECKPOINT_HEADER = "<8s8I"
 CHECKPOINT_HEADER_BYTES = 40
@@ -94,6 +94,24 @@ def _valid_train_number(value):
     return 1 <= len(text) <= 8 and text.isdigit()
 
 
+def _valid_measurement(value, limit):
+    try:
+        number = float(value)
+        return number == number and abs(number) <= limit
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_placeholder_basic(basic):
+    if not isinstance(basic, dict) or basic.get("train_no") != "---":
+        return False
+    speed = basic.get("speed_kmh")
+    km = basic.get("km_post")
+    return (_valid_measurement(speed, 500)
+            or _valid_measurement(km, 100000)
+            or (speed == "---" and km == "---"))
+
+
 def _has_history_extended_fields(extended):
     return (
         isinstance(extended, dict)
@@ -112,11 +130,12 @@ def is_valid_history_record(record):
     has_train = isinstance(basic, dict) and _valid_train_number(
         basic.get("train_no")
     )
+    has_placeholder_basic = _valid_placeholder_basic(basic)
     # An explicit extended-only message is still a real receiver event when
     # the extension parser could not recover any display field.  Keep its
     # timestamp/RIC/RSSI instead of silently deleting it from the machine log.
     has_extension = data.get("type") == "extended_only"
-    return has_train or has_extension
+    return has_train or has_placeholder_basic or has_extension
 
 
 def _bounded_field(value, max_chars):
@@ -139,22 +158,22 @@ def make_history_record(received_at, data):
     has_train = isinstance(basic, dict) and _valid_train_number(
         basic.get("train_no")
     )
+    has_placeholder_basic = _valid_placeholder_basic(basic)
     source_extended = data.get("extended")
     if not isinstance(source_extended, dict):
         source_extended = {}
     has_extension_fields = _has_history_extended_fields(source_extended)
     explicit_extension = msg_type == "extended_only"
-    if not has_train and not explicit_extension and not has_extension_fields:
+    if not has_train and not has_placeholder_basic and not explicit_extension and not has_extension_fields:
         return None
 
-    # Some transmitters send a placeholder basic half ("--- --- ---") with a
-    # valid extension.  Older parser versions labelled that train_data_full,
-    # but semantically it is extended-only because there is no train number.
-    if not has_train:
+    # Preserve complete BASIC placeholders, including "--- --- ---".  Only
+    # truly missing BASIC data is normalized to an extended-only record.
+    if not has_train and not has_placeholder_basic:
         msg_type = "extended_only"
 
     stored_basic = {}
-    if has_train:
+    if has_train or has_placeholder_basic:
         stored_basic["train_no"] = str(basic.get("train_no"))[:8]
         for name in BASIC_HISTORY_FIELDS:
             if name in basic:

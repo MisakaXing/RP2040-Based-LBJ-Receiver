@@ -35,6 +35,9 @@ class ParserHarness:
         self._parse_train_data = types.MethodType(
             receiver_class._parse_train_data, self
         )
+        self._has_usable_basic = types.MethodType(
+            receiver_class._has_usable_basic, self
+        )
         self.basic = basic
 
     def _find_lbj_block(self, _message):
@@ -55,6 +58,9 @@ class BasicOnlyHarness:
         self.receiver_class = receiver_class
         self._parse_train_data = types.MethodType(
             receiver_class._parse_train_data, self
+        )
+        self._has_usable_basic = types.MethodType(
+            receiver_class._has_usable_basic, self
         )
 
     def _find_lbj_block(self, _message):
@@ -82,7 +88,7 @@ class LBJReceiverParserTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = load_receiver_module()
 
-    def test_placeholder_basic_plus_extension_is_extended_only(self):
+    def test_placeholder_basic_plus_extension_is_full_data(self):
         parser = ParserHarness(self.module.LBJReceiver, {
             "train_no": "---",
             "speed_kmh": "---",
@@ -90,8 +96,8 @@ class LBJReceiverParserTests(unittest.TestCase):
             "placeholder": True,
         })
         result = parser._parse_train_data("--- --- --- " + "0" * 47)
-        self.assertEqual(result["type"], "extended_only")
-        self.assertNotIn("basic", result)
+        self.assertEqual(result["type"], "train_data_full")
+        self.assertTrue(result["basic"]["placeholder"])
         self.assertEqual(result["extended"]["loco_type"], "HXD3D-0324")
 
     def test_numeric_basic_plus_extension_remains_full(self):
@@ -134,13 +140,48 @@ class LBJReceiverParserTests(unittest.TestCase):
                 self.assertEqual(basic["km_post"], km)
                 self.assertEqual(basic.get("partial", False), partial)
 
-    def test_placeholder_and_invalid_train_are_not_basic_records(self):
+    def test_missing_train_keeps_one_valid_measurement(self):
+        parser = BasicOnlyHarness(self.module.LBJReceiver)
+        cases = (
+            ("--- 7 ---", "7", "---"),
+            ("--- --- 7", "---", 0.7),
+            ("---- 7 ---", "7", "---"),
+            ("- 7 ---", "7", "---"),
+        )
+        for message, speed, km in cases:
+            with self.subTest(message=message):
+                basic = parser._parse_basic(message)
+                self.assertEqual(basic["train_no"], "---")
+                self.assertEqual(basic["speed_kmh"], speed)
+                self.assertEqual(basic["km_post"], km)
+                self.assertTrue(basic["partial"])
+                result = parser._parse_train_data(message)
+                self.assertEqual(result["type"], "basic_only")
+                self.assertEqual(result["basic"], basic)
+
+        full = FullParserHarness(self.module.LBJReceiver)
+        full._find_lbj_block = lambda _message: len("--- 7 --- ")
+        combined = full._parse_train_data("--- 7 --- " + "0" * 47)
+        self.assertEqual(combined["type"], "train_data_full")
+        self.assertEqual(combined["basic"]["speed_kmh"], "7")
+
+        numeric = parser._parse_train_data("7 --- ----")
+        self.assertEqual(numeric["type"], "basic_only")
+        self.assertEqual(numeric["basic"]["train_no"], "7")
+        self.assertEqual(numeric["basic"]["speed_kmh"], "---")
+        self.assertEqual(numeric["basic"]["km_post"], "---")
+
+    def test_all_placeholders_are_basic_but_corrupt_fields_are_not(self):
         parser = BasicOnlyHarness(self.module.LBJReceiver)
 
-        self.assertEqual(
-            parser._parse_train_data("--- --- ---")["type"], "unknown"
-        )
-        for message in ("ABC --- ---", "123456789 --- ---"):
+        for message in ("--- --- ---", "--- ---- -----", "- - ----"):
+            with self.subTest(message=message):
+                result = parser._parse_train_data(message)
+                self.assertEqual(result["type"], "basic_only")
+                self.assertTrue(result["basic"]["placeholder"])
+        for message in ("ABC --- ---", "123456789 --- ---",
+                        "--- BAD ---", "--- --- 1000001",
+                        "--- 501 ---", "0D139 7 ---"):
             with self.subTest(message=message):
                 self.assertEqual(parser._parse_basic(message), {})
                 self.assertEqual(

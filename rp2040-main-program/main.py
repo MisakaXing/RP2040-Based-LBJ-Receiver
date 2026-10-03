@@ -92,6 +92,8 @@ wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
 last_hw_update = 0  
 last_hw_draw = None
 HW_SAMPLE_INTERVAL_MS = 5000
+USB_SAMPLE_INTERVAL_MS = 1000
+last_usb_update = None
 last_rssi_str = "N/A" 
 hist_rssi_str = "N/A" # 用于单独储存历史记录的 RSSI
 screen_is_on = True 
@@ -105,8 +107,15 @@ last_temp_str = None
 # 1. 硬件 IO 初始化
 
 tft_cs = Pin(9, Pin.OUT, value=1) 
-spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
-tft = ILI9341(spi1, cs=9, dc=12, rst=13)
+_boot_display = globals().pop('_boot_display', None)
+boot_started_ms = None
+boot_first_frame_ms = None
+if _boot_display is not None:
+    spi1, tft, boot_started_ms, boot_first_frame_ms = _boot_display
+else:
+    spi1 = machine.SPI(1, baudrate=20000000, sck=Pin(10), mosi=Pin(11), miso=Pin(8, Pin.IN, Pin.PULL_UP))
+    tft = ILI9341(spi1, cs=9, dc=12, rst=13)
+del _boot_display
 spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 
 sd_cs = Pin(7, Pin.OUT, value=1)
@@ -476,29 +485,44 @@ def get_battery_info():
 def sample_device_status(now, force=False):
     """Share one bounded ADC sample between the LCD and wireless snapshot."""
     global last_hw_update, last_battery_v, last_battery_p, last_temp_str, last_usb_power
-    sample_interval = HW_SAMPLE_INTERVAL_MS
-    if (not force and last_battery_v is not None
-            and time.ticks_diff(now, last_hw_update) < sample_interval):
+    global last_usb_update
+    previous_usb = last_usb_power
+    if (last_usb_update is None
+            or time.ticks_diff(now, last_usb_update) >= USB_SAMPLE_INTERVAL_MS):
+        detected_usb = usb_power_present()
+        if detected_usb is not None:
+            last_usb_power = detected_usb
+        last_usb_update = now
+    sample_due = (force or last_battery_v is None
+                  or time.ticks_diff(now, last_hw_update) >= HW_SAMPLE_INTERVAL_MS)
+    if not sample_due and previous_usb == last_usb_power:
         return
     battery_percent = None
     temp_c = None
     previous_percent = last_battery_p
-    previous_usb = last_usb_power
-    last_usb_power = usb_power_present() is True
+    if sample_due:
+        try:
+            last_battery_v, last_battery_p = get_battery_info()
+        except Exception:
+            last_battery_v, last_battery_p = "---", "---"
+        try:
+            reading = sensor_temp.read_u16() * (3.3 / 65535.0)
+            temp_c = round(27 - (reading - 0.706) / 0.001721, 1)
+            if not -100 <= temp_c <= 200:
+                temp_c = None
+        except Exception:
+            pass
+        last_temp_str = "ERR" if temp_c is None else f"{temp_c:.1f}C"
+        last_hw_update = now
     try:
-        last_battery_v, last_battery_p = get_battery_info()
         battery_percent = int(last_battery_p.rstrip('%'))
     except Exception:
-        last_battery_v, last_battery_p = "---", "---"
-    try:
-        reading = sensor_temp.read_u16() * (3.3 / 65535.0)
-        temp_c = round(27 - (reading - 0.706) / 0.001721, 1)
-        if not -100 <= temp_c <= 200:
-            temp_c = None
-    except Exception:
         pass
-    last_temp_str = "ERR" if temp_c is None else f"{temp_c:.1f}C"
-    last_hw_update = now
+    if not sample_due:
+        try:
+            temp_c = float(last_temp_str[:-1])
+        except (TypeError, ValueError):
+            pass
     try:
         voltage = float(last_battery_v[:-1])
     except (TypeError, ValueError):
@@ -521,7 +545,7 @@ def service_low_battery(now):
     """Protect immediately at 0%, unless USB is supplying the board."""
     if low_battery_shutdown or last_battery_p != "0%":
         return
-    if usb_power_present() is not True:
+    if not last_usb_power:
         enter_low_battery_shutdown()
 
 def enter_low_battery_shutdown():
@@ -968,9 +992,10 @@ def draw_hardware_bar(force=False):
     global last_hw_draw
     now = time.ticks_ms()
     sample_device_status(now)
-    if not force and last_hw_draw == last_hw_update:
+    draw_state = (last_hw_update, last_usb_power)
+    if not force and last_hw_draw == draw_state:
         return
-    last_hw_draw = last_hw_update
+    last_hw_draw = draw_state
 
     v, p, t = last_battery_v, last_battery_p, last_temp_str
     
@@ -1113,9 +1138,23 @@ def display_train_data(basic, ext, is_full_mode=True, is_history=False,
 
         loco = str(ext.get('loco_type', '----'))
         cab = str(ext.get('cab_end', ''))
-        if cab == '31': loco += 'A'
+        small_cab = b''
+        loco_raw = str(ext.get('loco_raw', ''))
+        separator = loco.rfind('-')
+        number = loco[separator + 1:] if separator >= 0 else ''
+        has_five_digit_raw = (len(loco_raw) == 8 and loco_raw[:3].isdigit()
+                              and int(loco_raw[:3]) >= 344)
+        if has_five_digit_raw or (len(number) == 5 and number.isdigit()):
+            if has_five_digit_raw and separator >= 0:
+                loco = loco[:separator + 1] + loco_raw[3:8]
+            small_cab = b'A' if cab == '31' else b'B' if cab == '32' else b''
+        elif cab == '31': loco += 'A'
         elif cab == '32': loco += 'B'
-        tft.draw_gbk(encode_loco_gbk(loco), 53, y3, WHITE, bg_color, scale=2)
+        loco_bytes = encode_loco_gbk(loco)
+        tft.draw_gbk(loco_bytes, 53, y3, WHITE, bg_color, scale=2)
+        if small_cab:
+            tft.draw_gbk(small_cab, 53 + len(loco_bytes) * 16, y3 + 8,
+                         WHITE, bg_color, scale=1)
 
     lon = str(ext.get('lon') or '---').replace('°', ' ')
     lat = str(ext.get('lat') or '---').replace('°', ' ')
@@ -1423,6 +1462,10 @@ def process_ui_data(data):
 
 load_config()
 post = SystemPOST(tft, tft_cs)
+if boot_started_ms is not None:
+    print('BOOT_UI_TIMING', 'first_frame_ms=', boot_first_frame_ms,
+          'post_ms=', time.ticks_diff(time.ticks_ms(), boot_started_ms),
+          'screen_reused=', True)
 boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver, wifi_portal)
 wifi_module_ok = post.wifi_ok
 if not wifi_module_ok:

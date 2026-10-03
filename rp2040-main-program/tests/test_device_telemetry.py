@@ -228,18 +228,17 @@ class DeviceSamplingTests(unittest.TestCase):
     def test_zero_protection_is_immediate_and_usb_inhibits_shutdown(self):
         function = next(n for n in ast.parse((ROOT / "main.py").read_text()).body
                         if isinstance(n, ast.FunctionDef) and n.name == "service_low_battery")
-        power = [False]
         shutdown = Mock()
         ns = {"low_battery_shutdown": False, "last_battery_p": "0%",
-              "usb_power_present": lambda: power[0], "enter_low_battery_shutdown": shutdown}
+              "last_usb_power": False, "enter_low_battery_shutdown": shutdown}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), ns)
         ns["service_low_battery"](0)
         shutdown.assert_called_once()
         shutdown.reset_mock()
-        power[0] = True
+        ns["last_usb_power"] = True
         ns["service_low_battery"](1)
         shutdown.assert_not_called()
-        power[0] = False
+        ns["last_usb_power"] = False
         ns["last_battery_p"] = "1%"
         ns["service_low_battery"](2)
         shutdown.assert_not_called()
@@ -255,6 +254,7 @@ class DeviceSamplingTests(unittest.TestCase):
         self.ns = {
             "last_hw_update": 0, "last_battery_v": None, "last_battery_p": None,
             "last_temp_str": None, "HW_SAMPLE_INTERVAL_MS": 5000,
+            "last_usb_update": None, "USB_SAMPLE_INTERVAL_MS": 1000,
             "top_bar_ready": False,
             "system_state": "DASHBOARD",
             "time": SimpleNamespace(ticks_diff=lambda a, b: a - b, sleep_ms=Mock()),
@@ -295,8 +295,24 @@ class DeviceSamplingTests(unittest.TestCase):
         self.assertIn("<strong id=battery>CHRG</strong>", page)
         self.assertIn('class="metric charging" id=batteryCard', page)
         self.ns["usb_power_present"].return_value = False
-        self.ns["sample_device_status"](200, force=True)
+        self.ns["sample_device_status"](1200, force=True)
         self.assertIsNotNone(self.ns["wifi_portal"]._device_view()["battery_percent"])
+
+    def test_usb_changes_at_one_second_without_resampling_battery(self):
+        sample = self.ns["sample_device_status"]
+        sample(100)
+        self.ns["usb_power_present"].return_value = True
+        sample(1099)
+        self.assertFalse(self.ns["last_usb_power"])
+        sample(1100)
+        self.assertTrue(self.ns["last_usb_power"])
+        self.assertTrue(self.ns["wifi_portal"]._device_view()["usb_power"])
+        self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 3)
+        self.assertEqual(self.ns["sensor_temp"].read_u16.call_count, 1)
+        self.ns["usb_power_present"].return_value = None
+        sample(2100)
+        self.assertTrue(self.ns["last_usb_power"])
+        self.assertEqual(self.ns["usb_power_present"].call_count, 3)
 
     def test_w_board_gain_matches_meter_reference(self):
         raw = 39737

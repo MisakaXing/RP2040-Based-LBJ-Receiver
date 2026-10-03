@@ -3,6 +3,9 @@ import time
 import rp2
 import json
 
+# Injected by the RAM loader; the production filesystem is not required.
+LOCO_TYPES = {}
+
 # 使用 jmp_pin 进行相对映射
 @rp2.asm_pio(
     in_shiftdir=rp2.PIO.SHIFT_LEFT,
@@ -60,18 +63,12 @@ class FixedQueue:
         self._count -= 1
         return item
 
-    def peek(self):
-        if self._count == 0:
-            return None
-        return self._items[self._head]
-
     def clear(self):
         while self._count:
             self.get()
 
 class LBJReceiver:
     COUNTER_MASK = 0x3FFFFFFF
-    MAX_NUMERIC_CHARS = 256
     FXOSC = 32000000
     FRF_SCALE = 524288
     FSTEP_HZ = FXOSC / FRF_SCALE
@@ -176,6 +173,8 @@ class LBJReceiver:
         self.last_fei_ppm = 0.0
         self.last_afc_hz = 0.0
         self.words_seen = 0
+        self.bits_total = 0
+        self.bits_one = 0
         self.fifo_highwater = 0
         self.fifo_full_hits = 0
         self._last_tick_entry_ms = None
@@ -196,7 +195,6 @@ class LBJReceiver:
         self.corrupt_since_log = 0
         self.spi_errors = 0
         self.callback_errors = 0
-        self.oversize_messages = 0
         print("BOOT_PPM", self.ppm_offset, "profile=stable_hardware_afc")
         
         self.POCSAG_SYNC  = 0x7CD215D8
@@ -250,10 +248,7 @@ class LBJReceiver:
             print("LBJ_CALLBACK_ERR", repr(exc))
 
     def _load_loco_types(self):
-        try:
-            with open(self.loco_file, 'r') as f: self.loco_types = json.load(f)
-        except Exception as exc:
-            print("LOCO_DB_ERR", repr(exc))
+        self.loco_types = LOCO_TYPES
 
     def _init_radio(self, spi_id, sck, mosi, miso, cs, rst):
         self.spi = machine.SPI(spi_id, baudrate=2000000, polarity=0, phase=0,
@@ -521,6 +516,8 @@ class LBJReceiver:
             "synced": self.synced,
             "ppm": self.ppm_offset,
             "words": self.words_seen,
+            "bits_total": self.bits_total,
+            "bits_one": self.bits_one,
             "fifo_highwater": self.fifo_highwater,
             "fifo_full_hits": self.fifo_full_hits,
             "max_tick_gap_ms": self.max_tick_gap_ms,
@@ -542,7 +539,6 @@ class LBJReceiver:
             "corrupt": self.corrupt_messages,
             "spi_errors": self.spi_errors,
             "callback_errors": self.callback_errors,
-            "oversize_messages": self.oversize_messages,
             "sync_age_ms": time.ticks_diff(now, self.last_sync_time),
             "word_age_ms": time.ticks_diff(now, self.last_word_time),
         }
@@ -643,17 +639,9 @@ class LBJReceiver:
             return False
 
     def _loco_number_raw(self, loco_raw, type_code):
-        if self._is_five_digit_loco_code(type_code):
-            return loco_raw[3:8]
         if self._is_emu_loco_code(type_code):
             return loco_raw[3:7]
         return loco_raw[4:8]
-
-    def _is_five_digit_loco_code(self, type_code):
-        try:
-            return int(type_code) >= 344
-        except:
-            return False
 
     def _score_lbj_candidate(self, block):
         # 失败码字已经由 XXXXX 占满 5 个字符；不足 47 字符表示消息被截断，
@@ -862,9 +850,6 @@ class LBJReceiver:
             ext_dict["block_start"] = lbj_start_idx
             if basic_str:
                 basic_dict = self._parse_basic(basic_str)
-                # "--- --- ---" is a placeholder basic half, not a train.
-                # Treat it as extended-only so downstream history does not
-                # reject an otherwise valid extension for lacking a number.
                 if self._has_usable_basic(basic_dict):
                     return {"type": "train_data_full", "raw": msg_clean, "basic": basic_dict, "extended": ext_dict}
                 return {"type": "extended_only", "raw": msg_clean, "extended": ext_dict, "garbage_prefix": basic_str}
@@ -1112,19 +1097,6 @@ class LBJReceiver:
                   "uncorrectable=", self.uncorrectable_codewords)
             self.last_resync_log = now
 
-    def _append_numeric(self, text):
-        if len(self.numeric_output) + len(text) > self.MAX_NUMERIC_CHARS:
-            self.oversize_messages = (
-                self.oversize_messages + 1
-            ) & self.COUNTER_MASK
-            self.numeric_output = ""
-            self.current_address = ""
-            self.pending_fei_hz = None
-            self.pending_afc_hz = None
-            return False
-        self.numeric_output += text
-        return True
-
     def _decode_codeword(self, codeword, now):
         self.codewords_seen = (self.codewords_seen + 1) & self.COUNTER_MASK
         cw_fixed, err_status = self._correct_bch(codeword)
@@ -1136,7 +1108,7 @@ class LBJReceiver:
             ) & self.COUNTER_MASK
             self.bad_codeword_streak += 1
             if self.current_address:
-                self._append_numeric("XXXXX")
+                self.numeric_output += "XXXXX"
             if self.bad_codeword_streak >= self.MAX_BAD_CODEWORDS:
                 self._lose_sync("bch_streak")
             return
@@ -1195,8 +1167,7 @@ class LBJReceiver:
                 | ((nibble & 4) >> 1)
                 | ((nibble & 8) >> 3)
             )
-            if not self._append_numeric(self.BCD_MAP[nibble_rev]):
-                break
+            self.numeric_output += self.BCD_MAP[nibble_rev]
 
     def _process_raw_queue(self):
         processed = 0
@@ -1248,6 +1219,11 @@ class LBJReceiver:
         while drained < 8 and fifo_depth > 0:
             word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF
             self.words_seen = (self.words_seen + 1) & self.COUNTER_MASK
+            self.bits_total = (self.bits_total + 32) & self.COUNTER_MASK
+            bits = word
+            while bits:
+                bits &= bits - 1
+                self.bits_one = (self.bits_one + 1) & self.COUNTER_MASK
             self.last_word_time = now
             drained += 1
             fifo_depth = self.sm.rx_fifo()

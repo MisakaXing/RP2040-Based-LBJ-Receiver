@@ -172,6 +172,31 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(loaded["d"]["basic"]["speed_kmh"], "---")
         self.assertEqual(loaded["d"]["basic"]["km_post"], "---")
 
+    def test_missing_train_with_one_measurement_survives_restart(self):
+        store = self.make_store(index_stride=1)
+        self.assertEqual(store.scan(), 0)
+        for basic in (
+            {"train_no": "---", "speed_kmh": "7", "km_post": "---", "partial": True},
+            {"train_no": "---", "speed_kmh": "---", "km_post": 0.7, "partial": True},
+        ):
+            compact = make_history_record("now", {"type": "basic_only", "basic": basic})
+            self.assertIsNotNone(compact)
+            self.assertEqual(compact["d"]["type"], "basic_only")
+            self.assertEqual(compact["d"]["basic"]["train_no"], "---")
+            self.assertTrue(is_valid_history_record(compact))
+            self.assertEqual(store.append(compact), APPEND_OK)
+        restarted = self.make_store(index_stride=1)
+        self.assertEqual(restarted.scan(), 2)
+        self.assertEqual(restarted.load(0)["d"]["basic"]["speed_kmh"], "7")
+        self.assertEqual(restarted.load(1)["d"]["basic"]["km_post"], 0.7)
+
+        all_missing = make_history_record("now", {"type": "basic_only", "basic": {
+            "train_no": "---", "speed_kmh": "---", "km_post": "---", "placeholder": True
+        }})
+        self.assertIsNotNone(all_missing)
+        self.assertTrue(is_valid_history_record(all_missing))
+        self.assertEqual(all_missing["d"]["type"], "basic_only")
+
     def test_extended_only_is_compacted_and_valid_without_train_number(self):
         source = extended_record()["d"]
         source["raw"] = "X" * 4000
@@ -200,7 +225,7 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertIsNotNone(partial)
         self.assertTrue(is_valid_history_record(partial))
 
-    def test_placeholder_full_message_is_normalized_to_extended_only(self):
+    def test_placeholder_full_message_keeps_basic_fields(self):
         source = extended_record()["d"]
         source["type"] = "train_data_full"
         source["basic"] = {
@@ -211,8 +236,10 @@ class HistoryStoreTests(unittest.TestCase):
         }
         compact = make_history_record("now", source)
         self.assertIsNotNone(compact)
-        self.assertEqual(compact["d"]["type"], "extended_only")
-        self.assertEqual(compact["d"]["basic"], {})
+        self.assertEqual(compact["d"]["type"], "train_data_full")
+        self.assertEqual(compact["d"]["basic"]["train_no"], "---")
+        self.assertEqual(compact["d"]["basic"]["speed_kmh"], "---")
+        self.assertEqual(compact["d"]["basic"]["km_post"], "---")
         self.assertEqual(
             compact["d"]["extended"]["loco_type"], "前进-1234"
         )
