@@ -82,7 +82,9 @@ class HistoryTimeTests(unittest.TestCase):
                       HISTORY_QUEUE_CAPACITY=8, history_queue=Queue(),
                       sd_log_queue=Queue(), HISTORY_RADIO_QUIET_MS=0,
                       STORAGE_WRITE_GAP_MS=0, last_storage_write=0,
-                      receiver=SimpleNamespace(last_word_time=0, raw_queue=[]),
+                      receiver=SimpleNamespace(last_word_time=0, raw_queue=[],
+                                               input_is_buffered=lambda:False,
+                                               input_pending=lambda:0),
                       time=SimpleNamespace(ticks_diff=lambda a,b:a-b),
                       history_offsets=array.array("I"),
                       HIST_FILE=str(Path(directory) / "history.jsonl"),
@@ -103,7 +105,7 @@ class HistoryTimeTests(unittest.TestCase):
     def test_main_wires_history_only(self):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         ast.parse(source)
-        self.assertIn('Program_ver = 5.9', source)
+        self.assertIn('Program_ver = "5.11"', source)
         self.assertIn('{format_history_time(hist_time)}', source)
 
 

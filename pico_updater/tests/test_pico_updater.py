@@ -257,6 +257,19 @@ class FirmwareSelectionTests(unittest.TestCase):
         selected, missing = updater.select_runtime_files(wireless, items)
         self.assertNotIn('boot.py', [item['name'] for item in selected])
 
+    def test_optional_dma_and_protection_files_precede_main_on_both_profiles(self):
+        for label in (updater.STANDARD_CHANNEL_LABEL, updater.WIRELESS_CHANNEL_LABEL):
+            profile = profile_for(label)
+            items = [{"name": name, "type": "file"} for name in profile["runtime_files"]]
+            selected, missing = updater.select_runtime_files(profile, items)
+            self.assertEqual(missing, [])
+            items += [{"name": name, "type": "file"} for name in ("pio_dma_rx.py", "device_protection.py")]
+            selected, missing = updater.select_runtime_files(profile, items)
+            names = [item["name"] for item in selected]
+            self.assertEqual(missing, [])
+            self.assertLess(names.index("pio_dma_rx.py"), names.index("main.py"))
+            self.assertLess(names.index("device_protection.py"), names.index("main.py"))
+
     def test_online_w_prepare_uses_frozen_branch_and_exact_allowlist(self):
         app = updater.PicoUpdaterApp.__new__(updater.PicoUpdaterApp)
         app.github_repo = updater.GITHUB_REPO

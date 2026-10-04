@@ -1,6 +1,7 @@
 import time
 import machine
 import sdcard
+from device_protection import BATTERY_EMPTY_V
 
 class SystemPOST:
     BLACK = 0x0000
@@ -21,6 +22,7 @@ class SystemPOST:
         self.has_warning = False
         self.has_critical_error = False
         self.rtc_error = False 
+        self.low_battery = False
         self.current_label = ""
         self.tft.fill(self.BLACK)
         self.tft.fill_rect(0, 0, 320, 42, self.PANEL)
@@ -44,6 +46,9 @@ class SystemPOST:
         elif status == "ERR":
             self.has_critical_error = True
             tag, color = b'FAIL', self.RED
+        elif status == "WARN_RED":
+            self.has_warning = True
+            tag, color = b'WARN', self.RED
         else:
             tag, color = b'OPTIONAL', self.MUTED
         self.tft.draw_gbk(tag, 132, self.y, color, row_bg)
@@ -53,8 +58,7 @@ class SystemPOST:
 
     def check_sys_ver(self, ver, is_es):
         self._check_start("FIRMWARE")
-        if is_es == 1: self._check_end("WARN", f"v{ver} (Eng Ver)") 
-        else: self._check_end("OK", f"v{ver} (Release)")
+        self._check_end("WARN" if is_es == 1 else "OK", f"v{ver}")
 
     def check_sx1276(self, spi_id=0, sck=18, mosi=19, miso=16, cs=17, rst=15):
         self._check_start("RADIO")
@@ -73,10 +77,16 @@ class SystemPOST:
     # 电池电压三段式检查
     def check_bat(self, bat_adc, bat_en):
         self._check_start("BATTERY")
-        bat_en.value(0); time.sleep_ms(10); raw = bat_adc.read_u16(); bat_en.value(1)
+        bat_en.value(0)
+        try:
+            time.sleep_ms(10)
+            raw = bat_adc.read_u16()
+        finally:
+            bat_en.value(1)
         volts = (raw / 65535.0) * 3.3 * 2 + 0.174
-        if volts < 3.5:
-            self._check_end("ERR", f"{volts:.2f}V (CRITICAL)")
+        self.low_battery = volts <= BATTERY_EMPTY_V
+        if self.low_battery:
+            self._check_end("WARN_RED", f"{volts:.2f}V (EMPTY)")
         elif volts < 3.7:
             self._check_end("WARN", f"{volts:.2f}V (LOW)")
         else:
@@ -85,7 +95,8 @@ class SystemPOST:
     def check_temp(self, sensor_temp):
         self._check_start("TEMPERATURE")
         t = 27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721
-        if 10 <= t <= 45: self._check_end("OK", f"{t:.1f}C (Norm)")
+        if t > 45: self._check_end("WARN_RED", f"{t:.1f}C (HOT)")
+        elif t >= 10: self._check_end("OK", f"{t:.1f}C (Norm)")
         else: self._check_end("WARN", f"{t:.1f}C (Abnorm)")
 
     def check_rtc(self, rtc):

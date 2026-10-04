@@ -11,10 +11,12 @@ from lbj_receiver import LBJReceiver, FixedQueue
 from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY, MAGENTA
 from rtc_ds3231 import DS3231, format_history_time
 from boot_post import SystemPOST
+from device_protection import DeviceProtection, battery_percent
 
 # 系统性能配置
 
 CPU_FREQ_HZ = 200000000
+LOW_BATTERY_CPU_HZ = 18000000
 TFT_SPI_BAUD = 60000000
 UI_QUEUE_CAPACITY = 16
 HISTORY_QUEUE_CAPACITY = 24
@@ -32,7 +34,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = 5.9
+Program_ver = "5.11"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -45,7 +47,10 @@ RADIO_HEARTBEAT = 0
 RADIO_CONSECUTIVE_ERRORS = 1
 RADIO_TOTAL_ERRORS = 2
 RADIO_LAST_ERROR_LOG = 3
-radio_state = [time.ticks_ms(), 0, 0, 0]
+RADIO_RUNNING = 4
+RADIO_STOPPED = 5
+RADIO_BUSY = 6
+radio_state = [time.ticks_ms(), 0, 0, 0, True, True, False]
 last_radio_health_log = 0
 last_storage_write = 0
 
@@ -57,6 +62,15 @@ last_battery_v = None
 last_battery_p = None
 last_temp_str = None
 last_vbus_display = None
+last_usb_power = False
+last_usb_update = None
+last_hw_draw = None
+HW_SAMPLE_INTERVAL_MS = 5000
+USB_SAMPLE_INTERVAL_MS = 1000
+low_battery_shutdown = False
+top_bar_ready = False
+last_top_status = None
+protection = DeviceProtection()
 
 # 1. 硬件 IO 初始化
 
@@ -290,13 +304,101 @@ def get_rtc_date_for_edit():
     return 26, 1, 1
 
 def get_battery_info():
-    bat_en.value(0); time.sleep_ms(5)
-    raw = bat_adc.read_u16()
-    bat_en.value(1)
+    bat_en.value(0)
+    try:
+        time.sleep_ms(5)
+        readings = [bat_adc.read_u16() for _ in range(3)]
+    finally:
+        bat_en.value(1)
+    readings.sort()
+    raw = readings[1]
     raw_volts = (raw / 65535) * 3.3 * 2
     volts = raw_volts + BAT_OFFSET
-    percent = int((volts - 3.4) / (4.2 - 3.4) * 100)
-    return f"{volts:.1f}V", f"{max(0, min(100, percent))}%"
+    return f"{volts:.1f}V", f"{battery_percent(volts)}%"
+
+def usb_power_present():
+    try:
+        return bool(vbus_sense.value())
+    except Exception:
+        return None
+
+def sample_device_status(now, force=False):
+    global last_hw_update, last_battery_v, last_battery_p, last_temp_str
+    global last_usb_power, last_usb_update
+    previous_usb = last_usb_power
+    if (last_usb_update is None
+            or time.ticks_diff(now, last_usb_update) >= USB_SAMPLE_INTERVAL_MS):
+        detected = usb_power_present()
+        if detected is not None:
+            last_usb_power = detected
+        last_usb_update = now
+    sample_due = (force or last_battery_v is None
+                  or time.ticks_diff(now, last_hw_update) >= HW_SAMPLE_INTERVAL_MS)
+    if not sample_due and previous_usb == last_usb_power:
+        return
+    if sample_due:
+        try:
+            last_battery_v, last_battery_p = get_battery_info()
+        except Exception:
+            last_battery_v, last_battery_p = '---', '---'
+        try:
+            reading = sensor_temp.read_u16() * (3.3 / 65535.0)
+            temp_c = round(27 - (reading - 0.706) / 0.001721, 1)
+            last_temp_str = f'{temp_c:.1f}C' if -100 <= temp_c <= 200 else 'ERR'
+        except Exception:
+            last_temp_str = 'ERR'
+        last_hw_update = now
+    try:
+        percent = int(last_battery_p.rstrip('%'))
+    except (AttributeError, ValueError):
+        percent = None
+    try:
+        temp_c = float(last_temp_str[:-1])
+    except (TypeError, ValueError):
+        temp_c = None
+    protection.update(percent, temp_c, last_usb_power)
+
+def service_low_battery(now):
+    if not low_battery_shutdown and protection.empty_battery():
+        enter_low_battery_shutdown()
+
+def enter_low_battery_shutdown():
+    global low_battery_shutdown
+    if low_battery_shutdown:
+        return
+    low_battery_shutdown = True
+    radio_state[RADIO_RUNNING] = False
+    print('LOW_BATTERY_SHUTDOWN', last_battery_v, last_battery_p)
+    buzzer.value(0)
+    try:
+        tft.fill_rect(0, 26, 320, 164, BLACK)
+        tft.draw_gbk(b'LOW BATTERY', 72, 65, RED, BLACK, scale=2)
+        tft.draw_gbk(b'RECEPTION STOPPED', 88, 110, WHITE, BLACK)
+        tft.draw_gbk(b'CONNECT USB TO RESTART', 64, 140, YELLOW, BLACK)
+        time.sleep_ms(1000)
+    except Exception as exc:
+        print('LOW_BATTERY_WARNING_ERR', repr(exc))
+    finally:
+        set_screen_power(False)
+    for _ in range(50):
+        if radio_state[RADIO_STOPPED]:
+            break
+        time.sleep_ms(10)
+    if radio_state[RADIO_STOPPED]:
+        machine.freq(LOW_BATTERY_CPU_HZ)
+        print('LOW_BATTERY_CPU_HZ', machine.freq())
+    else:
+        print('LOW_BATTERY_CLOCK_SKIPPED_RADIO_RUNNING')
+    confirmations = 0
+    while True:
+        if usb_power_present() is True:
+            confirmations += 1
+            if confirmations >= 2:
+                print('LOW_BATTERY_USB_RESTART')
+                machine.reset()
+        else:
+            confirmations = 0
+        time.sleep_ms(1000)
 
 def set_screen_power(enabled):
     """Keep the active-low backlight and software state in sync."""
@@ -412,7 +514,10 @@ def service_history_storage(now):
     global last_storage_write
     if len(history_queue) == 0 and len(sd_log_queue) == 0:
         return
-    if time.ticks_diff(now, receiver.last_word_time) < HISTORY_RADIO_QUIET_MS:
+    if (not receiver.input_is_buffered()
+            and time.ticks_diff(now, receiver.last_word_time) < HISTORY_RADIO_QUIET_MS):
+        return
+    if receiver.input_pending() > 1:
         return
     if len(receiver.raw_queue) != 0:
         return
@@ -500,8 +605,9 @@ def log_to_sd(data):
 # 4. UI 绘制函数 
 
 def draw_ui_skeleton():
-    global last_screen_layout
-    last_screen_layout = None 
+    global last_screen_layout, top_bar_ready
+    last_screen_layout = None
+    top_bar_ready = True
     safe_fill_rect(0, 0, 320, 240, BLACK) 
     tft.fill_rect(0, 190, 320, 1, GRAY)
     tft.draw_gbk(b"BAT:", 5, 218, GRAY, BLACK)
@@ -517,50 +623,44 @@ def update_top_bar():
     tft.draw_gbk(t_str.encode(), 145, 4, YELLOW, 0x01CF)
     try: last_minute = int(t_str.split(':')[1])
     except: pass
-    tft.draw_gbk(current_status, 230, 4, current_status_color, 0x01CF)
+    draw_battery_top_status(force=True)
+
+def draw_battery_top_status(force=False):
+    global last_top_status
+    warning = protection.top_warning(time.ticks_ms())
+    status = warning if warning is not None else current_status
+    color = RED if warning is not None else current_status_color
+    state = (status, color)
+    if not force and state == last_top_status:
+        return
+    last_top_status = state
+    tft.fill_rect(226, 0, 94, 24, 0x01CF)
+    tft.draw_gbk(status, 230, 4, color, 0x01CF)
 
 def draw_hardware_bar(force=False):
-    global last_hw_update, last_rssi_str, hist_rssi_str, system_state
-    global last_battery_v, last_battery_p, last_temp_str, last_vbus_display
+    global last_hw_draw, last_vbus_display
     now = time.ticks_ms()
-    usb_powered = bool(vbus_sense.value())
-    sample_due = (
-        last_battery_v is None
-        or time.ticks_diff(now, last_hw_update) >= 30000
-    )
-    if not force and not sample_due and usb_powered == last_vbus_display:
-        return
-
-    if sample_due:
-        last_battery_v, last_battery_p = get_battery_info()
-        try:
-            reading = sensor_temp.read_u16() * (3.3 / 65535.0)
-            temp_c = 27 - (reading - 0.706) / 0.001721
-            last_temp_str = f"{temp_c:.1f}C"
-        except Exception:
-            last_temp_str = "ERR"
-        last_hw_update = now
-
-    v, p, t = last_battery_v, last_battery_p, last_temp_str
-    
-    # 处于 HISTORY 模式时，底部状态栏使用历史 RSSI
+    sample_device_status(now)
     r = hist_rssi_str if system_state == "HISTORY" else last_rssi_str
-    
-    raw_p = int(p.replace('%', ''))
-    bat_color = RED if raw_p < 20 else WHITE
-    
-    # CHRG is four characters; clear up to, but not over, the RSSI label.
+    state = (last_hw_update, last_usb_power, r)
+    if not force and last_hw_draw == state:
+        return
+    last_hw_draw = state
+    v, p, t = last_battery_v, last_battery_p, last_temp_str
+    try:
+        bat_color = RED if int(p.rstrip('%')) < 20 else WHITE
+    except (TypeError, ValueError):
+        bat_color = WHITE
     tft.fill_rect(45, 218, 75, 16, BLACK)
-    tft.draw_gbk(v.encode(), 45, 218, WHITE if usb_powered else bat_color, BLACK)
-    tft.draw_gbk(b'CHRG' if usb_powered else p.encode(), 85, 218,
-                 GREEN if usb_powered else bat_color, BLACK)
-    last_vbus_display = usb_powered
-    
+    tft.draw_gbk(str(v).encode(), 45, 218, WHITE if last_usb_power else bat_color, BLACK)
+    tft.draw_gbk(b'CHRG' if last_usb_power else str(p).encode(), 85, 218,
+                 GREEN if last_usb_power else bat_color, BLACK)
+    last_vbus_display = last_usb_power
     tft.fill_rect(170, 218, 70, 16, BLACK)
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
-    
     tft.fill_rect(265, 218, 50, 16, BLACK)
-    tft.draw_gbk(t.encode(), 265, 218, WHITE, BLACK)
+    tft.draw_gbk(str(t).encode(), 265, 218,
+                 RED if protection.temperature_red() else WHITE, BLACK)
 
 
 def draw_idle_screen():
@@ -794,7 +894,8 @@ def radio_core_task(receiver_obj, state=radio_state,
     # MicroPython starts this on core1 with its own global-name context.
     # Keep the clock module local, just as the known-stable receiver loop did.
     import time
-    while True:
+    while state[4]:
+        state[6] = True
         try:
             receiver_obj.tick()
             state[1] = 0
@@ -820,8 +921,18 @@ def radio_core_task(receiver_obj, state=radio_state,
                         print("RADIO_RECOVERY_ERR", repr(recovery_exc))
                     except Exception:
                         pass
+        finally:
+            state[6] = False
         state[0] = time.ticks_ms()
         time.sleep_ms(1)
+    try:
+        receiver_obj.stop()
+        state[5] = True
+        print('RADIO_STOPPED')
+    except Exception as exc:
+        print('RADIO_STOP_ERR', repr(exc))
+        # Do not acknowledge a failed stop: protection must skip clock changes.
+        state[5] = False
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
@@ -889,6 +1000,9 @@ spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 if boot_status == "HALT":
     while True: pass 
 
+# Finish all POST rows, then protect before scanning or starting reception.
+sample_device_status(time.ticks_ms(), force=True)
+service_low_battery(time.ticks_ms())
 # Potentially slow storage work runs only after the POST is already visible.
 init_history()
 check_sd_startup()
@@ -897,6 +1011,9 @@ receiver = LBJReceiver(ppm_offset=cfg_ppm_offset)
 receiver.set_callback(light_callback) 
 radio_state[RADIO_HEARTBEAT] = time.ticks_ms()
 last_radio_health_log = radio_state[RADIO_HEARTBEAT]
+radio_state[RADIO_STOPPED] = False
+# Release constructor temporaries before allocating the core-1 thread stack.
+gc.collect()
 _thread.start_new_thread(radio_core_task, (receiver,))
 
 if boot_status == "RTC_SYNC":
@@ -919,6 +1036,10 @@ heartbeat = False
 while True:
     now = time.ticks_ms()
     service_buzzer(now)
+    sample_device_status(now)
+    service_low_battery(now)
+    if screen_is_on and top_bar_ready:
+        draw_battery_top_status()
 
     if time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]) > RADIO_CORE_STALL_MS:
         if time.ticks_diff(now, radio_state[RADIO_LAST_ERROR_LOG]) >= 5000:
