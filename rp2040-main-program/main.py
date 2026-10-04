@@ -34,7 +34,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.11"
+Program_ver = "5.12"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 BAT_OFFSET = 0.174 
@@ -213,7 +213,8 @@ def get_serial_number():
 
 # 2. 系统全局变量
 Serial_Number = get_serial_number()
-MAX_HIST = 2500
+MAX_HIST = 2000
+HISTORY_RESERVE_BYTES = 16 * 1024
 HIST_FILE = "history.jsonl"
 SD_LOG_FILE = "/sd/lbj_log.jsonl"
 CONFIG_FILE = "config.json"
@@ -237,6 +238,8 @@ hist_ptr = -1
 total_count = 0
 
 history_offsets = array.array('I') 
+history_block_reason = None
+history_free_bytes = None
 last_interaction = time.ticks_ms()
 
 last_minute = -1 
@@ -468,42 +471,93 @@ def save_config():
         with open(CONFIG_FILE, 'w') as f: f.write(json.dumps(config))
     except: pass
 
+def history_is_full():
+    return bool(history_block_reason) or total_count + len(history_queue) >= MAX_HIST
+
+def block_history_saving(reason):
+    global history_block_reason
+    if history_block_reason is None:
+        print('HISTORY_SAVE_BLOCKED', reason, 'free=', history_free_bytes)
+    history_block_reason = reason
+    history_queue.clear()
+
+def check_history_space(required_bytes=0):
+    global history_free_bytes
+    try:
+        stat = os.statvfs('/')
+        block_size = stat[1] or stat[0]
+        history_free_bytes = block_size * stat[4]
+    except Exception as exc:
+        print('HISTORY_SPACE_ERR', repr(exc))
+        block_history_saving('space_check')
+        return False
+    # Account for whole allocation blocks and COW/metadata scratch space.
+    needed = (((required_bytes + block_size - 1) // block_size + 2) * block_size
+              if required_bytes else 0)
+    if history_free_bytes < HISTORY_RESERVE_BYTES + needed:
+        block_history_saving('space')
+        return False
+    return True
+
 def init_history():
-    global total_count, history_offsets
+    global total_count, history_offsets, history_block_reason, history_free_bytes
+    history_block_reason = None
+    history_free_bytes = None
     history_offsets = array.array('I')
     try:
         with open(HIST_FILE, 'r') as f:
             while True:
                 offset = f.tell()      
                 line = f.readline()    
-                if not line: break     
+                if not line: break
+                if not line.endswith('\n'):
+                    block_history_saving('incomplete_tail')
+                    break
                 history_offsets.append(offset)
         total_count = len(history_offsets)
-    except: 
-        total_count = 0; history_offsets = array.array('I')
+    except OSError as exc:
+        total_count = len(history_offsets)
+        if not exc.args or exc.args[0] != 2:
+            print('HISTORY_READ_ERR', repr(exc))
+            block_history_saving('read_error')
+    if total_count >= MAX_HIST:
+        block_history_saving('limit')
+    elif history_block_reason is None:
+        check_history_space()
 
 def save_history(data, received_at=None):
     global total_count, history_offsets
+    if history_block_reason is not None:
+        return False
     if total_count >= MAX_HIST:
+        block_history_saving('limit')
         return False
     try:
         t_str = received_at if received_at is not None else rtc.get_history_time_str()
         record = {"t": t_str, "d": data}
-        json_str = json.dumps(record) 
-        with open(HIST_FILE, 'a') as f:
-            f.seek(0, 2); offset = f.tell() 
-            f.write(json_str + '\n')
-            history_offsets.append(offset) 
+        payload = (json.dumps(record) + '\n').encode('utf-8')
+        # Only the quiet-gap storage service checks Flash, not the RF callback.
+        if not check_history_space(len(payload)):
+            return False
+        with open(HIST_FILE, 'ab') as f:
+            f.seek(0, 2); offset = f.tell()
+            if f.write(payload) != len(payload):
+                raise OSError('short history write')
+        # Publish an index only after write AND close/flush succeed.
+        history_offsets.append(offset)
         total_count += 1
+        if total_count >= MAX_HIST:
+            block_history_saving('limit')
         return True
     except Exception as exc:
         print("HISTORY_WRITE_ERR", repr(exc))
+        block_history_saving('write_error')
         return False
 
 def queue_history(data):
     # Flash writes can stall both RP2040 cores. Keep the real-time receiver
     # independent and persist only during a quiet gap between transmissions.
-    if total_count + len(history_queue) >= MAX_HIST:
+    if history_is_full():
         return False
     if len(history_queue) >= HISTORY_QUEUE_CAPACITY:
         return False
@@ -630,6 +684,10 @@ def draw_battery_top_status(force=False):
     warning = protection.top_warning(time.ticks_ms())
     status = warning if warning is not None else current_status
     color = RED if warning is not None else current_status_color
+    if warning is None and history_is_full():
+        status = (b'MEM FULL' if history_block_reason in (None, 'limit', 'space')
+                  else b'SAVE ERR')
+        color = RED
     state = (status, color)
     if not force and state == last_top_status:
         return
@@ -868,7 +926,7 @@ def draw_about():
     tft.draw_gbk(b'--- ABOUT DEVICE ---', 75, 40, CYAN, 0x2104)
     es_tag = " (ES)" if is_es_ver == 1 else " (Rel)"
     tft.draw_gbk(f"Version: v{Program_ver}{es_tag}".encode(), 40, 70, RED if is_es_ver == 1 else WHITE, 0x2104)
-    tft.draw_gbk(f"Records: {total_count}/2500".encode(), 40, 95, WHITE, 0x2104)
+    tft.draw_gbk(f"Records: {total_count}/{MAX_HIST}".encode(), 40, 95, WHITE, 0x2104)
     tft.draw_gbk(b"Author: " + Author_Name.encode(), 40, 120, YELLOW, 0x2104)
     tft.draw_gbk(b"Serial Number: " + Serial_Number.encode(), 40, 145, WHITE, 0x2104)
     tft.draw_gbk(b'Press OK to Return', 40, 175, GRAY, 0x2104)
@@ -973,7 +1031,7 @@ def process_ui_data(data):
             
             if system_state == "DASHBOARD":
                 # 内存满了强制在右上角显示红色的 MEM FULL
-                if total_count + len(history_queue) >= MAX_HIST:
+                if history_is_full():
                     current_status, current_status_color = b'MEM FULL', RED
                 else:
                     current_status, current_status_color = (b'FULL DATA', GREEN) if last_is_full else (b'BASIC', YELLOW)
@@ -1257,7 +1315,7 @@ while True:
             with ui_lock:
                 ui_queue.clear()
             open(HIST_FILE, 'w').close()
-            total_count = 0; hist_ptr = -1; history_offsets = array.array('I')
+            init_history(); hist_ptr = -1
             has_received = False; last_basic = {}; last_ext = {}; last_is_full = True
             current_status = b'READY'; current_status_color = GREEN
             need_post_train_gc = False

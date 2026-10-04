@@ -83,6 +83,7 @@ class ProtectionTests(unittest.TestCase):
         now=[100]
         screen=SimpleNamespace(fill_rect=Mock(),draw_gbk=Mock())
         ns=dict(protection=self.p,tft=screen,RED=1,WHITE=2,GREEN=3,BLACK=0,
+                history_is_full=lambda:False,history_block_reason=None,
                 last_top_status=None,current_status=b'READY',current_status_color=3,
                 time=SimpleNamespace(ticks_ms=lambda:now[0]),
                 sample_device_status=Mock(),last_hw_draw=None,last_hw_update=100,

@@ -66,7 +66,8 @@ class HistoryTimeTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         tree = ast.parse(source)
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ("save_history", "queue_history", "load_history_entry", "service_history_storage")]
+                 and n.name in ("save_history", "queue_history", "load_history_entry", "service_history_storage",
+                                "history_is_full", "block_history_saving", "check_history_space")]
         class Queue:
             def __init__(self):
                 self.items = deque()
@@ -76,9 +77,14 @@ class HistoryTimeTests(unittest.TestCase):
                 self.items.append(value)
             def get(self):
                 return self.items.popleft() if self.items else None
+            def clear(self):
+                self.items.clear()
         with tempfile.TemporaryDirectory() as directory:
             stamp = ["2026-09-19 23:59"]
             ns = dict(json=json, total_count=0, MAX_HIST=9999,
+                      history_block_reason=None, history_free_bytes=None,
+                      HISTORY_RESERVE_BYTES=16384,
+                      os=SimpleNamespace(statvfs=lambda _: (4096,4096,1000,900,900)),
                       HISTORY_QUEUE_CAPACITY=8, history_queue=Queue(),
                       sd_log_queue=Queue(), HISTORY_RADIO_QUIET_MS=0,
                       STORAGE_WRITE_GAP_MS=0, last_storage_write=0,
@@ -105,7 +111,7 @@ class HistoryTimeTests(unittest.TestCase):
     def test_main_wires_history_only(self):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         ast.parse(source)
-        self.assertIn('Program_ver = "5.11"', source)
+        self.assertIn('Program_ver = "5.12"', source)
         self.assertIn('{format_history_time(hist_time)}', source)
 
 
