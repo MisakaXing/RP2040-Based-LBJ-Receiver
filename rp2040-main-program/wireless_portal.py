@@ -9,8 +9,10 @@ module supplies wildcard DNS and HTTP only.
 import json
 import errno
 import gc
+import os
 import socket
 import time
+from rtc_ds3231 import format_history_time
 
 try:
     import network
@@ -48,6 +50,11 @@ CLIENT_REVISION = 6
 CLIENT_HEARTBEAT = 7
 MODE_HTTP = 0
 MODE_SSE = 1
+MODE_HISTORY = 2
+CLIENT_HISTORY_JOB = 8
+CLIENT_PEER_IP = 9
+HISTORY_READ_TIMEOUT_MS = 3000
+HISTORY_READ_STEP_GAP_MS = 40
 
 CAPTIVE_PATHS = (
     "/generate_204",
@@ -241,6 +248,11 @@ class WirelessPortal:
         self._dns = None
         self._http = None
         self._clients = []
+        self._history_store = None
+        self._history_ready = None
+        self._history_owner = None
+        self._history_token = None
+        self._history_peer_ip = None
         self._latest_record = None
         self._latest_revision = 0
         self._battery_percent = None
@@ -257,8 +269,73 @@ class WirelessPortal:
     def is_enabled(self):
         return self._enabled
 
+    def set_history_store(self, store, ready=None):
+        self._history_store = store
+        self._history_ready = ready
+
+    def _history_response(self, request, head=False, defer=False, peer_ip=None):
+        # Only the browser that received this live stream's unguessable token
+        # may read Flash. Polling clients retain latest-only access.
+        query = request.split(b" ", 2)[1].decode("ascii").partition("?")[2]
+        params = {}
+        for part in query.split("&"):
+            key, _, value = part.partition("=")
+            params[key] = value
+        def reply(status, body):
+            return _http_response(status, "application/json; charset=utf-8",
+                                  json.dumps(body), head=head)
+        if (self._history_owner is None or not self._history_token
+                or params.get("token") != self._history_token
+                or (self._history_peer_ip is not None and peer_ip != self._history_peer_ip)):
+            return reply("403 Forbidden", {"error": "sse_required"})
+        if head:
+            # No synchronous Flash work for probes/prefetch. Only GET enters
+            # the cooperative read path used by the page.
+            return _http_response("405 Method Not Allowed", "application/json", b"",
+                                  "Allow: GET\r\n", head=True)
+        store = self._history_store
+        if store is None or not store.index_complete:
+            return reply("503 Service Unavailable", {"error": "history_unavailable"})
+        try:
+            index = int(params.get("index", "-1"))
+            step = int(params.get("step", "0"))
+        except (ValueError, TypeError):
+            return reply("400 Bad Request", {"error": "invalid_index"})
+        if step not in (-1, 0, 1):
+            return reply("400 Bad Request", {"error": "invalid_step"})
+        if store.count == 0:
+            return reply("200 OK", {"empty": True, "count": 0})
+        if index == -1:
+            index = store.count - 1
+        elif index < 0 or index >= store.count:
+            return reply("409 Conflict", {"error": "history_changed", "count": store.count})
+        else:
+            # Use the current device count, not a stale browser count, when
+            # a new train was saved while the phone was viewing history.
+            index = (index + step) % store.count
+        if defer:
+            # Creating this generator does not read Flash. Let the queued job
+            # wait for a safe gap instead of rejecting a momentarily busy RX.
+            return (store.iter_load(index), index, self._history_token)
+        if self._history_ready is not None and not self._history_ready():
+            return reply("503 Service Unavailable", {"error": "receiver_busy"})
+        # Never disturb the device's browsing cursor or latest snapshot.
+        record = store.load(index)
+        return self._history_result(record, index, head=head)
+
+    def _history_result(self, record, index, head=False):
+        if not isinstance(record, dict) or not isinstance(record.get("d"), dict):
+            return _http_response("503 Service Unavailable", "application/json",
+                                  json.dumps({"error": "history_read_failed"}), head=head)
+        view = self._view_model(record)
+        view["time"] = format_history_time(record.get("t"))
+        view["history_index"] = index
+        view["history_count"] = self._history_store.count
+        return _http_response("200 OK", "application/json; charset=utf-8", json.dumps(view), head=head)
+
     def set_latest(self, record):
-        # The caller replaces the snapshot on core 0; HTTP never touches Flash.
+        # The caller replaces the live snapshot on core 0. Authorized history
+        # reads use a separate cooperative iterator, never this snapshot.
         if isinstance(record, dict) and isinstance(record.get("d"), dict):
             self._latest_record = record
         else:
@@ -455,8 +532,11 @@ class WirelessPortal:
                 pass
 
     def _stop(self, clear_error=True):
+        self._history_owner = None
+        self._history_token = None
+        self._history_peer_ip = None
         for client in self._clients:
-            self._close_socket(client[0])
+            self._finish_client(client)
         self._clients = []
         self._close_socket(self._http)
         self._close_socket(self._dns)
@@ -490,7 +570,7 @@ class WirelessPortal:
 
     def _accept_http(self, now):
         try:
-            client, _ = self._http.accept()
+            client, address = self._http.accept()
         except OSError as exc:
             if _is_would_block(exc):
                 return
@@ -510,14 +590,14 @@ class WirelessPortal:
         # socket, progress, request, pending bytes, offset, mode, revision, heartbeat
         try:
             self._clients.append(
-                [client, now, bytearray(), None, 0, MODE_HTTP, -1, now]
+                [client, now, bytearray(), None, 0, MODE_HTTP, -1, now, None, address[0]]
             )
         except Exception as exc:
             print("WIFI_CLIENT_ERR", repr(exc))
             self._close_socket(client)
 
-    def _view_model(self):
-        record = self._latest_record
+    def _view_model(self, record=None):
+        record = self._latest_record if record is None else record
         if not record:
             return {
                 "available": False,
@@ -637,6 +717,7 @@ class WirelessPortal:
 header{background:#031927;border-bottom:2px solid var(--cyan);padding:9px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .logo{font-weight:900;letter-spacing:.08em}.logo b{color:var(--cyan)}.online{font-size:11px;color:var(--green);white-space:nowrap}.dot{display:inline-block;width:7px;height:7px;border-radius:50vw;background:var(--green);box-shadow:0 0 8px var(--green);margin-right:5px}
 main{max-width:620px;margin:auto;padding:9px}.strip{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:11px;margin:1px 1px 7px}.strip strong{color:var(--green)}
+.history-time:not([hidden]){display:block;margin-top:3px;color:var(--yellow);font-size:12px;font-weight:700;white-space:nowrap}
 .hero{position:relative;background:var(--panel);border:1px solid #24506b;border-left:4px solid var(--cyan);padding:10px;margin-bottom:7px;box-shadow:inset 0 0 22px #00131f}
 .eyebrow{font-size:11px;color:var(--muted);letter-spacing:.1em}.train-line{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:3px 0 8px}.train{font-size:clamp(31px,9vw,46px);line-height:1.1;color:var(--cyan);font-weight:900;word-break:break-all;text-shadow:0 0 12px #00c8e866}.loco-chip{max-width:100%%;padding:4px 7px;border:1px solid #326685;background:#071d2b;color:var(--white);font-size:13px;font-weight:800;overflow-wrap:anywhere}
 .metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px}.metric{min-width:0;background:#031927;border:1px solid #1d435a;padding:7px 9px}.metric span{display:block;color:var(--muted);font-size:11px}.metric strong{display:block;font-size:23px;line-height:1.12;margin-top:2px}.speed strong{color:var(--yellow)}.km strong{color:var(--green)}
@@ -644,15 +725,20 @@ main{max-width:620px;margin:auto;padding:9px}.strip{display:flex;justify-content
 .grid{display:grid;grid-template-columns:1fr 1fr;background:var(--panel);border:1px solid #23455c;margin-bottom:7px}.cell{min-width:0;padding:6px 9px;border-bottom:1px solid #1b3b50}.cell:nth-child(odd){border-right:1px solid #1b3b50}.cell:nth-last-child(-n+2){border-bottom:0}.cell span{display:block;color:var(--muted);font-size:10px}.cell strong{display:block;margin-top:2px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .location{background:var(--panel);border:1px solid #24506b;margin-bottom:7px}.loc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 9px;border-bottom:1px solid #1d435a}.loc-head span{color:var(--muted);font-size:10px;letter-spacing:.08em}.loc-head strong{color:var(--green);font-size:11px}.coordinate-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:7px}.coordinate{min-width:0;background:#031927;border:1px solid #1d435a;padding:6px 8px}.coordinate span{display:block;color:var(--muted);font-size:10px}.coordinate strong{display:block;color:var(--cyan);font-size:13px;margin-top:2px;overflow-wrap:anywhere}
 .device .metrics{padding:7px}.device strong{color:var(--green)}.device small{display:block;color:var(--muted);font-size:10px;line-height:1.25;margin-top:2px}.device .danger{border-color:var(--red);background:#2a1017}.device .danger strong,.device .danger small{color:var(--red)}
-.controls{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0}.sound{appearance:none;border:1px solid var(--yellow);background:#241f05;color:var(--yellow);padding:8px 10px;font:inherit;font-size:12px;font-weight:800;min-height:38px}.sound.on{border-color:var(--green);background:#092817;color:var(--green)}
+.controls{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0}.sound{appearance:none;border:1px solid var(--yellow);background:#241f05;color:var(--yellow);padding:8px 10px;font:inherit;font-size:12px;font-weight:800;min-height:44px}.sound.on{border-color:var(--green);background:#092817;color:var(--green)}
+.history-nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:4px}.history-nav button{min-height:46px;padding:8px;border:1px solid #326685;border-radius:7px;background:#102b40;color:var(--cyan);font:inherit;font-size:14px;font-weight:800;touch-action:manipulation}.history-nav button:disabled{opacity:.45}.history-nav button:focus-visible,.sound:focus-visible{outline:2px solid var(--yellow);outline-offset:2px}.history-hint{color:var(--muted);font-size:11px;line-height:1.4;min-height:16px;margin:0 0 7px}.history-view .hero{border-left-color:var(--yellow)}.history-view #train{color:var(--yellow)}
+@media(min-width:760px){main{max-width:960px;display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.strip,.hero,.history-nav,.history-hint,.route,.controls,.notice{grid-column:1/-1}.train{font-size:46px}.history-nav{max-width:620px;width:100%%;justify-self:center}}
+@media(max-width:480px){main{padding:7px}header{padding:7px 10px}.hero{padding:8px}.train-line{margin-bottom:6px}.metric{padding:6px 8px}.device .metric strong{font-size:20px}.device .metrics{padding:5px}.loc-head{padding:5px 8px}.coordinate-grid{padding:5px}.route{padding:7px 9px}.notice:empty{display:none}}
 .refresh{text-align:right;font-size:10px;color:var(--muted)}.refresh strong{display:block;color:var(--cyan);margin-bottom:2px}.notice{min-height:16px;color:var(--green);font-size:11px;margin-bottom:6px}
 .flash{animation:flash 1.2s ease}@keyframes flash{0%%{border-color:var(--yellow);box-shadow:0 0 30px #ffe34299}100%%{border-color:#24506b;box-shadow:inset 0 0 28px #00131f}}
 @media(max-width:360px){.train{font-size:31px}.loco-chip{font-size:12px}.route strong{font-size:16px}.metric strong{font-size:20px}.refresh{max-width:135px}}
  .metric.charging strong{color:#4ade80}</style></head>
 <body data-record-id="%(record_id)s"><header><div class=logo>LBJ RECEIVER <b>W</b></div><div class=online><i class=dot></i>AP ONLINE</div></header>
-<main><div class=strip><span id=state>%(state)s</span><strong id=live>实时监视中</strong></div>
+<main><div class=strip><div><span id=state>%(state)s</span><span id=historyReceived class=history-time hidden></span></div><strong id=live>实时监视中</strong></div>
 <section class=hero id=hero><div class=eyebrow>TRAIN NUMBER / 车次 · 车型</div><div class=train-line><div class=train id=train>%(train)s</div><div class=loco-chip id=loco>%(loco)s</div></div>
 <div class=metrics><div class="metric speed"><span>速度 km/h</span><strong id=speed>%(speed)s</strong></div><div class="metric km"><span>公里标 km</span><strong id=km>%(km)s</strong></div></div></section>
+<nav class=history-nav aria-label="历史车次翻页"><button id=historyUp type=button disabled>↑ 上翻</button><button id=historyDown type=button disabled>↓ 下翻</button><button id=historyBack type=button disabled>返回实时</button></nav>
+<div class=history-hint id=historyHint aria-live=polite>历史查询需连接实时 SSE 通道</div>
 <section class=route><label>线路</label><strong id=route data-gbk="%(route)s">%(route)s</strong><span class=direction id=direction>%(direction)s</span></section>
 <section class=grid>
 <div class=cell><span>接收时间</span><strong id=received>%(time)s</strong></div><div class=cell><span>端位</span><strong id=cab>%(cab)s</strong></div>
@@ -666,6 +752,15 @@ main{max-width:620px;margin:auto;padding:9px}.strip{display:flex;justify-content
 <div class=notice id=notice aria-live=polite></div></main>
 <script>
 const el=id=>document.getElementById(id);let lastId=document.body.dataset.recordId||"",lastRevision=Number(lastId)||0,soundOn=false,audioCtx=null,stream=null,streamErrors=0,fallbackTimer=null,reopenTimer=null,pollPrimed=true;
+let historyToken=null,historyMode=false,historyBusy=false,historyIndex=-1,historyCount=0,historyTimer=null,historySeq=0,latestLive=null,historyAbort=null;
+function historyAllowed(){return !!historyToken&&!!stream&&stream.readyState===1}
+function historyButtons(){const allowed=historyAllowed();el("historyUp").disabled=!allowed||historyBusy;el("historyDown").disabled=!allowed||historyBusy;el("historyBack").disabled=!historyMode;if(!allowed)put("historyHint","当前为轮询模式：历史仅供占用 SSE 实时通道的页面查看")}
+function historyIdle(){if(historyTimer!==null)clearTimeout(historyTimer);historyTimer=setTimeout(()=>returnLive("20 秒无操作，已返回实时"),20000)}
+function returnLive(message){historySeq++;if(historyAbort)historyAbort.abort();historyAbort=null;historyBusy=false;historyMode=false;historyIndex=-1;if(historyTimer!==null)clearTimeout(historyTimer);historyTimer=null;document.body.classList.remove("history-view");el("historyReceived").hidden=true;if(latestLive)paintRecord(latestLive);put("live",stream&&stream.readyState===1?"实时监视中":"轮询监视中");el("live").style.color="var(--green)";if(historyAllowed())put("historyHint",message||"按上翻或下翻查看历史车次");historyButtons()}
+function loseHistory(){historyToken=null;returnLive();historyButtons()}
+async function browseHistory(step){if(!historyAllowed()||historyBusy)return;const target=historyIndex,seq=++historySeq;historyAbort=typeof AbortController==="function"?new AbortController():null;historyBusy=true;historyMode=true;historyIdle();historyButtons();put("historyHint","正在读取历史…");try{let d;for(let attempt=0;attempt<8;attempt++){const response=await fetch("/api/history?token="+historyToken+"&index="+target+"&step="+step,{cache:"no-store",signal:historyAbort?historyAbort.signal:undefined});d=await response.json();if(seq!==historySeq)return;if(response.ok)break;if(d.error==="receiver_busy"&&attempt<7){put("historyHint","接收优先，稍后读取历史…");await new Promise(resolve=>setTimeout(resolve,400));if(seq!==historySeq)return;continue}if(response.status===403){loseHistory();return}if(d.error==="history_changed"){returnLive("历史记录已变更，请重新翻页");return}throw Error(d.error||"read_failed")}if(!historyAllowed()||seq!==historySeq)return;if(d.empty){returnLive("暂无已保存的历史车次");return}historyIndex=d.history_index;historyCount=d.history_count;document.body.classList.add("history-view");paintRecord(d);put("historyReceived","接收于 "+d.time);el("historyReceived").hidden=false;put("state","历史车次 "+(historyIndex+1)+" / "+historyCount);put("live","历史回放");el("live").style.color="var(--yellow)";put("historyHint","20 秒无操作返回实时 · 新车次仍在后台接收")}catch(e){if(seq!==historySeq)return;returnLive("历史读取失败，请重试")}finally{if(seq===historySeq){historyAbort=null;historyBusy=false;historyButtons()}}}
+el("historyUp").onclick=()=>browseHistory(-1);el("historyDown").onclick=()=>browseHistory(1);el("historyBack").onclick=()=>returnLive();
+document.addEventListener("pointerdown",()=>{if(historyMode)historyIdle()});document.addEventListener("keydown",()=>{if(historyMode)historyIdle()});
 function renderDevice(d){d=d||{};const b=d.battery_percent,t=d.core_temp_c,bv=typeof b==="number"&&Number.isFinite(b)&&b>=0&&b<=100,tv=typeof t==="number"&&Number.isFinite(t)&&t>=-100&&t<=200,chg=d.usb_power===true,low=!chg&&bv&&b<20,hot=tv&&t>45;put("battery",chg?"CHRG":bv?b+"%%":null);put("temperature",tv?t.toFixed(1)+"°C":null);el("batteryCard").classList.toggle("danger",low);el("batteryCard").classList.toggle("charging",chg);el("tempCard").classList.toggle("danger",hot);put("batteryNote",(typeof d.battery_voltage==="number"?d.battery_voltage.toFixed(2)+" V · ":"")+(chg?"USB 供电":!bv?"等待有效采样":low?"⚠ 低电量警告：低于 20%%":"电量正常"));put("tempNote",!tv?"等待有效采样":hot?"⚠ 温度警告：高于 45°C":"温度正常")}
 function put(id,v){el(id).textContent=(v===undefined||v===null||v==="")?"---":v}
 function decodeRoute(hex){if(!hex||hex==="---")return "---";if(hex.length%%2||!/^[0-9a-f]+$/i.test(hex))return "编码 "+hex;try{const pairs=hex.match(/[0-9a-f]{2}/gi),bytes=Uint8Array.from(pairs,x=>parseInt(x,16));const text=new TextDecoder("gbk",{fatal:true}).decode(bytes).replace(/\u0000/g,"").trim();return text||("编码 "+hex)}catch(e){return "编码 "+hex}}
@@ -674,15 +769,16 @@ function coordinateText(value,positive,negative){return Math.abs(value).toFixed(
 function renderCoordinates(latitude,longitude,available){const lat=asCoordinate(latitude),lon=asCoordinate(longitude);if(lat===null||lon===null||Math.abs(lat)>90||Math.abs(lon)>180){put("longitude",null);put("latitude",null);el("locationState").textContent=available?"本次无有效坐标":"等待定位报文";return}put("longitude",coordinateText(lon,"E","W"));put("latitude",coordinateText(lat,"N","S"));el("locationState").textContent="坐标有效"}
 function tone(){if(!soundOn||!audioCtx)return;try{const t=audioCtx.currentTime,o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.setValueAtTime(880,t);o.frequency.setValueAtTime(1175,t+.09);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.18,t+.015);g.gain.exponentialRampToValueAtTime(.0001,t+.20);o.connect(g);g.connect(audioCtx.destination);o.start(t);o.stop(t+.21)}catch(e){}}
 function announce(){const hero=el("hero");hero.classList.remove("flash");void hero.offsetWidth;hero.classList.add("flash");el("notice").textContent="● 收到新的列车信息  "+new Date().toLocaleTimeString();tone()}
-function render(d,fromLive,resetRevision){const id=String(d.update_id||""),revision=Number(id),numeric=Number.isFinite(revision),wrapped=numeric&&lastRevision>1879048192&&revision<268435456;if(resetRevision&&numeric&&revision<lastRevision&&!wrapped){lastRevision=revision;lastId=id}if(wrapped){lastRevision=-1;lastId=""}else if(fromLive&&!resetRevision&&numeric&&revision<lastRevision)return false;const changed=fromLive&&d.available&&(numeric?revision>lastRevision:id&&id!==lastId);put("state",d.available?"最近一次列车信息":"等待列车信号");put("train",d.train_no);put("speed",d.speed);put("km",d.km);put("route",decodeRoute(d.route));put("direction",d.direction);put("received",d.time);put("loco",d.loco);put("cab",d.cab);put("rssi",d.rssi);put("type",d.type);renderCoordinates(d.latitude,d.longitude,d.available);renderDevice(d.device);if(changed)announce();if(id)lastId=id;if(numeric)lastRevision=revision;return true}
+function paintRecord(d){put("state",d.available?"最近一次列车信息":"等待列车信号");put("train",d.train_no);put("speed",d.speed);put("km",d.km);put("route",decodeRoute(d.route));put("direction",d.direction);put("received",d.time);put("loco",d.loco);put("cab",d.cab);put("rssi",d.rssi);put("type",d.type);renderCoordinates(d.latitude,d.longitude,d.available);renderDevice(d.device)}
+function render(d,fromLive,resetRevision){const id=String(d.update_id||""),revision=Number(id),numeric=Number.isFinite(revision),wrapped=numeric&&lastRevision>1879048192&&revision<268435456;if(resetRevision&&numeric&&revision<lastRevision&&!wrapped){lastRevision=revision;lastId=id}if(wrapped){lastRevision=-1;lastId=""}else if(fromLive&&!resetRevision&&numeric&&revision<lastRevision)return false;const changed=fromLive&&d.available&&(numeric?revision>lastRevision:id&&id!==lastId);latestLive=d;if(!historyMode)paintRecord(d);else renderDevice(d.device);if(changed){if(historyMode){put("notice","● 收到新车次，返回实时即可查看");tone()}else announce()}if(id)lastId=id;if(numeric)lastRevision=revision;return true}
 function clearFallback(){if(fallbackTimer!==null){clearTimeout(fallbackTimer);fallbackTimer=null}}
 function scheduleFallback(delay){if(fallbackTimer===null)fallbackTimer=setTimeout(fallbackPoll,delay)}
 function fallbackPoll(){fallbackTimer=null;if(stream&&stream.readyState===1)return;el("refreshState").textContent="兼容模式轮询中";fetch("/api/latest?t="+Date.now(),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error(r.status);return r.json()}).then(d=>{if(stream&&stream.readyState===1)return;const first=pollPrimed;pollPrimed=false;if(render(d,true,first))el("streamDetail").textContent="最近同步 "+new Date().toLocaleTimeString()}).catch(()=>{pollPrimed=true;el("streamDetail").textContent="连接失败，继续重试"}).then(()=>{if(!stream||stream.readyState!==1)scheduleFallback(5000)})}
 function reconcile(){fetch("/api/latest?t="+Date.now(),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error(r.status);return r.json()}).then(d=>{if(render(d,true))el("streamDetail").textContent="已对账 "+new Date().toLocaleTimeString()}).catch(()=>{})}
 function scheduleStreamReopen(){if(reopenTimer===null)reopenTimer=setTimeout(()=>{reopenTimer=null;openStream()},30000)}
-function openStream(){if(!window.EventSource){el("refreshState").textContent="浏览器兼容模式";el("streamDetail").textContent="此浏览器不支持实时流";pollPrimed=true;scheduleFallback(0);return}if(stream)stream.close();const opened=new EventSource("/api/events");let streamPrimed=false;stream=opened;streamErrors=0;opened.onopen=()=>{if(stream!==opened)return;streamPrimed=false;streamErrors=0;clearFallback();el("refreshState").textContent="实时推送已连接";el("streamDetail").textContent="收到新报文即更新";el("live").textContent="实时监视中";el("live").style.color="var(--green)"};opened.addEventListener("train",event=>{if(stream!==opened)return;try{const first=!streamPrimed;streamPrimed=true;if(render(JSON.parse(event.data),true,first))el("streamDetail").textContent="刚刚实时更新 "+new Date().toLocaleTimeString()}catch(e){el("streamDetail").textContent="收到异常数据，等待下一条"}});opened.onerror=()=>{if(stream!==opened)return;streamErrors=opened.readyState===2?3:streamErrors+1;el("refreshState").textContent="实时通道重连中";el("streamDetail").textContent="暂用兼容轮询";el("live").textContent="正在重连";el("live").style.color="var(--yellow)";pollPrimed=true;scheduleFallback(2000);if(streamErrors>=3){opened.close();stream=null;el("refreshState").textContent="兼容模式（实时流忙）";el("streamDetail").textContent="5 秒同步；30 秒后重试实时流";scheduleFallback(0);scheduleStreamReopen()}}}
+function openStream(){loseHistory();if(!window.EventSource){el("refreshState").textContent="浏览器兼容模式";el("streamDetail").textContent="此浏览器不支持实时流";pollPrimed=true;scheduleFallback(0);return}if(stream)stream.close();const opened=new EventSource("/api/events");let streamPrimed=false;stream=opened;streamErrors=0;opened.onopen=()=>{if(stream!==opened)return;streamPrimed=false;streamErrors=0;clearFallback();el("refreshState").textContent="实时推送已连接";el("streamDetail").textContent="收到新报文即更新";el("live").textContent="实时监视中";el("live").style.color="var(--green)"};opened.addEventListener("session",event=>{if(stream!==opened)return;try{historyToken=JSON.parse(event.data).history_token;historyButtons();put("historyHint","按上翻或下翻查看历史车次")}catch(e){loseHistory()}});opened.addEventListener("train",event=>{if(stream!==opened)return;try{const first=!streamPrimed;streamPrimed=true;if(render(JSON.parse(event.data),true,first))el("streamDetail").textContent="刚刚实时更新 "+new Date().toLocaleTimeString()}catch(e){el("streamDetail").textContent="收到异常数据，等待下一条"}});opened.onerror=()=>{if(stream!==opened)return;loseHistory();streamErrors=opened.readyState===2?3:streamErrors+1;el("refreshState").textContent="实时通道重连中";el("streamDetail").textContent="暂用兼容轮询";el("live").textContent="正在重连";el("live").style.color="var(--yellow)";pollPrimed=true;scheduleFallback(2000);if(streamErrors>=3){opened.close();stream=null;el("refreshState").textContent="兼容模式（实时流忙）";el("streamDetail").textContent="5 秒同步；30 秒后重试实时流";scheduleFallback(0);scheduleStreamReopen()}}}
 el("soundBtn").onclick=function(){soundOn=!soundOn;if(soundOn){try{const button=this,A=window.AudioContext||window.webkitAudioContext;if(!A)throw Error();audioCtx=audioCtx||new A();button.textContent="正在启用声音…";const ready=audioCtx.state==="suspended"?audioCtx.resume():Promise.resolve();ready.then(()=>{if(!soundOn)return;tone();button.textContent="声音提醒：开启";button.classList.add("on");el("notice").textContent="声音提醒已开启（刚才是测试音）"}).catch(()=>{soundOn=false;button.textContent="声音提醒：关闭（未授权）";button.classList.remove("on");el("notice").textContent="浏览器阻止了声音，请再次点按重试"})}catch(e){soundOn=false;this.textContent="此浏览器不支持声音"}}else{this.textContent="声音提醒：关闭";this.classList.remove("on");el("notice").textContent="声音提醒已关闭"}};
-put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location").dataset.lat,el("location").dataset.lon,el("train").textContent!=="---");openStream();document.addEventListener("visibilitychange",()=>{if(!document.hidden){reconcile();if(!stream)scheduleFallback(0)}});window.addEventListener("pagehide",()=>{clearFallback();if(reopenTimer!==null)clearTimeout(reopenTimer);if(stream)stream.close()});
+put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location").dataset.lat,el("location").dataset.lon,el("train").textContent!=="---");openStream();document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(historyMode)returnLive("已返回实时");reconcile();if(!stream)scheduleFallback(0)}});window.addEventListener("pagehide",()=>{loseHistory();clearFallback();if(reopenTimer!==null)clearTimeout(reopenTimer);if(stream)stream.close()});
 </script></body></html>""" % values
 
     def _sse_event(self):
@@ -730,7 +826,13 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
                 state[CLIENT_SENT] = 0
                 state[CLIENT_PROGRESS] = now
                 return False
-        state[CLIENT_RESPONSE] = _sse_headers() + self._sse_event()
+        token = os.urandom(16).hex()
+        session = ("event: session\ndata: %s\n\n" %
+                   json.dumps({"history_token": token})).encode("utf-8")
+        state[CLIENT_RESPONSE] = _sse_headers() + session + self._sse_event()
+        self._history_owner = state
+        self._history_token = token
+        self._history_peer_ip = state[CLIENT_PEER_IP] if len(state) > CLIENT_PEER_IP else None
         state[CLIENT_REQUEST] = None
         state[CLIENT_SENT] = 0
         state[CLIENT_MODE] = MODE_SSE
@@ -739,7 +841,7 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
         state[CLIENT_HEARTBEAT] = now
         return True
 
-    def _build_http_response(self, request):
+    def _build_http_response(self, request, peer_ip=None):
         try:
             method, path = _parse_http_request(request)
         except Exception:
@@ -757,6 +859,8 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
         if path == "/api/latest":
             body = json.dumps(self._view_model())
             return _http_response("200 OK", "application/json; charset=utf-8", body, head=head)
+        if path == "/api/history":
+            return self._history_response(request, head=head, peer_ip=peer_ip)
         if path == "/api/events":
             if head:
                 return _http_response(
@@ -786,6 +890,12 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
         )
 
     def _finish_client(self, client_state):
+        if client_state[CLIENT_MODE] == MODE_HISTORY:
+            client_state[CLIENT_HISTORY_JOB][0].close()
+        if client_state is self._history_owner:
+            self._history_owner = None
+            self._history_token = None
+            self._history_peer_ip = None
         self._close_socket(client_state[0])
 
     def _service_http_client(self, now):
@@ -834,6 +944,43 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
                 self._finish_client(state)
             else:
                 self._clients.append(state)
+            return
+
+        if state[CLIENT_MODE] == MODE_HISTORY:
+            job = state[CLIENT_HISTORY_JOB]
+            iterator, index, token, started, last_step = job
+            error, status = None, "503 Service Unavailable"
+            if self._history_owner is None or token != self._history_token:
+                error, status = "sse_required", "403 Forbidden"
+            elif index >= self._history_store.count:
+                error, status = "history_changed", "409 Conflict"
+            elif _ticks_diff(now, started) >= HISTORY_READ_TIMEOUT_MS:
+                error = "receiver_busy"
+            elif self._history_ready is not None and not self._history_ready():
+                self._clients.append(state)
+                return
+            elif _ticks_diff(now, last_step) < HISTORY_READ_STEP_GAP_MS:
+                self._clients.append(state)
+                return
+            else:
+                try:
+                    job[4] = now
+                    record = next(iterator)
+                    if record is None:
+                        self._clients.append(state)
+                        return
+                    state[CLIENT_RESPONSE] = self._history_result(record, index)
+                except StopIteration:
+                    error = "history_read_failed"
+                except Exception:
+                    error = "history_read_failed"
+            iterator.close()
+            if error:
+                state[CLIENT_RESPONSE] = _http_response(status, "application/json",
+                                                       json.dumps({"error": error}))
+            state[CLIENT_MODE] = MODE_HTTP
+            state[CLIENT_PROGRESS] = now
+            self._clients.append(state)
             return
 
         if state[CLIENT_MODE] == MODE_SSE:
@@ -899,8 +1046,22 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
                 method, path = _parse_http_request(limited_request)
                 if method == "GET" and path == "/api/events":
                     self._start_sse(state, now)
+                elif method == "GET" and path == "/api/history":
+                    peer_ip = state[CLIENT_PEER_IP] if len(state) > CLIENT_PEER_IP else None
+                    result = self._history_response(limited_request, defer=True, peer_ip=peer_ip)
+                    state[CLIENT_REQUEST] = None
+                    if isinstance(result, tuple):
+                        state[CLIENT_MODE] = MODE_HISTORY
+                        job = list(result) + [now, now]
+                        if len(state) > CLIENT_HISTORY_JOB:
+                            state[CLIENT_HISTORY_JOB] = job
+                        else:
+                            state.append(job)
+                    else:
+                        state[CLIENT_RESPONSE] = result
                 else:
-                    state[CLIENT_RESPONSE] = self._build_http_response(limited_request)
+                    peer_ip = state[CLIENT_PEER_IP] if len(state) > CLIENT_PEER_IP else None
+                    state[CLIENT_RESPONSE] = self._build_http_response(limited_request, peer_ip=peer_ip)
                     state[CLIENT_REQUEST] = None
             except Exception as exc:
                 # A malformed request or transient allocation failure belongs

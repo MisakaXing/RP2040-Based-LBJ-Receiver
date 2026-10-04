@@ -67,10 +67,12 @@ class HistoryTimeTests(unittest.TestCase):
             record = make_history_record("2026-09-19 12:34", data)
             self.assertEqual(record["t"], "2026-09-19 12:34")
 
-    def test_main_wires_history_only(self):
+    def test_main_shares_history_receipt_with_web_preserving_sd_log(self):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         ast.parse(source)
-        self.assertIn("make_history_record(rtc.get_history_time_str(), data)", source)
+        self.assertIn("history_received_at = rtc.get_history_time_str()", source)
+        self.assertIn("make_history_record(history_received_at, data)", source)
+        self.assertIn('latest_train_record = {"t": history_received_at, "d": data}', source)
         self.assertIn("received_record = {\"t\": received_at, \"d\": data}", source)
         self.assertIn("{format_history_time(hist_time)}", source)
 

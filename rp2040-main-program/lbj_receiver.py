@@ -2,6 +2,7 @@ import machine
 import time
 import rp2
 import json
+from array import array
 
 # 使用 jmp_pin 进行相对映射
 @rp2.asm_pio(
@@ -86,8 +87,8 @@ class LBJReceiver:
     LBJ_EXTENDED_RIC = 1234002
     LBJ_TIME_RIC = 1234008
 
-    # Stable Direct-mode profile: fixed +6 ppm tuning with per-burst hardware
-    # AFC. FEI is diagnostic only and must never accumulate into ppm_offset.
+    # Direct-mode AFC runs on RX restart, not automatically on every burst.
+    # Reacquire only outside locked payloads; FEI never changes ppm_offset.
     FEI_MAX_HZ = 20000
     PPM_LIMIT = 25.0
     PRINT_FEI_CORRECTION = False
@@ -152,6 +153,8 @@ class LBJReceiver:
         self.rx_group_id = 0
         
         self.raw_queue = FixedQueue(self.RAW_QUEUE_CAPACITY)
+        self._dma_rx = None
+        self._dma_seen_overruns = 0
         self.last_sync_time = time.ticks_ms()
         self.last_word_time = self.last_sync_time
         self.last_health_check = self.last_sync_time
@@ -175,6 +178,12 @@ class LBJReceiver:
         self.last_fei_hz = 0.0
         self.last_fei_ppm = 0.0
         self.last_afc_hz = 0.0
+        self._afc_preamble_words = 0
+        self.afc_refreshes = 0
+        self.afc_no_sync_refreshes = 0
+        self._last_afc_refresh = time.ticks_add(time.ticks_ms(), -1000)
+        self._afc_backlog_at = time.ticks_add(time.ticks_ms(), -100)
+        self._last_acquisition_probe = time.ticks_add(time.ticks_ms(), -250)
         self.words_seen = 0
         self.fifo_highwater = 0
         self.fifo_full_hits = 0
@@ -215,24 +224,122 @@ class LBJReceiver:
         self._w(0x01, 0x05) 
         while self.sm.rx_fifo() > 0: 
             self.sm.get()   
-            
+        if hasattr(rp2, "DMA"):
+            try:
+                from pio_dma_rx import PioDmaRx
+                self._dma_rx = PioDmaRx(self.sm)
+                print("RADIO_DMA_READY", "words=", self._dma_rx.words)
+            except Exception as exc:
+                # Keep the proven FIFO path available on unsupported firmware
+                # or when another peripheral has claimed all DMA channels.
+                print("RADIO_DMA_FALLBACK", repr(exc))
         self.last_sync_time = time.ticks_ms()
+
+    def _refresh_afc_on_preamble(self, word, now):
+        # Only an alternating 64-bit preamble, consumed without backlog, can
+        # retrigger AFC. Never restart in an active POCSAG payload.
+        if self.synced:
+            self._afc_preamble_words = 0
+            return False
+        # A queued preamble can be old while the air signal is already in its
+        # payload. Require 100 ms of caught-up capture before qualifying a
+        # new header; never retrigger from the tail of a drained backlog.
+        if self.input_pending() > 0:
+            self._afc_backlog_at = now
+            self._afc_preamble_words = 0
+            return False
+        if time.ticks_diff(now, self._afc_backlog_at) < 100:
+            self._afc_preamble_words = 0
+            return False
+        alternating = False
+        for pattern in (0xAAAAAAAA, 0x55555555):
+            errors = word ^ pattern
+            for _ in range(2):
+                errors &= errors - 1
+            if errors == 0:
+                alternating = True
+                break
+        if not alternating:
+            self._afc_preamble_words = 0
+            return False
+        self._afc_preamble_words = min(2, self._afc_preamble_words + 1)
+        if (self._afc_preamble_words < 2
+                or time.ticks_diff(now, self._last_afc_refresh) < 1000):
+            return False
+        return self._restart_afc_capture(now)
+
+    def _service_acquisition_timeout(self, now):
+        # A running capture is not proof of valid RF acquisition. Reopen AFC
+        # if the ready receiver only produces noise for 15 seconds. Do not
+        # disturb a locked payload, a backlog, or FSRx waiting for preamble.
+        if (self.synced or self.words_seen < 128
+                or time.ticks_diff(now, self.last_sync_time) < 15000
+                or time.ticks_diff(now, self._last_afc_refresh) < 15000):
+            return
+        # After rearming, FSRx may legitimately wait a long time. Probe at
+        # most four times per second, not on every 1 ms receive-thread tick.
+        if time.ticks_diff(now, self._last_acquisition_probe) < 250:
+            return
+        self._last_acquisition_probe = now
+        if self._restart_afc_capture(now):
+            self.afc_no_sync_refreshes += 1
+
+    def _restart_afc_capture(self, now):
+        if (self.input_pending() > 1 or (self._r(0x3e) & 0x80) == 0
+                or (self._r(1) & 0x87) != 5):
+            return False
+        self._last_afc_refresh = now
+        self.sm.active(0)
+        if self._dma_rx is not None:
+            self._dma_rx.stop()
+        try:
+            self.sm.restart()
+            while self.sm.rx_fifo():
+                self.sm.get()
+            # restart() clears shift state, not the instruction counter.
+            self.sm.exec((machine.mem32[0x502000cc] >> 7) & 31)
+            if self._dma_rx is not None:
+                self._dma_rx.reset()
+            self._reset_decoder(discard_message=True)
+            self._w(self.REG_RXCONFIG, self.RXCONFIG_AFC_PREAMBLE | 0x20)
+            self.afc_refreshes += 1
+            self._afc_preamble_words = 0
+        finally:
+            self.sm.active(1)
+        return True
+
+    def input_pending(self):
+        capture = getattr(self, "_dma_rx", None)
+        return capture.pending() if capture is not None else self.sm.rx_fifo()
+
+    def input_is_buffered(self):
+        capture = getattr(self, "_dma_rx", None)
+        return capture is not None and capture.running
+
+    def stop(self):
+        self.sm.active(0)
+        if self._dma_rx is not None:
+            self._dma_rx.stop()
+        self.cs_pin.value(1)
+        self._w(0x01, 0x00)  # SX1276 FSK sleep, after the capture path stops.
 
     #预计算 1-bit 和 2-bit 错误的校验子查表
     def _init_syndrome_table(self):
-        self.syndrome_table = {}
+        # Four KiB instead of hundreds of dict entries/tuples. Mask bit 0
+        # is unused by BCH and encodes whether this is a two-bit correction.
+        self.syndrome_table = array('I', [0] * 1024)
         # 预计算 1-bit 错误 (数据位在 bits 1~31)
         for i in range(1, 32):
             mask = 1 << i
             synd = self._calc_syndrome(mask)
-            self.syndrome_table[synd] = (mask, 1) # 记录 (错误掩码, 错误位数)
+            self.syndrome_table[synd] = mask
             
         # 预计算 2-bit 错误 (数据位在 bits 1~31)
         for i in range(1, 32):
             for j in range(i + 1, 32):
                 mask = (1 << i) | (1 << j)
                 synd = self._calc_syndrome(mask)
-                self.syndrome_table[synd] = (mask, 2)
+                self.syndrome_table[synd] = mask | 1
 
     def set_callback(self, callback_func):
         self.callback = callback_func
@@ -436,8 +543,12 @@ class LBJReceiver:
             return "spi_version"
 
         op_mode = self._r(0x01)
-        if (op_mode & 0x87) != 0x05:
-            return "op_mode"
+        mode = op_mode & 0x87
+        if mode != 0x05:
+            # FSRx with PLL locked, RxReady/ModeReady low is the observed
+            # preamble-trigger acquisition state, not a lost RX request.
+            if mode != 0x04 or (self._r(0x3e) & 0xD0) != 0x10:
+                return "op_mode"
 
         expected = (
             (self.REG_FRF_MSB, (self._expected_frf >> 16) & 0xFF, "frf_msb"),
@@ -457,10 +568,10 @@ class LBJReceiver:
         return None
 
     def _service_radio_health(self, now):
-        # Register reads/reconfiguration while direct data is clocking can
-        # interrupt marginal receivers. Keep this diagnostic monitor off in
-        # the production receive path; recover() remains available for an
-        # explicit radio-thread exception.
+        self._service_acquisition_timeout(now)
+        # The profile monitor only repairs confirmed register faults. Normal
+        # FSRx preamble acquisition is not a fault; clocked unsynced noise is
+        # handled independently by the bounded AFC re-acquisition above.
         if not self.RADIO_PROFILE_MONITOR_ENABLED:
             return
         if time.ticks_diff(now, self.last_health_check) < self.HEALTH_CHECK_INTERVAL_MS:
@@ -493,6 +604,8 @@ class LBJReceiver:
               "count=", self.radio_recoveries)
 
         self.sm.active(0)
+        if self._dma_rx is not None:
+            self._dma_rx.stop()
         try:
             self.cs_pin.value(1)
             if hard:
@@ -512,6 +625,8 @@ class LBJReceiver:
             self.last_health_check = now
             self.last_word_time = now
         finally:
+            if self._dma_rx is not None:
+                self._dma_rx.reset()
             self.sm.active(1)
         return True
 
@@ -523,6 +638,13 @@ class LBJReceiver:
             "words": self.words_seen,
             "fifo_highwater": self.fifo_highwater,
             "fifo_full_hits": self.fifo_full_hits,
+            "dma_enabled": self._dma_rx is not None,
+            "afc_refreshes": self.afc_refreshes,
+            "afc_no_sync_refreshes": self.afc_no_sync_refreshes,
+            "dma_pending": self._dma_rx.pending() if self._dma_rx is not None else 0,
+            "dma_highwater": self._dma_rx.highwater if self._dma_rx is not None else 0,
+            "dma_overruns": self._dma_rx.overruns if self._dma_rx is not None else 0,
+            "dma_dropped_words": self._dma_rx.dropped_words if self._dma_rx is not None else 0,
             "max_tick_gap_ms": self.max_tick_gap_ms,
             "tick_gaps_over_200ms": self.tick_gaps_over_200ms,
             "max_tick_us": self.max_tick_us,
@@ -575,9 +697,10 @@ class LBJReceiver:
                 return cw ^ 1, 1   # 数据段正确，仅第 0 位(校验位)错误
 
         # 查表匹配 1-bit 和 2-bit 错误图谱
-        match = self.syndrome_table.get(synd)
-        if match is not None:
-            err_mask, err_count = match
+        match = self.syndrome_table[synd]
+        if match:
+            err_mask = match & 0xFFFFFFFE
+            err_count = 1 + (match & 1)
             
             if not parity_ok:
                 # 校验失败(奇数个错): 查到 1-bit 错说明是 1个数据位错误
@@ -1202,9 +1325,8 @@ class LBJReceiver:
         processed = 0
         while processed < self.RAW_PARSE_BUDGET:
             # A new direct word arrived while parsing a previous message.
-            # Return to the PIO drain loop first; display/JSON parsing can
-            # safely wait, a four-word hardware FIFO cannot.
-            if self.sm.rx_fifo() > 0:
+            # Drain captured words before parsing another complete message.
+            if self.input_pending() > 0:
                 break
             item = self.raw_queue.get()
             if item is None:
@@ -1245,12 +1367,23 @@ class LBJReceiver:
             self.fifo_highwater = fifo_depth
         if fifo_depth >= 8:
             self.fifo_full_hits = (self.fifo_full_hits + 1) & self.COUNTER_MASK
-        while drained < 8 and fifo_depth > 0:
-            word = (self.sm.get() ^ 0xFFFFFFFF) & 0xFFFFFFFF
+        capture = getattr(self, "_dma_rx", None)
+        input_depth = capture.available() if capture is not None else fifo_depth
+        while drained < 8 and input_depth > 0:
+            word = ((capture.get() if capture is not None else self.sm.get())
+                    ^ 0xFFFFFFFF) & 0xFFFFFFFF
+            if capture is not None and capture.overruns != self._dma_seen_overruns:
+                self._dma_seen_overruns = capture.overruns
+                self._reset_decoder(discard_message=True)
+                self._advance_rx_group()
+                print("RADIO_DMA_OVERRUN", capture.overruns, capture.dropped_words)
             self.words_seen = (self.words_seen + 1) & self.COUNTER_MASK
             self.last_word_time = now
             drained += 1
-            fifo_depth = self.sm.rx_fifo()
+            input_depth = capture.available() if capture is not None else self.sm.rx_fifo()
+            if self._refresh_afc_on_preamble(word, now):
+                input_depth = capture.available() if capture is not None else self.sm.rx_fifo()
+                continue
             for i in range(31, -1, -1):
                 bit = (word >> i) & 1
                 if not self.synced:

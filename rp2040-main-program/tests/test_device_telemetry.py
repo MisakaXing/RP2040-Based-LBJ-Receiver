@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 from wireless_portal import MAX_SSE_EVENT, MODE_SSE, WirelessPortal
 from test_wireless_portal import StreamClient
+from device_protection import DeviceProtection, battery_percent
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -113,6 +114,7 @@ class DeviceSamplingTests(unittest.TestCase):
                         if isinstance(n, ast.FunctionDef) and n.name == "draw_hardware_bar")
         display = SimpleNamespace(fill_rect=Mock(), draw_gbk=Mock())
         ns = {"last_hw_draw": None, "last_hw_update": 100,
+              "protection": DeviceProtection(),
               "time": SimpleNamespace(ticks_ms=lambda: 100), "sample_device_status": Mock(),
               "last_battery_v": "3.4V", "last_battery_p": "0%", "last_temp_str": "30C",
               "last_usb_power": True, "system_state": "DASHBOARD", "last_rssi_str": "N/A",
@@ -128,19 +130,24 @@ class DeviceSamplingTests(unittest.TestCase):
                         and node.name == "draw_battery_top_status")
         display = SimpleNamespace(fill_rect=Mock(), draw_gbk=Mock())
         scope = {
+            "protection": DeviceProtection(), "last_top_status": None,
+            "time": SimpleNamespace(ticks_ms=lambda: 100),
             "low_battery_shutdown": False,
             "last_battery_p": "9%", "current_status": b"READY",
             "current_status_color": 2, "RED": 1, "tft": display, "last_usb_power": False,
         }
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), scope)
+        scope["protection"].update(9, 30, False)
         scope["draw_battery_top_status"]()
-        self.assertEqual(display.draw_gbk.call_args.args[0], b"LOWBAT")
+        self.assertEqual(display.draw_gbk.call_args.args[0], b"LOW BAT")
         self.assertEqual(display.draw_gbk.call_args.args[3], 1)
         scope["last_battery_p"] = "10%"
+        scope["protection"].update(10, 30, False)
         scope["draw_battery_top_status"]()
         self.assertEqual(display.draw_gbk.call_args.args[0], b"READY")
         scope["last_battery_p"] = "0%"
         scope["last_usb_power"] = True
+        scope["protection"].update(0, 30, True)
         scope["draw_battery_top_status"]()
         self.assertEqual(display.draw_gbk.call_args.args[0], b"READY")
 
@@ -230,16 +237,20 @@ class DeviceSamplingTests(unittest.TestCase):
                         if isinstance(n, ast.FunctionDef) and n.name == "service_low_battery")
         shutdown = Mock()
         ns = {"low_battery_shutdown": False, "last_battery_p": "0%",
+              "protection": DeviceProtection(),
               "last_usb_power": False, "enter_low_battery_shutdown": shutdown}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), ns)
+        ns["protection"].update(0, 30, False)
         ns["service_low_battery"](0)
         shutdown.assert_called_once()
         shutdown.reset_mock()
         ns["last_usb_power"] = True
+        ns["protection"].update(0, 30, True)
         ns["service_low_battery"](1)
         shutdown.assert_not_called()
         ns["last_usb_power"] = False
         ns["last_battery_p"] = "1%"
+        ns["protection"].update(1, 30, False)
         ns["service_low_battery"](2)
         shutdown.assert_not_called()
 
@@ -252,6 +263,7 @@ class DeviceSamplingTests(unittest.TestCase):
                                 if isinstance(node, ast.FunctionDef)
                                 and node.name == "battery_voltage_from_raw")
         self.ns = {
+            "protection": DeviceProtection(), "battery_percent": battery_percent,
             "last_hw_update": 0, "last_battery_v": None, "last_battery_p": None,
             "last_temp_str": None, "HW_SAMPLE_INTERVAL_MS": 5000,
             "last_usb_update": None, "USB_SAMPLE_INTERVAL_MS": 1000,

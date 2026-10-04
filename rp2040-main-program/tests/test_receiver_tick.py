@@ -29,6 +29,10 @@ class ReceiverTickTests(unittest.TestCase):
         namespace = {'time': clock}
         exec(compile(ast.Module(body=[tick], type_ignores=[]), str(source), 'exec'), namespace)
         cls.tick = staticmethod(namespace['tick'])
+        buffered = next(node for node in receiver.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'input_is_buffered')
+        exec(compile(ast.Module(body=[buffered], type_ignores=[]), str(source), 'exec'), namespace)
+        cls.buffered = staticmethod(namespace['input_is_buffered'])
 
     def receiver(self, decoded_words, synced):
         radio = SimpleNamespace(
@@ -40,16 +44,51 @@ class ReceiverTickTests(unittest.TestCase):
             corrected_sync_words=0, soft_sync_locks=0,
             current_cw=0, bit_count=0, last_timeout_check=1000,
             decoded=[], sync_times=[],
+            _dma_rx=None, _dma_seen_overruns=0,
         )
         def record_sync(now):
             radio.synced = True
             radio.sync_times.append(now)
+        radio._refresh_afc_on_preamble = lambda word, now: False
         radio._record_sync = record_sync
         radio._decode_codeword = lambda word, now: radio.decoded.append(word)
         radio._process_raw_queue = lambda: None
         radio._flush_pending_fragments = lambda now: None
         radio._service_radio_health = lambda now: None
         return radio
+
+    def test_buffered_status_requires_dma_to_be_running(self):
+        radio = self.receiver([], synced=True)
+        self.assertFalse(self.buffered(radio))
+        radio._dma_rx = SimpleNamespace(running=True)
+        self.assertTrue(self.buffered(radio))
+        radio._dma_rx.running = False
+        self.assertFalse(self.buffered(radio))
+
+    def test_dma_words_are_decoded_without_reading_hardware_fifo(self):
+        radio = self.receiver([], synced=True)
+        captured = Fifo([0x12345678] * 9)
+        radio._dma_rx = SimpleNamespace(available=captured.rx_fifo,
+                                        get=captured.get, overruns=0)
+        self.tick(radio)
+        self.assertEqual(radio.words_seen, 8)
+        self.assertEqual(captured.rx_fifo(), 1)
+        self.assertEqual(radio.fifo_full_hits, 0)
+        self.tick(radio)
+        self.assertEqual(radio.words_seen, 9)
+
+    def test_dma_overrun_resets_decoder_before_using_latest_words(self):
+        radio = self.receiver([], synced=True)
+        captured = Fifo([0x12345678])
+        resets = []
+        radio._dma_rx = SimpleNamespace(available=captured.rx_fifo,
+            get=captured.get, overruns=1, dropped_words=3)
+        radio._reset_decoder = lambda **kwargs: resets.append(kwargs)
+        radio._advance_rx_group = lambda: resets.append("advance")
+        self.tick(radio)
+        self.assertEqual(resets, [{"discard_message": True}, "advance"])
+        self.tick(radio)
+        self.assertEqual(len(resets), 2)
 
     def test_fifo_drain_is_bounded_to_eight_words(self):
         radio = self.receiver([0x12345678] * 9, synced=True)

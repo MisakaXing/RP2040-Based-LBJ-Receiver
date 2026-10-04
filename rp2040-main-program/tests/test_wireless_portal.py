@@ -612,7 +612,7 @@ class WirelessPortalTests(unittest.TestCase):
             [client, 100, bytearray(), None, 0, MODE_HTTP, -1, 100]
         ]
 
-        def fail_render(_request):
+        def fail_render(_request, peer_ip=None):
             raise MemoryError("injected")
 
         portal._build_http_response = fail_render

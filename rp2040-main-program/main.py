@@ -21,6 +21,7 @@ from ili9341 import ILI9341, BLACK, WHITE, RED, GREEN, BLUE, CYAN, YELLOW, GRAY,
 from rtc_ds3231 import DS3231, format_history_time
 from boot_post import SystemPOST, battery_voltage_from_raw, BATTERY_EMPTY_V
 from wireless_portal import WirelessPortal, AP_SSID
+from device_protection import DeviceProtection, battery_percent
 
 # 系统性能配置
 
@@ -58,7 +59,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.11-W"
+Program_ver = "5.13-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 VSYS_USB_PRESENT_RAW = 28200  # GP46 reads VSYS/3; about 4.26 V at a 3.3 V ADC reference.
@@ -74,7 +75,8 @@ RADIO_TOTAL_ERRORS = 2
 RADIO_LAST_ERROR_LOG = 3
 RADIO_RUNNING = 4
 RADIO_STOPPED = 5
-radio_state = [time.ticks_ms(), 0, 0, 0, True, True]
+RADIO_BUSY = 6
+radio_state = [time.ticks_ms(), 0, 0, 0, True, True, False]
 last_radio_health_log = 0
 last_storage_write = 0
 storage_pending_since = None
@@ -103,6 +105,9 @@ low_battery_shutdown = False
 last_usb_power = False
 top_bar_ready = False
 last_temp_str = None
+last_top_status = None
+wifi_thermal_blocked = False
+protection = DeviceProtection()
 
 # 1. 硬件 IO 初始化
 
@@ -478,8 +483,7 @@ def get_battery_info():
     readings.sort()
     raw = readings[1]
     volts = battery_voltage_from_raw(raw)
-    percent = int((volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V) * 100)
-    percent = 0 if volts <= BATTERY_EMPTY_V else max(1, min(100, percent))
+    percent = battery_percent(volts)
     return f"{volts:.1f}V", f"{percent}%"
 
 def sample_device_status(now, force=False):
@@ -528,6 +532,7 @@ def sample_device_status(now, force=False):
     except (TypeError, ValueError):
         voltage = None
     wifi_portal.set_device_status(battery_percent, temp_c, last_usb_power, voltage)
+    protection.update(battery_percent, temp_c, last_usb_power)
     if top_bar_ready and system_state == "DASHBOARD" and (
             previous_percent != last_battery_p or previous_usb != last_usb_power):
         draw_battery_top_status()
@@ -543,9 +548,7 @@ def usb_power_present():
 
 def service_low_battery(now):
     """Protect immediately at 0%, unless USB is supplying the board."""
-    if low_battery_shutdown or last_battery_p != "0%":
-        return
-    if not last_usb_power:
+    if not low_battery_shutdown and protection.empty_battery():
         enter_low_battery_shutdown()
 
 def enter_low_battery_shutdown():
@@ -560,23 +563,31 @@ def enter_low_battery_shutdown():
         wifi_portal.set_enabled(False)
     except Exception as exc:
         print("LOW_BATTERY_WIFI_STOP_ERR", repr(exc))
+    print('LOW_BATTERY_WIFI_STOPPED')
     stop_buzzer()
     try:
+        tft.fill_rect(0, 26, 320, 164, BLACK)
+        tft.draw_gbk(b'LOW BATTERY', 72, 65, RED, BLACK, scale=2)
+        tft.draw_gbk(b'RECEPTION STOPPED', 88, 110, WHITE, BLACK)
+        tft.draw_gbk(b'CONNECT USB TO RESTART', 64, 140, YELLOW, BLACK)
         if cfg_buzzer:
             buzzer.value(1)
             time.sleep_ms(70)
             buzzer.value(0)
+        time.sleep_ms(1000)
     except Exception as exc:
         print("LOW_BATTERY_WARNING_ERR", repr(exc))
     finally:
         stop_buzzer()
         set_screen_power(False)
+    print('LOW_BATTERY_SCREEN_OFF')
     for _ in range(50):
         if radio_state[RADIO_STOPPED]:
             break
         time.sleep_ms(10)
     if radio_state[RADIO_STOPPED]:
         try:
+            print('LOW_BATTERY_CLOCK_BEGIN', LOW_BATTERY_CPU_HZ)
             machine.freq(LOW_BATTERY_CPU_HZ)
             print("LOW_BATTERY_CPU_HZ", machine.freq())
         except Exception as exc:
@@ -666,7 +677,21 @@ def _schedule_wifi_retry(now):
     wifi_retry_delay_ms = min(WIFI_RETRY_MAX_MS, wifi_retry_delay_ms * 2)
 
 def service_wifi(now):
-    global wifi_service_errors, wifi_retry_delay_ms, wifi_retry_at
+    global wifi_service_errors, wifi_retry_delay_ms, wifi_retry_at, wifi_thermal_blocked
+    blocked = protection.overheat
+    if blocked != wifi_thermal_blocked:
+        wifi_thermal_blocked = blocked
+        if blocked:
+            wifi_portal.set_enabled(False)
+            print('WIFI_DISABLED_HIGH_TEMP', protection.temp_c)
+        else:
+            wifi_retry_at = time.ticks_add(now, -1)
+            wifi_retry_delay_ms = WIFI_RETRY_INITIAL_MS
+            print('WIFI_THERMAL_LOCK_RELEASED', protection.temp_c)
+        if screen_is_on and system_state == 'WIFI_SETTINGS':
+            draw_wifi_settings()
+    if blocked or low_battery_shutdown:
+        return
     if not cfg_wifi_enabled or not wifi_module_ok:
         return
     if not wifi_portal.is_enabled():
@@ -976,15 +1001,17 @@ def update_top_bar():
     tft.draw_gbk(t_str.encode(), 145, 4, YELLOW, 0x01CF)
     try: last_minute = int(t_str.split(':')[1])
     except: pass
-    draw_battery_top_status()
+    draw_battery_top_status(force=True)
 
-def draw_battery_top_status():
-    try:
-        is_low = not last_usb_power and int(last_battery_p.rstrip('%')) < 10
-    except (AttributeError, ValueError):
-        is_low = False
-    status = b'LOWBAT' if is_low else current_status
-    color = RED if is_low else current_status_color
+def draw_battery_top_status(force=False):
+    global last_top_status
+    warning = protection.top_warning(time.ticks_ms())
+    status = warning if warning is not None else current_status
+    color = RED if warning is not None else current_status_color
+    state = (status, color)
+    if not force and state == last_top_status:
+        return
+    last_top_status = state
     tft.fill_rect(226, 0, 94, 24, 0x01CF)
     tft.draw_gbk(status, 230, 4, color, 0x01CF)
 
@@ -1016,7 +1043,8 @@ def draw_hardware_bar(force=False):
     tft.draw_gbk(r.encode(), 170, 218, WHITE, BLACK)
     
     tft.fill_rect(265, 218, 50, 16, BLACK)
-    tft.draw_gbk(t.encode(), 265, 218, WHITE, BLACK)
+    tft.draw_gbk(t.encode(), 265, 218,
+                 RED if protection.temperature_red() else WHITE, BLACK)
 
 def draw_history_rssi():
     """Refresh the only hardware-bar value that belongs to a history entry."""
@@ -1252,6 +1280,13 @@ def draw_wifi_settings():
         tft.draw_gbk(b'WIFI MODULE FAILED', 75, 96, RED, 0x2104)
         tft.draw_gbk(b'[MENU] BACK', 108, 150, GRAY, 0x2104)
         return
+    if protection.overheat:
+        tft.draw_gbk(b'--- WIRELESS SETTING ---', 55, 40, CYAN, 0x2104)
+        tft.draw_gbk(b'WIFI DISABLED: HIGH TEMP', 64, 85, RED, 0x2104)
+        tft.draw_gbk(b'RESUME AT 55C OR BELOW', 72, 113, YELLOW, 0x2104)
+        tft.draw_gbk(b'SAVED WIFI SETTING UNCHANGED', 52, 141, GRAY, 0x2104)
+        tft.draw_gbk(b'[MENU] BACK', 108, 180, GRAY, 0x2104)
+        return
     status = wifi_portal.get_status()
     enabled = status["enabled"]
     retrying = cfg_wifi_enabled and not enabled
@@ -1356,6 +1391,7 @@ def radio_core_task(receiver_obj, state=radio_state,
     # Keep the clock module local, just as the known-stable receiver loop did.
     import time
     while state[4]:
+        state[6] = True
         try:
             receiver_obj.tick()
             state[1] = 0
@@ -1381,16 +1417,26 @@ def radio_core_task(receiver_obj, state=radio_state,
                         print("RADIO_RECOVERY_ERR", repr(recovery_exc))
                     except Exception:
                         pass
+        finally:
+            # Web history must not start a Flash/JSON step while core 1 is
+            # draining, parsing a frame, or recovering the radio.
+            state[6] = False
         state[0] = time.ticks_ms()
         time.sleep_ms(1)
     try:
-        receiver_obj.sm.active(0)
-        receiver_obj.cs_pin.value(1)
-        print("RADIO_STOPPED_LOW_BATTERY")
+        receiver_obj.stop()
+        state[5] = True
+        print("RADIO_STOPPED")
     except Exception as exc:
         print("RADIO_STOP_ERR", repr(exc))
-    finally:
-        state[5] = True
+        # Do not acknowledge a failed stop: protection must skip clock changes.
+        state[5] = False
+    # Avoid a possible stale SDK Flash-lockout victim state on core-1 exit
+    # in the vendor build. Keep that core parked (no RF/PIO/DMA work)
+    # so clock/Flash operations still have a live lockout IRQ handler.
+    # Only a hardware reset leaves battery protection or a maintenance stop.
+    while True:
+        time.sleep_ms(1000)
 
 def process_ui_data(data):
     global last_basic, last_ext, last_is_full, has_received, current_status, current_status_color, last_rssi_str
@@ -1424,7 +1470,8 @@ def process_ui_data(data):
                 
             received_at = rtc.get_time_str(True)
             received_record = {"t": received_at, "d": data}
-            compact_record = make_history_record(rtc.get_history_time_str(), data)
+            history_received_at = rtc.get_history_time_str()
+            compact_record = make_history_record(history_received_at, data)
             if compact_record is not None:
                 queue_history(compact_record)
             queue_sd_log(received_record)
@@ -1434,7 +1481,9 @@ def process_ui_data(data):
             last_is_full = (msg_type != "basic_only")
             # Web/SSE is a live snapshot, not an internal-history reader.
             # Publish every parsed fragment, including extended_only.
-            latest_train_record = received_record
+            # Share the exact saved receipt date/minute with the web snapshot;
+            # preserve the SD log's existing time-with-seconds format above.
+            latest_train_record = {"t": history_received_at, "d": data}
             sample_device_status(time.ticks_ms(), force=True)
             wifi_portal.set_latest(latest_train_record)
             
@@ -1499,10 +1548,24 @@ elif cfg_wifi_enabled:
     service_wifi(time.ticks_ms())
 
 receiver = LBJReceiver(ppm_offset=cfg_ppm_offset)
+wifi_portal.set_history_store(history_store, lambda:
+    (receiver.input_is_buffered() or not radio_state[RADIO_BUSY])
+    and not len(receiver.raw_queue) and not len(ui_queue)
+    and not len(history_queue) and not len(sd_log_queue)
+    and receiver.input_pending() <= 1
+    and time.ticks_diff(time.ticks_ms(), last_storage_write) >= STORAGE_WRITE_GAP_MS
+    # A running DMA ring preserves incoming bits through a bounded Flash step.
+    # Still defer to all priority queues and any input backlog; core 1 keeps
+    # decoding while hardware DMA preserves newly arriving words.
+    # The original FIFO fallback must retain its stricter quiet-gap rule.
+    and (receiver.input_is_buffered() or not receiver.synced
+         or time.ticks_diff(time.ticks_ms(), receiver.last_word_time) >= HISTORY_RADIO_QUIET_MS))
 receiver.set_callback(light_callback) 
 radio_state[RADIO_HEARTBEAT] = time.ticks_ms()
 last_radio_health_log = radio_state[RADIO_HEARTBEAT]
 radio_state[RADIO_STOPPED] = False
+# Release constructor temporaries before allocating the core-1 thread stack.
+gc.collect()
 _thread.start_new_thread(radio_core_task, (receiver,))
 
 if boot_status == "RTC_SYNC":
@@ -1528,9 +1591,10 @@ while True:
     service_buzzer(now)
     sample_device_status(now)
     service_low_battery(now)
+    if screen_is_on and top_bar_ready:
+        draw_battery_top_status()
     if screen_is_on and system_state in ("DASHBOARD", "HISTORY"):
         draw_hardware_bar()
-    service_wifi(now)
 
     if time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]) > RADIO_CORE_STALL_MS:
         if time.ticks_diff(now, radio_state[RADIO_LAST_ERROR_LOG]) >= 5000:
@@ -1743,7 +1807,9 @@ while True:
                     draw_wifi_settings()
 
         elif system_state == "WIFI_SETTINGS":
-            if not wifi_module_ok:
+            if protection.overheat:
+                draw_wifi_settings()
+            elif not wifi_module_ok:
                 system_state = "MENU"
                 draw_menu(full=True)
             else:
@@ -1834,4 +1900,7 @@ while True:
         else:
             draw_idle_screen()
 
+    # Network/history work is lower priority than train redraws and buttons.
+    # One bounded history line at most, and only in a radio/storage quiet gap.
+    service_wifi(time.ticks_ms())
     time.sleep_ms(1)

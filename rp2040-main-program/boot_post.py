@@ -3,7 +3,7 @@ import machine
 import sdcard
 
 BATTERY_ADC_GAIN = 1.07
-BATTERY_EMPTY_V = 3.45
+from device_protection import BATTERY_EMPTY_V
 
 def battery_voltage_from_raw(raw):
     """Apply the W receiver's voltage gain to the ADC reading."""
@@ -114,7 +114,8 @@ class SystemPOST:
     def check_temp(self, sensor_temp):
         self._check_start("TEMPERATURE")
         t = 27 - (sensor_temp.read_u16()*(3.3/65535)-0.706)/0.001721
-        if 10 <= t <= 45: self._check_end("OK", f"{t:.1f}C (Norm)")
+        if t > 45: self._check_end("WARN_RED", f"{t:.1f}C (HOT)")
+        elif t >= 10: self._check_end("OK", f"{t:.1f}C (Norm)")
         else: self._check_end("WARN", f"{t:.1f}C (Abnorm)")
 
     def check_rtc(self, rtc):

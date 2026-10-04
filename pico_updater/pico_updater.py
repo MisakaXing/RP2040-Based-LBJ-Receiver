@@ -69,7 +69,7 @@ FIRMWARE_BRANCHES = {
         "family": "rp2040",
         "hardware_hint": "仅适用于 RP2040 Pico 标准接收器",
         "runtime_files": COMMON_RUNTIME_FILES + ("main.py",),
-        "optional_runtime_files": ("boot.py",),
+        "optional_runtime_files": ("boot.py", "pio_dma_rx.py", "device_protection.py"),
     },
     WIRELESS_CHANNEL_LABEL: {
         "label": WIRELESS_CHANNEL_LABEL,
@@ -81,6 +81,9 @@ FIRMWARE_BRANCHES = {
             "wireless_portal.py",
             "main.py",
         ),
+        # New W firmware can use hardware RX buffering; older releases still
+        # work without this optional module and use their original FIFO path.
+        "optional_runtime_files": ("pio_dma_rx.py", "device_protection.py"),
     },
 }
 

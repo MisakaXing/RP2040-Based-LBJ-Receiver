@@ -22,7 +22,7 @@ process.stdin.on('end', async () => {
       addEventListener(name, cb) { this.handlers[name] = cb; }
       close() { this.readyState = 2; }
     }
-    const context = vm.createContext({document: {body: {dataset: {recordId: '0'}},
+    const context = vm.createContext({document: {body: {dataset: {recordId: '0'}, classList: el('body').classList},
       getElementById: el, addEventListener() {}},
       window: {EventSource, addEventListener() {}}, EventSource, TextDecoder,
       setTimeout: () => 1, clearTimeout() {},

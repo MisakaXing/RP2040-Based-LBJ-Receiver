@@ -611,6 +611,44 @@ class HistoryStore:
             self.last_error = "READ " + str(exc)[:40]
             return None
 
+    def iter_load(self, index):
+        """Cooperative one-record lookup: at most one JSON line per next().
+
+        None means more work; a dictionary is the result. The caller must
+        close the iterator on cancellation so the Flash handle is released.
+        Unlike load(), this never builds a 16-record cache for web browsing.
+        """
+        if not self.index_complete or index < 0 or index >= self.count:
+            return
+        checkpoint = index // self.index_stride
+        if checkpoint >= len(self.offsets):
+            return
+        slot = index - checkpoint * self.index_stride
+        if self._cache_checkpoint == checkpoint and slot < len(self._cache_records):
+            yield self._cache_records[slot]
+            return
+        next_offset = (self.offsets[checkpoint + 1]
+                       if checkpoint + 1 < len(self.offsets) else None)
+        try:
+            with open(self.path, "rb") as source:
+                source.seek(self.offsets[checkpoint])
+                while True:
+                    if next_offset is not None and source.tell() >= next_offset:
+                        raise ValueError("INDEX MISMATCH")
+                    line, _, oversized = self._read_bounded_line(source)
+                    if line is None and not oversized:
+                        raise ValueError("INDEX MISMATCH")
+                    record = None if oversized else self._decode_line(line, self.max_scan_line_bytes)
+                    if record is not None:
+                        if slot == 0:
+                            self.last_error = ""
+                            yield record
+                            return
+                        slot -= 1
+                    yield None
+        except Exception as exc:
+            self.last_error = "READ " + str(exc)[:40]
+
     def _load_uncached(self, index, checkpoint, next_offset=None):
         remaining = index - checkpoint * self.index_stride
         try:

@@ -92,6 +92,70 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(history_limit_for_filesystem(6 * 1024 * 1024), 5000)
         self.assertEqual(history_limit_for_filesystem(2 * 1024 * 1024), 2500)
 
+    def test_cooperative_read_yields_one_line_without_changing_cache(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(20):
+            self.assertEqual(store.append(record(number)), APPEND_OK)
+        iterator = store.iter_load(15)
+        for _ in range(15):
+            self.assertIsNone(next(iterator))
+        self.assertEqual(next(iterator)["d"]["basic"]["train_no"], "15")
+        iterator.close()
+        self.assertEqual(store._cache_checkpoint, -1)
+        self.assertEqual(store.count, 20)
+        iterator = store.iter_load(0)
+        self.assertEqual(next(iterator)["d"]["basic"]["train_no"], "0")
+        iterator.close()
+        self.assertEqual(list(store.iter_load(999)), [])
+
+    def test_cooperative_read_closes_file_on_cancellation(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(20):
+            store.append(record(number))
+        actual_open = open
+        handles = []
+        def tracked_open(*args, **kwargs):
+            handle = actual_open(*args, **kwargs)
+            handles.append(handle)
+            return handle
+        with mock.patch("builtins.open", side_effect=tracked_open):
+            iterator = store.iter_load(15)
+            self.assertIsNone(next(iterator))
+            self.assertFalse(handles[0].closed)
+            iterator.close()
+            self.assertTrue(handles[0].closed)
+        self.assertEqual(store._cache_checkpoint, -1)
+
+    def test_cooperative_read_uses_existing_cache_without_mutating_it(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(20):
+            store.append(record(number))
+        cached = store.load(15)
+        cache = store._cache_records
+        with mock.patch("builtins.open", side_effect=AssertionError("unexpected Flash read")):
+            iterator = store.iter_load(15)
+            self.assertIs(next(iterator), cached)
+            iterator.close()
+        self.assertIs(store._cache_records, cache)
+
+    def test_cooperative_read_handles_invalid_lines_and_file_truncation(self):
+        with open(self.path, "w") as target:
+            target.write(json.dumps(record(0)) + "\ninvalid\n" + json.dumps(record(1)) + "\n")
+        store = self.make_store()
+        store.scan()
+        iterator = store.iter_load(1)
+        self.assertIsNone(next(iterator))
+        self.assertIsNone(next(iterator))
+        self.assertEqual(next(iterator)["d"]["basic"]["train_no"], "1")
+        iterator.close()
+        with open(self.path, "w") as target:
+            target.write(json.dumps(record(0)) + "\n")
+        self.assertEqual(list(store.iter_load(1)), [None])
+        self.assertIn("INDEX MISMATCH", store.last_error)
+
     def test_capacity_recovers_after_transient_initial_statvfs_failure(self):
         calls = 0
 
