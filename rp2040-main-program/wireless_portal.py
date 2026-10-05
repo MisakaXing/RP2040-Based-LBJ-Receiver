@@ -55,6 +55,7 @@ CLIENT_HISTORY_JOB = 8
 CLIENT_PEER_IP = 9
 HISTORY_READ_TIMEOUT_MS = 3000
 HISTORY_READ_STEP_GAP_MS = 40
+SERVICE_BUDGET_MS = 8
 
 CAPTIVE_PATHS = (
     "/generate_204",
@@ -270,6 +271,16 @@ class WirelessPortal:
         self._health_at = 0
         self.txpower_dbm = self.AP_TXPOWER_DBM
         self._txpower_error = ""
+        self._input_yield = None
+        self.last_service_ms = 0
+        self.max_service_ms = 0
+        self._service_phase = 0
+
+    def set_input_yield(self, callback):
+        self._input_yield = callback
+
+    def _yield_for_input(self):
+        return self._input_yield is not None and self._input_yield()
 
     def is_enabled(self):
         return self._enabled
@@ -559,6 +570,7 @@ class WirelessPortal:
                 pass
         self._enabled = False
         self._ip = AP_IP
+        self._service_phase = 0
         if clear_error:
             self._last_error = ""
         print("WIFI_AP_OFF")
@@ -1091,22 +1103,39 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
             self._clients.append(state)
 
     def service(self, now=None):
-        if not self._enabled:
+        if not self._enabled or self._yield_for_input():
             return
-        now = _ticks_ms() if now is None else now
-        self._service_dns()
-        self._service_http_client(now)
-        # Free a completed short request before accepting the next connection.
-        # When both slots remain occupied, leave new TCP handshakes in the
-        # listen backlog instead of accept+RST cycling them.
-        if len(self._clients) < MAX_HTTP_CLIENTS:
-            self._accept_http(now)
-
-        if _ticks_diff(now, self._health_at) >= 5000:
-            self._health_at = now
-            try:
-                if not self._ap.active():
-                    raise OSError("AP became inactive")
-            except Exception as exc:
-                self._last_error = str(exc)[:48]
-                self._stop(clear_error=False)
+        started = _ticks_ms()
+        now = started if now is None else now
+        try:
+            # Round-robin resumes at the next phase when a slow step uses the
+            # budget: DNS floods must not starve HTTP or vice versa. This is a
+            # cooperative budget, not a preemptive timeout for a single SDK
+            # call. Hard IRQ capture preserves key pulses during that call.
+            for _ in range(4):
+                if (self._yield_for_input()
+                        or _ticks_diff(_ticks_ms(), started) >= SERVICE_BUDGET_MS):
+                    return
+                phase = self._service_phase
+                self._service_phase = (phase + 1) % 4
+                if phase == 0:
+                    self._service_dns()
+                elif phase == 1:
+                    self._service_http_client(now)
+                elif phase == 2:
+                    # Leave new TCP handshakes in the listen backlog when
+                    # both slots are occupied, rather than accept+RST cycling.
+                    if len(self._clients) < MAX_HTTP_CLIENTS:
+                        self._accept_http(now)
+                elif _ticks_diff(now, self._health_at) >= 5000:
+                    self._health_at = now
+                    try:
+                        if not self._ap.active():
+                            raise OSError("AP became inactive")
+                    except Exception as exc:
+                        self._last_error = str(exc)[:48]
+                        self._stop(clear_error=False)
+                        return
+        finally:
+            self.last_service_ms = _ticks_diff(_ticks_ms(), started)
+            self.max_service_ms = max(self.max_service_ms, self.last_service_ms)

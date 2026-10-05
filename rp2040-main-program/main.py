@@ -3,6 +3,7 @@ import json
 import machine
 import os
 import gc
+import micropython
 import sdcard
 import _thread  
 from machine import Pin, ADC, I2C
@@ -59,7 +60,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.13-W"
+Program_ver = "5.14-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 VSYS_USB_PRESENT_RAW = 28200  # GP46 reads VSYS/3; about 4.26 V at a 3.3 V ADC reference.
@@ -139,6 +140,7 @@ rtc = DS3231(i2c0)
 btn_menu, btn_up, btn_down, btn_ok = [Pin(i, Pin.IN, Pin.PULL_UP) for i in (2, 3, 4, 5)]
 btn_wake = Pin(42, Pin.IN, Pin.PULL_UP)
 sensor_temp = ADC(ADC.CORE_TEMP)
+micropython.alloc_emergency_exception_buf(128)
 
 
 class ButtonTracker:
@@ -155,58 +157,126 @@ class ButtonTracker:
         self.changed_at = time.ticks_ms()
         self.repeat_at = time.ticks_add(self.changed_at, repeat_delay_ms)
         self.suppress_until_release = False
+        # A hard GPIO IRQ preserves a complete short press even while the VM
+        # is drawing, writing Flash or servicing a network request. All handler
+        # objects are bound here; the IRQ only changes pre-existing small-int
+        # and boolean fields. Commands are still executed exclusively on core 0.
+        self._pending_press = False
+        self.irq_enabled = False
+        self.irq_error = ""
+        self.irq_edges = 0
+        self.captured_presses = 0
+        self.delivered_events = 0
+        self.coalesced_presses = 0
+        self._read_pin = pin.value
+        self._ticks_ms = time.ticks_ms
+        self._ticks_diff = time.ticks_diff
+        self._qualify = self._qualify_state
+        self._irq_handler = self._capture_edge
+        self._disable_irq = None
+        self._enable_irq = None
+        if hasattr(pin, "irq"):
+            try:
+                self._disable_irq = machine.disable_irq
+                self._enable_irq = machine.enable_irq
+                pin.irq(handler=self._irq_handler,
+                        trigger=pin.IRQ_FALLING | pin.IRQ_RISING, hard=True)
+                self.irq_enabled = True
+            except Exception as exc:
+                # Do not silently substitute a scheduled soft IRQ: it can be
+                # delayed by the same VM work as polling. Keep the legacy path
+                # usable, and make degraded capture visible in the boot log.
+                self.irq_error = str(exc)[:48]
+                try:
+                    pin.irq(handler=None)
+                except Exception:
+                    pass
 
-    def set_repeat_profile(self, delay_ms, interval_ms, now,
-                           suppress_until_release=False):
-        self.repeat_delay_ms = delay_ms
-        self.repeat_interval_ms = interval_ms
-        self.repeat_at = time.ticks_add(now, delay_ms)
-        if suppress_until_release:
-            self.suppress_until_release = (
-                self.raw_pressed
-                or self.stable_pressed
-                or not self.pin.value()
-            )
-
-    def poll(self, now):
-        raw_pressed = not self.pin.value()
-        if raw_pressed != self.raw_pressed:
-            self.raw_pressed = raw_pressed
-            self.changed_at = now
-
-        # A direction key may still be held when HISTORY exits.  Swallow that
-        # hold through a debounced release so its accelerated repeat cannot
-        # leak into the dashboard or menu.
+    def _qualify_state(self, now):
         if self.suppress_until_release:
-            if (
-                not self.raw_pressed
-                and self.stable_pressed
-                and time.ticks_diff(now, self.changed_at) >= self.debounce_ms
-            ):
+            self._pending_press = False
+            if (not self.raw_pressed and self.stable_pressed
+                    and self._ticks_diff(now, self.changed_at) >= self.debounce_ms):
                 self.stable_pressed = False
             if not self.raw_pressed and not self.stable_pressed:
                 self.suppress_until_release = False
-            return False
-
-        if (
-            self.raw_pressed != self.stable_pressed
-            and time.ticks_diff(now, self.changed_at) >= self.debounce_ms
-        ):
+            return
+        if (self.raw_pressed != self.stable_pressed
+                and self._ticks_diff(now, self.changed_at) >= self.debounce_ms):
             self.stable_pressed = self.raw_pressed
             if self.stable_pressed:
+                if self._pending_press:
+                    self.coalesced_presses = (self.coalesced_presses + 1) & 0xFFFF
+                self._pending_press = True
+                self.captured_presses = (self.captured_presses + 1) & 0xFFFF
+
+    def _capture_edge(self, _pin):
+        # Qualify the PREVIOUS level at its actual ending edge. In particular,
+        # a >=12 ms low pulse must survive even when press and release both
+        # happened between two visits to poll(). No printing/allocation/I/O
+        # beyond a GPIO read is allowed here.
+        now = self._ticks_ms()
+        pressed = not self._read_pin()
+        if pressed != self.raw_pressed:
+            self._qualify(now)
+            self.raw_pressed = pressed
+            self.changed_at = now
+            self.irq_edges = (self.irq_edges + 1) & 0xFFFF
+
+    def input_pending(self):
+        return self._pending_press or self.raw_pressed != self.stable_pressed
+
+    def set_repeat_profile(self, delay_ms, interval_ms, now,
+                           suppress_until_release=False):
+        irq_state = self._disable_irq() if self.irq_enabled else None
+        try:
+            self.repeat_delay_ms = delay_ms
+            self.repeat_interval_ms = interval_ms
+            self.repeat_at = time.ticks_add(now, delay_ms)
+            if suppress_until_release:
+                self._pending_press = False
+                self.suppress_until_release = (
+                    self.raw_pressed or self.stable_pressed or not self._read_pin()
+                )
+        finally:
+            if self.irq_enabled:
+                self._enable_irq(irq_state)
+
+    def poll(self, now):
+        # IRQ and foreground share debounce/latch fields. Keep this small
+        # critical section allocation-free; no screen, Flash, sound or network
+        # command is dispatched with interrupts masked.
+        irq_state = self._disable_irq() if self.irq_enabled else None
+        try:
+            raw_pressed = not self._read_pin()
+            if raw_pressed != self.raw_pressed:
+                if self.irq_enabled:
+                    # An edge can latch just after interrupts were masked.
+                    # Its previous level has a known IRQ timestamp, so retain
+                    # a completed press before updating from the live GPIO.
+                    self._qualify(now)
+                # Also retain polling on firmware without hard GPIO IRQs. A
+                # polled change has an unknown edge time; never infer that the
+                # previous level persisted through the whole sampling gap.
+                self.raw_pressed = raw_pressed
+                self.changed_at = now
+            self._qualify(now)
+            if self.suppress_until_release:
+                return False
+            if self._pending_press:
+                self._pending_press = False
                 self.repeat_at = time.ticks_add(now, self.repeat_delay_ms)
+                self.delivered_events = (self.delivered_events + 1) & 0xFFFF
+                return True
+            if (self.repeat and self.raw_pressed and self.stable_pressed
+                    and time.ticks_diff(now, self.repeat_at) >= 0):
+                self.repeat_at = time.ticks_add(now, self.repeat_interval_ms)
+                self.delivered_events = (self.delivered_events + 1) & 0xFFFF
                 return True
             return False
-
-        if (
-            self.repeat
-            and self.raw_pressed
-            and self.stable_pressed
-            and time.ticks_diff(now, self.repeat_at) >= 0
-        ):
-            self.repeat_at = time.ticks_add(now, self.repeat_interval_ms)
-            return True
-        return False
+        finally:
+            if self.irq_enabled:
+                self._enable_irq(irq_state)
 
 # 显示只运行在核心 0，驱动内部已经分块发送，无需人为 sleep 或二次切片。
 def safe_fill_rect(x, y, w, h, color):
@@ -1581,6 +1651,28 @@ up_button = ButtonTracker(btn_up, repeat=True)
 down_button = ButtonTracker(btn_down, repeat=True)
 ok_button = ButtonTracker(btn_ok)
 wake_button = ButtonTracker(btn_wake)
+button_trackers = (menu_button, up_button, down_button, ok_button, wake_button)
+
+def buttons_pending():
+    for button in button_trackers:
+        if button.input_pending():
+            return True
+    return False
+
+def network_should_yield():
+    # New RF words/decoded messages outrank both web traffic and web history.
+    # pending() is advisory only; only core 1 consumes the DMA ring.
+    return (bool(len(receiver.raw_queue)) or bool(len(ui_queue))
+            or receiver.input_pending() > 1 or buttons_pending())
+
+wifi_portal.set_input_yield(network_should_yield)
+print('BUTTON_IRQ', [button.irq_enabled for button in button_trackers])
+for button in button_trackers:
+    if button.irq_error:
+        print('BUTTON_IRQ_FALLBACK', button.irq_error)
+last_button_scan_ms = None
+button_last_scan_gap_ms = 0
+button_max_scan_gap_ms = 0
 last_sec = time.ticks_ms()
 heartbeat = False
 
@@ -1591,43 +1683,9 @@ while True:
     service_buzzer(now)
     sample_device_status(now)
     service_low_battery(now)
-    if screen_is_on and top_bar_ready:
-        draw_battery_top_status()
-    if screen_is_on and system_state in ("DASHBOARD", "HISTORY"):
-        draw_hardware_bar()
-
-    if time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]) > RADIO_CORE_STALL_MS:
-        if time.ticks_diff(now, radio_state[RADIO_LAST_ERROR_LOG]) >= 5000:
-            print("RADIO_CORE_STALL", "age_ms=", time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]))
-            radio_state[RADIO_LAST_ERROR_LOG] = now
-
-    if time.ticks_diff(now, last_radio_health_log) >= RADIO_HEALTH_LOG_MS:
-        with ui_lock:
-            ui_pending = len(ui_queue)
-            ui_dropped = ui_queue.dropped
-        print("RADIO_HEALTH", receiver.get_health_snapshot(),
-              "thread_errors=", radio_state[RADIO_TOTAL_ERRORS],
-              "ui_pending=", ui_pending,
-              "ui_dropped=", ui_dropped,
-              "history_pending=", len(history_queue),
-              "history_dropped=", history_dropped,
-              "sd_pending=", len(sd_log_queue),
-              "sd_dropped=", sd_dropped,
-              "storage_errors=", storage_errors,
-              "storage_forced=", storage_forced_writes,
-              "wifi_errors=", wifi_service_errors,
-              "mem_free=", gc.mem_free())
-        last_radio_health_log = now
-
-    screen_timeout_ms = SCR_OFF_MS[cfg_scr_idx]
-    if screen_is_on and screen_timeout_ms >= 0:
-        if time.ticks_diff(now, last_interaction) > screen_timeout_ms:
-            set_screen_power(False)
-            
-    if need_post_train_gc and time.ticks_diff(now, last_interaction) > 1000:
-        gc.collect()
-        need_post_train_gc = False
-
+    # RF decoding stays on core 1. On core 0, acknowledge/publish an already
+    # decoded train before dispatching input; IRQ capture retains presses while
+    # that higher-priority work redraws the display.
     ui_data_to_process = None
     with ui_lock:
         ui_data_to_process = ui_queue.get()
@@ -1638,56 +1696,23 @@ while True:
         except Exception as exc:
             print("UI_QUEUE_ERR", repr(exc))
 
-    try:
-        service_history_storage(now)
-    except Exception as exc:
-        # Never allow non-essential storage work to exit the main loop.
-        print("STORAGE_SERVICE_ERR", repr(exc))
-        storage_errors = (storage_errors + 1) & 0x3FFFFFFF
-        history_dropped = (history_dropped + len(history_queue)) & 0x3FFFFFFF
-        sd_dropped = (sd_dropped + len(sd_log_queue)) & 0x3FFFFFFF
-        history_queue.clear()
-        sd_log_queue.clear()
-        storage_pending_since = None
-        current_status, current_status_color = b'STOR ERR', RED
-        if system_state == "DASHBOARD":
-            update_top_bar()
-            
-    try:
-        service_history_checkpoint(time.ticks_ms())
-    except Exception as exc:
-        # Optional boot acceleration cannot discard pending train records.
-        print("HISTORY_CHECKPOINT_ERR", repr(exc))
-
-    if gc.mem_free() < 20000:
-        gc.collect()
-
-    if time.ticks_diff(now, last_sec) > 1000:
-        if system_state == "DASHBOARD": 
-            heartbeat = not heartbeat
-            tft.fill_rect(310, 8, 6, 6, GREEN if heartbeat else 0x01CF)
-            t_str = rtc.get_time_str(show_seconds=False)
-            try:
-                now_min = int(t_str.split(':')[1])
-                if now_min != last_minute:
-                    tft.fill_rect(135, 4, 60, 16, 0x01CF) 
-                    tft.draw_gbk(t_str.encode(), 135, 4, YELLOW, 0x01CF)
-                    last_minute = now_min
-            except: pass
-            
-            if not sd_active and current_sd_status != "NO SD CARD" and time.ticks_diff(now, last_sd_err_time) > 3000:
-                current_sd_status = "NO SD CARD"
-                update_top_bar() 
-                
-            if not has_received: 
-                draw_hardware_bar(force=False) 
-        last_sec = now
+    # Sample with the actual scan time, not the beginning of earlier I/O.
+    now = time.ticks_ms()
+    if last_button_scan_ms is not None:
+        button_last_scan_gap_ms = time.ticks_diff(now, last_button_scan_ms)
+        button_max_scan_gap_ms = max(button_max_scan_gap_ms, button_last_scan_gap_ms)
+    last_button_scan_ms = now
 
     wake_event = wake_button.poll(now)
     menu_event = menu_button.poll(now)
     down_event = down_button.poll(now)
     up_event = up_button.poll(now)
     ok_event = ok_button.poll(now)
+    # A buffered MENU command must not also confirm the freshly opened menu.
+    # Coalesce competing navigation commands, as on HISTORY exit, rather than
+    # replaying old OK/direction input into a different screen.
+    if menu_event:
+        down_event = up_event = ok_event = False
     any_button_event = wake_event or menu_event or down_event or up_event or ok_event
 
     if any_button_event:
@@ -1880,6 +1905,97 @@ while True:
             spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
             time.sleep(1)
             system_state = "DASHBOARD"; draw_ui_skeleton(); draw_idle_screen(); draw_hardware_bar(force=True)
+
+    # Train events were handled first above. Dispatch captured buttons before
+    # optional hardware-bar redraws, storage/checkpoint work and GC.
+    now = time.ticks_ms()
+    if screen_is_on and top_bar_ready:
+        draw_battery_top_status()
+    if screen_is_on and system_state in ("DASHBOARD", "HISTORY"):
+        draw_hardware_bar()
+
+    if time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]) > RADIO_CORE_STALL_MS:
+        if time.ticks_diff(now, radio_state[RADIO_LAST_ERROR_LOG]) >= 5000:
+            print("RADIO_CORE_STALL", "age_ms=", time.ticks_diff(now, radio_state[RADIO_HEARTBEAT]))
+            radio_state[RADIO_LAST_ERROR_LOG] = now
+
+    if time.ticks_diff(now, last_radio_health_log) >= RADIO_HEALTH_LOG_MS:
+        with ui_lock:
+            ui_pending = len(ui_queue)
+            ui_dropped = ui_queue.dropped
+        print("RADIO_HEALTH", receiver.get_health_snapshot(),
+              "thread_errors=", radio_state[RADIO_TOTAL_ERRORS],
+              "ui_pending=", ui_pending,
+              "ui_dropped=", ui_dropped,
+              "history_pending=", len(history_queue),
+              "history_dropped=", history_dropped,
+              "sd_pending=", len(sd_log_queue),
+              "sd_dropped=", sd_dropped,
+              "storage_errors=", storage_errors,
+              "storage_forced=", storage_forced_writes,
+              "wifi_errors=", wifi_service_errors,
+              "mem_free=", gc.mem_free())
+        print('BUTTON_HEALTH', 'scan_max_ms=', button_max_scan_gap_ms,
+              'irq=', [button.irq_enabled for button in button_trackers],
+              'captured=', [button.captured_presses for button in button_trackers],
+              'events=', [button.delivered_events for button in button_trackers],
+              'coalesced=', [button.coalesced_presses for button in button_trackers],
+              'wifi_max_ms=', wifi_portal.max_service_ms)
+        last_radio_health_log = now
+
+    screen_timeout_ms = SCR_OFF_MS[cfg_scr_idx]
+    if screen_is_on and screen_timeout_ms >= 0:
+        if time.ticks_diff(now, last_interaction) > screen_timeout_ms:
+            set_screen_power(False)
+
+    if need_post_train_gc and time.ticks_diff(now, last_interaction) > 1000:
+        gc.collect()
+        need_post_train_gc = False
+
+    try:
+        service_history_storage(time.ticks_ms())
+    except Exception as exc:
+        # Never allow non-essential storage work to exit the main loop.
+        print("STORAGE_SERVICE_ERR", repr(exc))
+        storage_errors = (storage_errors + 1) & 0x3FFFFFFF
+        history_dropped = (history_dropped + len(history_queue)) & 0x3FFFFFFF
+        sd_dropped = (sd_dropped + len(sd_log_queue)) & 0x3FFFFFFF
+        history_queue.clear()
+        sd_log_queue.clear()
+        storage_pending_since = None
+        current_status, current_status_color = b'STOR ERR', RED
+        if system_state == "DASHBOARD":
+            update_top_bar()
+
+    try:
+        service_history_checkpoint(time.ticks_ms())
+    except Exception as exc:
+        # Optional boot acceleration cannot discard pending train records.
+        print("HISTORY_CHECKPOINT_ERR", repr(exc))
+
+    if gc.mem_free() < 20000:
+        gc.collect()
+
+    if time.ticks_diff(now, last_sec) > 1000:
+        if system_state == "DASHBOARD":
+            heartbeat = not heartbeat
+            tft.fill_rect(310, 8, 6, 6, GREEN if heartbeat else 0x01CF)
+            t_str = rtc.get_time_str(show_seconds=False)
+            try:
+                now_min = int(t_str.split(':')[1])
+                if now_min != last_minute:
+                    tft.fill_rect(135, 4, 60, 16, 0x01CF)
+                    tft.draw_gbk(t_str.encode(), 135, 4, YELLOW, 0x01CF)
+                    last_minute = now_min
+            except: pass
+
+            if not sd_active and current_sd_status != "NO SD CARD" and time.ticks_diff(now, last_sd_err_time) > 3000:
+                current_sd_status = "NO SD CARD"
+                update_top_bar()
+
+            if not has_received:
+                draw_hardware_bar(force=False)
+        last_sec = now
 
     # HISTORY uses a user-input clock of its own. Incoming train messages may
     # wake the screen and refresh live data, but must not keep a viewer trapped

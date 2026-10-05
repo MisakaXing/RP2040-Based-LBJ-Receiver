@@ -20,6 +20,16 @@ from wireless_portal import WirelessPortal, _ticks_ms, _http_response, _parse_ht
 from history_store import HistoryStore, APPEND_OK
 from test_history_store import fake_statvfs, record
 
+class HostAP:
+    """Only replace the radio driver; exercise the production service loop."""
+    def __init__(self):
+        self.enabled = True
+
+    def active(self, enabled=None):
+        if enabled is not None:
+            self.enabled = enabled
+        return self.enabled
+
 def main():
     with tempfile.TemporaryDirectory(prefix="lbj-9999-native-browser-") as directory:
         store = HistoryStore(str(pathlib.Path(directory) / "history.jsonl"),
@@ -49,6 +59,11 @@ def main():
         portal._http.bind(("127.0.0.1", 0))
         portal._http.listen(2)
         portal._http.setblocking(False)
+        portal._dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        portal._dns.bind(("127.0.0.1", 0))
+        portal._dns.setblocking(False)
+        portal._ap = HostAP()
+        portal._enabled = True
         port = portal._http.getsockname()[1]
         stop = threading.Event()
         def serve():
@@ -59,9 +74,7 @@ def main():
                     revision += 1
                     portal.set_latest(record(revision))
                     last = now
-                portal._service_http_client(now)
-                if len(portal._clients) < 2:
-                    portal._accept_http(now)
+                portal.service(now)
                 time.sleep(.001)
         worker = threading.Thread(target=serve, daemon=True)
         worker.start()

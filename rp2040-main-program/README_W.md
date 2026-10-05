@@ -1,6 +1,8 @@
 # LBJ Receiver W 版（Waveshare RP2350B-Plus-W）
 
-这是从原 `rp2040-main-program` 完整复制后独立开发的无线版本。GitHub 的 `Wireless-Enabled` 分支保存 W 版；`main` 分支保留普通版。本次版本分别为 `5.13-W` 和 `5.11`。
+这是从原 `rp2040-main-program` 完整复制后独立开发的无线版本。GitHub 的 `Wireless-Enabled` 分支保存 W 版，当前版本为 `5.14-W`；`main` 分支保留普通版，其版本以该分支代码为准。
+
+`5.14-W` 改进无线负载下的按键响应：硬中断保留短按，主循环先处理列车事件，再处理按键；网页任务在射频积压或按键待处理时让行，并采用轮转时间预算。射频参数、解码与 DMA 链路不变。测试结果见 [`BUTTON_INPUT_FIX_TEST_REPORT.md`](BUTTON_INPUT_FIX_TEST_REPORT.md)。
 
 ## 本次更新
 
