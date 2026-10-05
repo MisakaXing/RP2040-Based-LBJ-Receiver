@@ -223,6 +223,11 @@ def _parse_http_request(request):
     return parts[0].upper(), parts[1].split("?", 1)[0]
 
 
+def _cached_history_record(record):
+    # This iterator is guaranteed RAM-only, even if the store cache changes.
+    yield record
+
+
 def _sse_headers():
     # An SSE stream has no Content-Length and stays open until the browser
     # disconnects.  ``retry`` asks EventSource to reconnect after two seconds.
@@ -316,7 +321,12 @@ class WirelessPortal:
         if defer:
             # Creating this generator does not read Flash. Let the queued job
             # wait for a safe gap instead of rejecting a momentarily busy RX.
-            return (store.iter_load(index), index, self._history_token)
+            cached = store.peek_web_cached(index) if hasattr(store, "peek_web_cached") else None
+            iterator = (_cached_history_record(cached) if cached is not None else
+                        store.iter_load_web(index) if hasattr(store, "iter_load_web") else
+                        store.iter_load(index))
+            return (iterator, index, self._history_token, cached is not None,
+                    getattr(store, "web_cache_generation", 0))
         if self._history_ready is not None and not self._history_ready():
             return reply("503 Service Unavailable", {"error": "receiver_busy"})
         # Never disturb the device's browsing cursor or latest snapshot.
@@ -948,18 +958,21 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
 
         if state[CLIENT_MODE] == MODE_HISTORY:
             job = state[CLIENT_HISTORY_JOB]
-            iterator, index, token, started, last_step = job
+            iterator, index, token, started, last_step = job[:5]
+            cached_only = len(job) > 5 and job[5]
             error, status = None, "503 Service Unavailable"
             if self._history_owner is None or token != self._history_token:
                 error, status = "sse_required", "403 Forbidden"
             elif index >= self._history_store.count:
                 error, status = "history_changed", "409 Conflict"
+            elif len(job) > 6 and job[6] != getattr(self._history_store, "web_cache_generation", 0):
+                error, status = "history_changed", "409 Conflict"
             elif _ticks_diff(now, started) >= HISTORY_READ_TIMEOUT_MS:
                 error = "receiver_busy"
-            elif self._history_ready is not None and not self._history_ready():
+            elif not cached_only and self._history_ready is not None and not self._history_ready():
                 self._clients.append(state)
                 return
-            elif _ticks_diff(now, last_step) < HISTORY_READ_STEP_GAP_MS:
+            elif not cached_only and _ticks_diff(now, last_step) < HISTORY_READ_STEP_GAP_MS:
                 self._clients.append(state)
                 return
             else:
@@ -1052,7 +1065,7 @@ put("route",decodeRoute(el("route").dataset.gbk));renderCoordinates(el("location
                     state[CLIENT_REQUEST] = None
                     if isinstance(result, tuple):
                         state[CLIENT_MODE] = MODE_HISTORY
-                        job = list(result) + [now, now]
+                        job = list(result[:3]) + [now, now] + list(result[3:])
                         if len(state) > CLIENT_HISTORY_JOB:
                             state[CLIENT_HISTORY_JOB] = job
                         else:

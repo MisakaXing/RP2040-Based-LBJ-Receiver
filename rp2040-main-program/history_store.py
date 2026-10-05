@@ -20,6 +20,8 @@ LARGE_FLASH_FS_BYTES = 12 * MIB
 MEDIUM_FLASH_FS_BYTES = 4 * MIB
 LARGE_FLASH_HISTORY_LIMIT = 9999
 MEDIUM_FLASH_HISTORY_LIMIT = 5000
+WEB_HISTORY_CACHE_SIZE = 8
+WEB_HISTORY_CACHE_MIN_FREE = 48 * 1024
 SMALL_FLASH_HISTORY_LIMIT = 2500
 DEFAULT_INDEX_STRIDE = 16
 DEFAULT_MAX_RECORD_BYTES = 1024
@@ -246,6 +248,9 @@ class HistoryStore:
         self.offsets = array.array("I")
         self._cache_checkpoint = -1
         self._cache_records = []
+        self._web_cache_start = -1
+        self._web_cache_records = []
+        self.web_cache_generation = 0
         self.count = 0
         self.invalid_lines = 0
         self.tail_needs_separator = False
@@ -407,6 +412,9 @@ class HistoryStore:
     def _clear_cache(self):
         self._cache_checkpoint = -1
         self._cache_records = []
+        self._web_cache_start = -1
+        self._web_cache_records = []
+        self.web_cache_generation = (self.web_cache_generation + 1) & 0x3fffffff
 
     def _refresh_capacity_policy(self):
         if self._automatic_limit:
@@ -649,6 +657,88 @@ class HistoryStore:
         except Exception as exc:
             self.last_error = "READ " + str(exc)[:40]
 
+    def peek_web_cached(self, index):
+        """RAM-only lookup; never populate or change the LCD history cache."""
+        if not self.index_complete or index < 0 or index >= self.count:
+            return None
+        checkpoint, slot = divmod(index, self.index_stride)
+        if self._cache_checkpoint == checkpoint and slot < len(self._cache_records):
+            return self._cache_records[slot]
+        slot = index - self._web_cache_start
+        if 0 <= slot < len(self._web_cache_records):
+            return self._web_cache_records[slot]
+        return None
+
+    def iter_load_web(self, index):
+        """Preload up to eight nearby records, one Flash line per next().
+
+        Kept separate from the LCD's 16-record cache. Append-only writes do
+        not invalidate existing record IDs; scan/format invalidates both.
+        """
+        cached = self.peek_web_cached(index)
+        if cached is not None:
+            yield cached
+            return
+        if not self.index_complete or index < 0 or index >= self.count:
+            return
+        checkpoint = index // self.index_stride
+        if checkpoint >= len(self.offsets):
+            return
+        generation = self.web_cache_generation
+        block_start = checkpoint * self.index_stride
+        start = max(block_start, (index // WEB_HISTORY_CACHE_SIZE) * WEB_HISTORY_CACHE_SIZE)
+        end = min(start + WEB_HISTORY_CACHE_SIZE, block_start + self.index_stride, self.count)
+        next_offset = (self.offsets[checkpoint + 1]
+                       if checkpoint + 1 < len(self.offsets) else None)
+        # Release the previous web window before constructing the next one.
+        self._web_cache_start = -1
+        self._web_cache_records = []
+        memory_free = getattr(gc, "mem_free", None)
+        if memory_free is not None and memory_free() < WEB_HISTORY_CACHE_MIN_FREE:
+            gc.collect()
+            if memory_free() < WEB_HISTORY_CACHE_MIN_FREE:
+                for result in self.iter_load(index):
+                    yield result
+                return
+        records = []
+        ordinal = block_start
+        try:
+            with open(self.path, "rb") as source:
+                source.seek(self.offsets[checkpoint])
+                while ordinal < end:
+                    if generation != self.web_cache_generation or not self.index_complete:
+                        return
+                    if next_offset is not None and source.tell() >= next_offset:
+                        raise ValueError("INDEX MISMATCH")
+                    if memory_free is not None and memory_free() < 16 * 1024:
+                        raise MemoryError("history prefetch headroom")
+                    line, _, oversized = self._read_bounded_line(source)
+                    if line is None and not oversized:
+                        raise ValueError("INDEX MISMATCH")
+                    item = None if oversized else self._decode_line(line, self.max_scan_line_bytes)
+                    if item is not None:
+                        if ordinal >= start:
+                            records.append(item)
+                        ordinal += 1
+                    if ordinal < end:
+                        yield None
+            self._web_cache_start = start
+            self._web_cache_records = records
+            self.last_error = ""
+            yield records[index - start]
+        except MemoryError:
+            # Caching is optional. Fall back to the original cooperative
+            # single-record read without hiding an allocation failure as AP loss.
+            records = None
+            item = None
+            line = None
+            gc.collect()
+            yield None
+            for result in self.iter_load(index):
+                yield result
+        except Exception as exc:
+            self.last_error = "READ " + str(exc)[:40]
+
     def _load_uncached(self, index, checkpoint, next_offset=None):
         remaining = index - checkpoint * self.index_stride
         try:
@@ -757,6 +847,7 @@ class HistoryStore:
             # needed, so deleted records can never survive in a stale cache.
             empty_offsets = array.array("I")
             empty_cache = []
+            next_web_generation = (self.web_cache_generation + 1) & 0x3fffffff
             # Invalidate the cache before replacing the log. Power loss here
             # leaves the old history recoverable by a full scan, never stale IDs.
             try:
@@ -773,6 +864,9 @@ class HistoryStore:
             self.offsets = empty_offsets
             self._cache_checkpoint = -1
             self._cache_records = empty_cache
+            self._web_cache_start = -1
+            self._web_cache_records = empty_cache
+            self.web_cache_generation = next_web_generation
             self.count = 0
             self._indexed_end = 0
             self._checkpoint_count = -1

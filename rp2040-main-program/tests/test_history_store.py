@@ -128,6 +128,126 @@ class HistoryStoreTests(unittest.TestCase):
             self.assertTrue(handles[0].closed)
         self.assertEqual(store._cache_checkpoint, -1)
 
+    def test_web_window_preloads_eight_and_following_pages_never_read_flash(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(32):
+            store.append(record(number))
+        lcd_cache = store._cache_records
+        with mock.patch.object(store, "_read_bounded_line", wraps=store._read_bounded_line) as read:
+            values = list(store.iter_load_web(15))
+            self.assertEqual(read.call_count, 16)
+        self.assertEqual(values[:-1], [None] * 15)
+        self.assertEqual(values[-1]["d"]["basic"]["train_no"], "15")
+        self.assertEqual(store._web_cache_start, 8)
+        self.assertEqual(len(store._web_cache_records), 8)
+        self.assertIs(store._cache_records, lcd_cache)
+        with mock.patch("builtins.open", side_effect=AssertionError("unexpected Flash read")):
+            for index in range(14, 7, -1):
+                cached = store.peek_web_cached(index)
+                self.assertEqual(cached["d"]["basic"]["train_no"], str(index))
+                self.assertEqual(list(store.iter_load_web(index)), [cached])
+        self.assertEqual(list(store.iter_load_web(7))[-1]["d"]["basic"]["train_no"], "7")
+        self.assertEqual((store._web_cache_start, len(store._web_cache_records)), (0, 8))
+
+    def test_web_window_append_keeps_existing_ids_format_revokes_cache(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(8):
+            store.append(record(number))
+        list(store.iter_load_web(7))
+        generation = store.web_cache_generation
+        store.append(record(8))
+        with mock.patch("builtins.open", side_effect=AssertionError("unexpected Flash read")):
+            self.assertEqual(store.peek_web_cached(7)["d"]["basic"]["train_no"], "7")
+        self.assertEqual(store.web_cache_generation, generation)
+        self.assertTrue(store.clear())
+        self.assertNotEqual(store.web_cache_generation, generation)
+        store.append(record(99))
+        self.assertIsNone(store.peek_web_cached(0))
+        self.assertEqual(list(store.iter_load_web(0))[-1]["d"]["basic"]["train_no"], "99")
+
+    def test_web_window_preserves_lcd_cache_and_reuses_it(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(32):
+            store.append(record(number))
+        iterator = store.iter_load_web(15)
+        self.assertIsNone(next(iterator))
+        store.load(31)
+        lcd_cache = store._cache_records
+        self.assertEqual(list(iterator)[-1]["d"]["basic"]["train_no"], "15")
+        self.assertIs(store._cache_records, lcd_cache)
+        with mock.patch("builtins.open", side_effect=AssertionError("unexpected Flash read")):
+            self.assertEqual(list(store.iter_load_web(30))[0]["d"]["basic"]["train_no"], "30")
+
+    def test_web_window_cancellation_closes_handle_without_publishing_partial_cache(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(16):
+            store.append(record(number))
+        actual_open, handles = open, []
+        def tracked_open(*args, **kwargs):
+            handle = actual_open(*args, **kwargs)
+            handles.append(handle)
+            return handle
+        with mock.patch("builtins.open", side_effect=tracked_open):
+            iterator = store.iter_load_web(15)
+            self.assertIsNone(next(iterator))
+            iterator.close()
+        self.assertTrue(handles[0].closed)
+        self.assertEqual(store._web_cache_records, [])
+
+    def test_web_window_memory_failure_falls_back_to_cooperative_single_record(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(16):
+            store.append(record(number))
+        decode, calls = store._decode_line, [0]
+        def pressure(*args):
+            calls[0] += 1
+            if calls[0] == 3:
+                raise MemoryError("injected prefetch pressure")
+            return decode(*args)
+        with mock.patch.object(store, "_decode_line", side_effect=pressure):
+            values = list(store.iter_load_web(15))
+        self.assertEqual(values[-1]["d"]["basic"]["train_no"], "15")
+        self.assertEqual(store._web_cache_records, [])
+
+    def test_web_window_scan_invalidates_pending_iterator_and_cache(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(16):
+            store.append(record(number))
+        iterator = store.iter_load_web(15)
+        self.assertIsNone(next(iterator))
+        store.scan(use_checkpoint=False)
+        self.assertEqual(list(iterator), [])
+        self.assertIsNone(store.peek_web_cached(15))
+
+    def test_web_window_low_heap_skips_prefetch_without_losing_record(self):
+        store = self.make_store()
+        store.scan()
+        for number in range(16):
+            store.append(record(number))
+        import gc
+        with mock.patch.object(gc, "mem_free", return_value=12000, create=True):
+            values = list(store.iter_load_web(15))
+        self.assertEqual(values[-1]["d"]["basic"]["train_no"], "15")
+        self.assertEqual(store._web_cache_records, [])
+
+    def test_web_window_nonstandard_stride_partial_tail_and_invalid_lines(self):
+        with open(self.path, "w") as target:
+            for number in range(12):
+                target.write(json.dumps(record(number)) + "\ninvalid\n")
+        store = self.make_store(index_stride=5)
+        store.scan()
+        for index in (0, 4, 5, 9, 10, 11):
+            self.assertEqual(list(store.iter_load_web(index))[-1]["d"]["basic"]["train_no"], str(index))
+            self.assertLessEqual(len(store._web_cache_records), 8)
+        self.assertEqual(list(store.iter_load_web(-1)), [])
+        self.assertEqual(list(store.iter_load_web(12)), [])
+
     def test_cooperative_read_uses_existing_cache_without_mutating_it(self):
         store = self.make_store()
         store.scan()

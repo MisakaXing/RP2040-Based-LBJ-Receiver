@@ -183,6 +183,50 @@ class PortalHistoryTests(unittest.TestCase):
         self.portal._service_http_client(42)
         self.assertEqual(self.store.loads, [])
         self.assertIn(b"403", state[3])
+
+    def test_cached_history_is_ram_only_and_served_even_when_flash_is_busy(self):
+        self.store.peek_web_cached = lambda index: self.store.records[index]
+        self.portal._history_ready = lambda: False
+        state = self.start_deferred_request()
+        self.portal._clients = [state]
+        self.portal._service_http_client(2)  # No 40 ms Flash spacing for RAM.
+        self.assertEqual(state[5], MODE_HTTP)
+        self.assertIn(b"200 OK", state[3])
+        self.assertEqual(self.store.loads, [])
+
+    def test_cached_history_still_requires_owner_and_generation(self):
+        self.store.peek_web_cached = lambda index: self.store.records[index]
+        self.store.web_cache_generation = 1
+        state = self.start_deferred_request()
+        self.store.web_cache_generation = 2  # Format/scan, even if count is unchanged.
+        self.portal._clients = [state]
+        self.portal._service_http_client(2)
+        self.assertIn(b"409 Conflict", state[3])
+        self.assertEqual(self.store.loads, [])
+        state = self.start_deferred_request()
+        self.portal._finish_client(self.owner)
+        self.portal._clients = [state]
+        self.portal._service_http_client(2)
+        self.assertIn(b"403 Forbidden", state[3])
+
+    def test_cold_history_selects_prefetch_but_still_obeys_radio_gate(self):
+        calls = []
+        def prefetch(index):
+            calls.append(index)
+            yield None
+            yield self.store.records[index]
+        self.store.iter_load_web = prefetch
+        self.store.peek_web_cached = lambda index: None
+        self.portal._history_ready = lambda: False
+        state = self.start_deferred_request()
+        self.portal._clients = [state]
+        self.portal._service_http_client(100)
+        self.assertEqual(calls, [])
+        self.portal._history_ready = lambda: True
+        self.portal._service_http_client(140)
+        self.portal._service_http_client(180)
+        self.assertEqual(calls, [0])
+        self.assertIn(b"200 OK", state[3])
     def test_one_record_at_capacity_does_not_read_whole_history(self):
         self.store.records *= 5000
         self.store.records = self.store.records[:9999]
