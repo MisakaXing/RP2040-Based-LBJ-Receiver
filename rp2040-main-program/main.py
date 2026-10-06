@@ -126,8 +126,9 @@ spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
-bat_adc = ADC(Pin(41))
 vsys_adc = ADC(Pin(46))
+# POST and runtime telemetry share the onboard VSYS /3 channel.
+bat_adc = vsys_adc
 buzzer = Pin(22, Pin.OUT, value=0)
 try:
     buzzer_timer = machine.Timer(-1)
@@ -544,12 +545,7 @@ def get_rtc_date_for_edit():
     return 26, 1, 1
 
 def get_battery_info():
-    bat_en.value(0)
-    try:
-        time.sleep_ms(5)
-        readings = [bat_adc.read_u16() for _ in range(3)]
-    finally:
-        bat_en.value(1)
+    readings = [bat_adc.read_u16() for _ in range(3)]
     readings.sort()
     raw = readings[1]
     volts = battery_voltage_from_raw(raw)

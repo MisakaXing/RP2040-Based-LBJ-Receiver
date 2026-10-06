@@ -272,10 +272,10 @@ class DeviceSamplingTests(unittest.TestCase):
             "time": SimpleNamespace(ticks_diff=lambda a, b: a - b, sleep_ms=Mock()),
             "sensor_temp": SimpleNamespace(read_u16=Mock(return_value=13200)),
             "bat_en": SimpleNamespace(value=Mock()),
-            "bat_adc": SimpleNamespace(read_u16=Mock(return_value=37000)),
+            "bat_adc": SimpleNamespace(read_u16=Mock(return_value=26500)),
             "BATTERY_EMPTY_V": 3.45, "BATTERY_FULL_V": 4.2,
             "wifi_portal": WirelessPortal("test-password"),
-            "BATTERY_ADC_GAIN": 1.07, "last_usb_power": False,
+            "last_usb_power": False,
             "usb_power_present": Mock(return_value=False),
         }
         exec(compile(ast.Module(body=[battery_function], type_ignores=[]),
@@ -283,15 +283,15 @@ class DeviceSamplingTests(unittest.TestCase):
         exec(compile(ast.Module(body=functions, type_ignores=[]), "main.py", "exec"), self.ns)
 
     def test_battery_zero_begins_at_3_45v(self):
-        raw = int(3.45 / 1.07 / 6.6 * 65535)
+        raw = int(3.45 / 9.9 * 65535)
         self.ns["bat_adc"].read_u16.side_effect = [raw - 1000, raw, raw + 1000]
         shown_voltage, shown_percent = self.ns["get_battery_info"]()
         self.assertEqual(shown_voltage, "3.4V")
         self.assertEqual(shown_percent, "0%")
-        self.ns["bat_en"].value.assert_called_with(1)
+        self.ns["bat_en"].value.assert_not_called()
 
     def test_just_above_cutoff_remains_one_percent(self):
-        raw = int(3.451 / 1.07 / 6.6 * 65535) + 1
+        raw = int(3.451 / 9.9 * 65535) + 1
         self.ns["bat_adc"].read_u16.return_value = raw
         self.assertEqual(self.ns["get_battery_info"]()[1], "1%")
 
@@ -326,26 +326,26 @@ class DeviceSamplingTests(unittest.TestCase):
         self.assertTrue(self.ns["last_usb_power"])
         self.assertEqual(self.ns["usb_power_present"].call_count, 3)
 
-    def test_gain_matches_requested_formula(self):
-        raw = 39737
+    def test_vsys_uses_three_to_one_divider_without_battery_gain(self):
+        raw = 30535
         self.ns["bat_adc"].read_u16.return_value = raw
         shown_voltage, shown_percent = self.ns["get_battery_info"]()
-        self.assertEqual(shown_voltage, "4.3V")
+        self.assertEqual(shown_voltage, "4.6V")
         self.assertGreaterEqual(int(shown_percent[:-1]), 90)
         self.assertAlmostEqual(self.ns["battery_voltage_from_raw"](raw),
-                               raw / 65535.0 * 6.6 * 1.07, places=8)
+                               raw / 65535.0 * 9.9, places=8)
 
     def test_gain_is_constant_across_adc_range(self):
         for raw in (32000, 37000, 39737):
             voltage = self.ns["battery_voltage_from_raw"](raw)
-            self.assertAlmostEqual(voltage / (raw / 65535.0 * 6.6),
-                                   1.07, places=8)
+            self.assertAlmostEqual(voltage / (raw / 65535.0 * 3.3),
+                                   3.0, places=8)
 
     def test_full_charge_is_based_on_corrected_voltage(self):
-        raw = int(4.2 / 1.07 / 6.6 * 65535) + 1
+        raw = int(4.2 / 9.9 * 65535) + 1
         self.ns["bat_adc"].read_u16.return_value = raw
         self.assertEqual(self.ns["get_battery_info"](), ("4.2V", "100%"))
-        self.ns["bat_adc"].read_u16.return_value = int(4.125 / 1.07 / 6.6 * 65535)
+        self.ns["bat_adc"].read_u16.return_value = int(4.125 / 9.9 * 65535)
         self.assertLess(int(self.ns["get_battery_info"]()[1][:-1]), 100)
 
     def test_cache_does_not_resample_during_lcd_redraw(self):
@@ -362,7 +362,7 @@ class DeviceSamplingTests(unittest.TestCase):
         self.ns["bat_adc"].read_u16.side_effect = OSError("ADC failure")
         self.ns["sensor_temp"].read_u16.side_effect = OSError("ADC failure")
         self.ns["sample_device_status"](100, force=True)
-        self.ns["bat_en"].value.assert_called_with(1)
+        self.ns["bat_en"].value.assert_not_called()
         self.assertEqual(self.ns["last_battery_p"], "---")
         self.assertEqual(self.ns["last_temp_str"], "ERR")
         device = self.ns["wifi_portal"]._view_model()["device"]

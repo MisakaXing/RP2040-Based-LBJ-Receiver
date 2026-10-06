@@ -2,12 +2,11 @@ import time
 import machine
 import sdcard
 
-BATTERY_ADC_GAIN = 1.07
 from device_protection import BATTERY_EMPTY_V
 
 def battery_voltage_from_raw(raw):
-    """Apply the W receiver's voltage gain to the ADC reading."""
-    return (raw / 65535.0) * 3.3 * 2.0 * BATTERY_ADC_GAIN
+    """Read VSYS through the W board's GP46 /3 divider; no battery gain."""
+    return (raw / 65535.0) * 3.3 * 3.0
 
 class SystemPOST:
     BLACK = 0x0000
@@ -95,13 +94,10 @@ class SystemPOST:
 
     # 电池电压三段式检查
     def check_bat(self, bat_adc, bat_en):
-        self._check_start("BATTERY")
-        bat_en.value(0)
-        try:
-            time.sleep_ms(10)
-            raw = bat_adc.read_u16()
-        finally:
-            bat_en.value(1)
+        self._check_start("VSYS")
+        readings = [bat_adc.read_u16() for _ in range(3)]
+        readings.sort()
+        raw = readings[1]
         volts = battery_voltage_from_raw(raw)
         self.low_battery = volts <= BATTERY_EMPTY_V
         if volts <= BATTERY_EMPTY_V:
