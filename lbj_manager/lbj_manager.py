@@ -3956,12 +3956,18 @@ class LBJManager(PicoUpdaterApp):
         self._enable_file_drop()
         self.bind('<Command-o>', lambda event: self.open_history_file())
         self.bind('<Control-o>', lambda event: self.open_history_file())
-        self.bind('<Command-1>', lambda event: self.show_page('设备管理'))
-        self.bind('<Command-2>', lambda event: self.show_page('历史记录'))
+        self._bind_navigation_shortcuts()
         self.bind('<Return>', lambda event: self.history.apply_filter() if self.active_page == '历史记录' else None)
         self.bind('<Escape>', lambda event: self.history.reset_filter() if self.active_page == '历史记录' else None)
         super().after(15, self._pump_ui)
         super().after(2000, self._scan_loop)
+
+    def _bind_navigation_shortcuts(self):
+        modifier = 'Command' if sys.platform == 'darwin' else 'Control'
+        # A bare numeric detail such as <Command-1> is a mouse-button
+        # binding in Tk, not the digit key. Always name the event type.
+        self.bind(f'<{modifier}-KeyPress-1>', lambda event: self.show_page('设备管理'))
+        self.bind(f'<{modifier}-KeyPress-2>', lambda event: self.show_page('历史记录'))
 
     def after(self, ms, func=None, *args):
         if threading.get_ident() == self._ui_thread:

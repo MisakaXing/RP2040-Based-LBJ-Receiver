@@ -540,6 +540,44 @@ class TransferTests(unittest.TestCase):
         dialog.assert_not_called()
 
 
+class NavigationShortcutTests(unittest.TestCase):
+    def bindings(self, platform):
+        root = SimpleNamespace(bind=mock.Mock(), show_page=mock.Mock())
+        with mock.patch.object(manager.sys, 'platform', platform):
+            manager.LBJManager._bind_navigation_shortcuts(root)
+        return root, root.bind.call_args_list
+
+    def test_mac_uses_explicit_command_keypress(self):
+        _, calls = self.bindings('darwin')
+        self.assertEqual([call.args[0] for call in calls],
+                         ['<Command-KeyPress-1>', '<Command-KeyPress-2>'])
+
+    def test_windows_uses_explicit_control_keypress(self):
+        _, calls = self.bindings('win32')
+        self.assertEqual([call.args[0] for call in calls],
+                         ['<Control-KeyPress-1>', '<Control-KeyPress-2>'])
+
+    def test_linux_uses_control_keypress(self):
+        _, calls = self.bindings('linux')
+        self.assertEqual([call.args[0] for call in calls],
+                         ['<Control-KeyPress-1>', '<Control-KeyPress-2>'])
+
+    def test_callbacks_select_expected_pages(self):
+        for platform in ('darwin', 'win32'):
+            root, calls = self.bindings(platform)
+            for call in calls:
+                call.args[1](None)
+            self.assertEqual(root.show_page.call_args_list,
+                             [mock.call('设备管理'), mock.call('历史记录')])
+
+    def test_no_ambiguous_numeric_shortcuts_in_source(self):
+        tree = ast.parse((ROOT / 'lbj_manager.py').read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'bind':
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    self.assertNotIn(node.args[0].value, ('<Command-1>', '<Command-2>', '<Control-1>', '<Control-2>'))
+
+
 class SourceTests(unittest.TestCase):
     def test_standalone_entry_does_not_import_old_gui_modules(self):
         tree = ast.parse((ROOT / 'lbj_manager.py').read_text())

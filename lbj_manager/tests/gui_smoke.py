@@ -123,6 +123,38 @@ def begin():
     check('scan result shown next to device selector', '已自动选中 Pico' in app.device_status.cget('text'))
     app.refresh_ports(silent=True)
     check('automatic scan does not erase success confirmation', '已自动选中 Pico' in app.device_status.cget('text'))
+    app.update()
+    check('no navigation shortcut registered as mouse press',
+          all('Button' not in str(pattern) for pattern in app.tk.call('bind', str(app))))
+    for page in ('历史记录', '设备管理', '历史记录', '设备管理'):
+        button = app.nav._buttons_dict[page]
+        button._text_label.event_generate('<ButtonPress-1>', x=4, y=4, state=0)
+        button._text_label.event_generate('<ButtonRelease-1>', x=4, y=4, state=0)
+        app.update()
+        check('real mouse event opens ' + page, app.active_page == page and app.nav.get() == page)
+    # Exercise Windows shortcuts in the same Tcl event engine without
+    # pretending this Mac is a Windows host for other library code.
+    app.unbind('<Command-KeyPress-1>')
+    app.unbind('<Command-KeyPress-2>')
+    with mock.patch.object(manager.sys, 'platform', 'win32'):
+        app._bind_navigation_shortcuts()
+    app.focus_force()
+    app.update()
+    app.event_generate('<Control-KeyPress-2>')
+    app.update()
+    check('Windows Ctrl+2 event opens history', app.active_page == '历史记录')
+    app.event_generate('<Control-KeyPress-1>')
+    app.update()
+    check('Windows Ctrl+1 event opens device page', app.active_page == '设备管理')
+    app.unbind('<Control-KeyPress-1>')
+    app.unbind('<Control-KeyPress-2>')
+    app._bind_navigation_shortcuts()
+    app.event_generate('<Command-KeyPress-2>')
+    app.update()
+    check('macOS Command+2 event opens history', app.active_page == '历史记录')
+    app.event_generate('<Command-KeyPress-1>')
+    app.update()
+    check('macOS Command+1 event opens device page', app.active_page == '设备管理')
     screenshot('device-page')
     check('history navigation', app.show_page('历史记录'))
     heartbeat['enabled'] = True
