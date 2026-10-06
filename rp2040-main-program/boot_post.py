@@ -87,7 +87,7 @@ class SystemPOST:
         self.low_battery = volts <= BATTERY_EMPTY_V
         if self.low_battery:
             self._check_end("WARN_RED", f"{volts:.2f}V (EMPTY)")
-        elif volts < 3.7:
+        elif volts < 3.6:
             self._check_end("WARN", f"{volts:.2f}V (LOW)")
         else:
             self._check_end("OK", f"{volts:.2f}V (Good)")
