@@ -1933,11 +1933,7 @@ class PicoUpdaterApp(ctk.CTk):
                 return
 
             self.log("正在重启 Pico 生效固件...")
-            self.run_mpremote(port, ["exec", "import machine; machine.reset()"], timeout_sec=10)
-
-            self.after(0, self.set_progress, 1.0, "离线刷入完成")
-            self.log("\n[完成] 离线 ZIP 刷入完成，Pico 已重启。")
-            self.after(0, lambda: messagebox.showinfo("离线刷入完成", "离线 ZIP 固件刷入完成！"))
+            self._complete_flash(port, "离线 ZIP 刷入")
 
         except Exception as e:
             error_text = str(e)
@@ -2252,21 +2248,8 @@ class PicoUpdaterApp(ctk.CTk):
                 return
 
             self.log("正在重启 Pico 生效固件...")
-            self.run_mpremote(
-                port,
-                ["exec", "import machine; machine.reset()"],
-                timeout_sec=10,
-            )
-
-            self.after(0, self.set_progress, 1.0, "更新完成")
             msg_title = "强制刷入完成" if force else "初次/更新安装完成"
-            self.log(f"\n[完成] {msg_title}，Pico 已加载所选分支程序。")
-            self.after(
-                0,
-                lambda mt=msg_title: messagebox.showinfo(
-                    mt, f"{mt}！操作已成功完成！"
-                ),
-            )
+            self._complete_flash(port, msg_title)
         except Exception as e:
             error_text = str(e)
             self.log(f"\n[失败] 刷入过程中发生错误: {error_text}")
@@ -2279,6 +2262,21 @@ class PicoUpdaterApp(ctk.CTk):
         finally:
             self._cleanup_temp_dir(temp_dir)
             self.after(0, self.set_ui_state, False)
+
+    def _complete_flash(self, port, title):
+        confirmed, detail = self.run_mpremote(
+            port, ['exec', 'import machine; machine.reset()'], timeout_sec=10)
+        text = ('文件写入完成，设备 USB 已断开并重新连接。\n'
+                '请确认接收器屏幕与接收状态正常。\n\n' + detail) if confirmed else (
+                '文件写入完成，但无法确认设备已重启并重新连接。\n'
+                '不要据此判断固件已正常运行；请检查 USB、屏幕，必要时手动复位。\n\n' + detail)
+        self._reset_notice_posted = True
+        self._reset_warning = '' if confirmed else text
+        self.after(0, self.set_progress, 1.0,
+                   '文件写入完成，USB 已重连' if confirmed else '文件写入完成，重启待确认')
+        self.log(('\n[完成] ' if confirmed else '\n[警告] ') + text)
+        self.after(0, messagebox.showinfo if confirmed else messagebox.showwarning,
+                   title if confirmed else '文件写入完成，重启待确认', text)
 
 
 # History-view engine
@@ -3332,9 +3330,88 @@ import queue
 import time
 from dataclasses import dataclass
 
-MANAGER_VERSION = '3.0.3-preview'
+MANAGER_VERSION = '3.0.4-preview'
 PLACEHOLDER_PORT = '未选择 Pico'
 TrainLogApp = _HistoryViewBase  # Compatibility for engine regression tests.
+
+
+@dataclass(frozen=True)
+class RebootResult:
+    sent: bool
+    reconnected: bool
+    port: str = ''
+    message: str = ''
+
+
+def same_usb_receiver(original, candidate):
+    """Never mistake another attached receiver for the one being rebooted."""
+    if not is_pico_port(candidate) or (candidate.vid, candidate.pid) != (original.vid, original.pid):
+        return False
+    serial_number = getattr(original, 'serial_number', None)
+    if serial_number:
+        return serial_number == getattr(candidate, 'serial_number', None)
+    if candidate.device != original.device:
+        return False  # A renamed port requires a stable USB serial number.
+    location = getattr(original, 'location', None)
+    candidate_location = getattr(candidate, 'location', None)
+    return not (location and candidate_location) or location == candidate_location
+
+
+def reboot_receiver(port, timeout=10, transport_factory=None, enumerate_ports=None,
+                    clock=None, sleep=None):
+    """Send a reset without following EOF, close, observe the same USB device.
+
+    USB re-enumeration is not proof that main.py or RF reception is healthy.
+    No post-reset REPL command is issued, so verification does not stop the
+    newly started receiver. All operations belong in the device worker.
+    """
+    enumerate_ports = enumerate_ports or serial.tools.list_ports.comports
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    try:
+        original = [item for item in enumerate_ports() if item.device == port and is_pico_port(item)]
+    except Exception as exc:
+        return RebootResult(False, False, message='重启前无法枚举设备：' + str(exc))
+    if len(original) != 1:
+        return RebootResult(False, False, message='重启前未找到所选 Pico，未发送重启指令。')
+    original = original[0]
+    transport, sent, error, close_error = None, False, '', ''
+    try:
+        transport = (transport_factory or _connect)(port)
+        transport.serial.timeout = 2
+        transport.serial.write_timeout = 3
+        transport.use_raw_paste = False
+        transport.enter_raw_repl(soft_reset=False, timeout_overall=5)
+        # Brief delay lets the raw-REPL acknowledgement reach Windows and
+        # the host close its old handle before USB disappears. Never follow
+        # command output / EOF, and never exit raw REPL after issuing reset.
+        transport.exec_raw_no_follow('import machine, time; time.sleep_ms(150); machine.reset()')
+        sent = True
+    except Exception as exc:
+        error = '未能确认重启指令已发送：' + str(exc)
+    finally:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception as exc:
+                close_error = '释放旧串口失败：' + str(exc)
+    if not sent:
+        return RebootResult(False, False, message=error + ('；' + close_error if close_error else ''))
+    deadline, disappeared = clock() + max(0, timeout), False
+    while clock() < deadline:
+        try:
+            matches = [item for item in enumerate_ports() if same_usb_receiver(original, item)]
+        except Exception as exc:
+            return RebootResult(True, False, message='重启指令已发送，USB 枚举失败：' + str(exc))
+        if not matches:
+            disappeared = True
+        elif disappeared and len(matches) == 1:
+            if close_error:
+                return RebootResult(True, False, matches[0].device, close_error)
+            return RebootResult(True, True, matches[0].device,
+                                '同一接收器已重新连接：' + matches[0].device)
+        sleep(min(.1, max(0, deadline - clock())))
+    detail = '未在限定时间内重新检测到同一接收器。' if disappeared else '未观察到 USB 断开重连，不能确认重启。'
+    return RebootResult(True, False, message='重启指令已发送；' + detail + ('；' + close_error if close_error else ''))
 
 
 def dropped_file(tcl, data, extensions):
@@ -3941,6 +4018,8 @@ class LBJManager(PicoUpdaterApp):
         self._task_context = threading.local()
         self._updater_lease = None
         self._device_touched = self._reset_done = self._flash_partial = False
+        self._reset_attempted = self._reset_notice_posted = False
+        self._reset_warning = ''
         self._finishing = self._closing = False
         self._scan_initialized = False
         self._auto_selected_port = None
@@ -4371,6 +4450,8 @@ class LBJManager(PicoUpdaterApp):
             if self._updater_lease is None:
                 self._updater_lease = self.begin_task('更新 / 硬件检查', self.port_var.get())
                 self._device_touched = self._reset_done = self._flash_partial = False
+                self._reset_attempted = self._reset_notice_posted = False
+                self._reset_warning = ''
                 self._finishing = False
             panel = self.inspection_window
             if panel is not None and panel.finished:
@@ -4382,15 +4463,16 @@ class LBJManager(PicoUpdaterApp):
     def _finish_updater(self, lease):
         if lease is None or self.tasks.active is not lease or self._finishing:
             return
-        if self._device_touched and not self._reset_done and not self._flash_partial:
+        if (self._device_touched and not self._reset_done and not self._flash_partial
+                and not self.__dict__.get('_reset_attempted', False)):
             self._finishing = True
             self.notice('正在恢复接收程序，请勿拔线…')
             def restore():
                 self._task_context.lease = lease
                 try:
                     success, output = self.run_mpremote(lease.port,
-                        ['resume', 'exec', "import machine; print('LBJ_MANAGER_RESET_SENT'); machine.reset()"], 12)
-                    warning = '' if success or 'LBJ_MANAGER_RESET_SENT' in output else '无法确认恢复接收，请手动复位设备。'
+                        ['resume', 'exec', 'import machine; machine.reset()'], 10)
+                    warning = '' if success else '恢复状态待确认：' + output
                 except Exception as exc:
                     warning = '恢复失败，请手动复位设备：' + str(exc)
                 self.dispatch.post(0, self._release_updater, (lease, warning))
@@ -4399,7 +4481,8 @@ class LBJManager(PicoUpdaterApp):
             except Exception as exc:
                 self._release_updater(lease, '无法启动恢复任务，请手动复位：' + str(exc))
             return
-        self._release_updater(lease, '刷入未完成，请重新刷入；不要将设备视为已恢复接收。' if self._flash_partial else '')
+        self._release_updater(lease, '刷入未完成，请重新刷入；不要将设备视为已恢复接收。'
+                              if self._flash_partial else self.__dict__.get('_reset_warning', ''))
 
     def _release_updater(self, lease, warning=''):
         if not self.tasks.release(lease):
@@ -4409,7 +4492,7 @@ class LBJManager(PicoUpdaterApp):
         self.sync_controls()
         self.notice(warning or '设备任务结束。')
         self.refresh_ports(silent=True)
-        if warning:
+        if warning and not self.__dict__.get('_reset_notice_posted', False):
             messagebox.showwarning('设备状态提示', warning, parent=self)
 
     def run_mpremote(self, port, args_list, timeout_sec=60, live_stream=False):
@@ -4418,10 +4501,17 @@ class LBJManager(PicoUpdaterApp):
             return False, '串口任务已失效，未执行设备命令。'
         self._device_touched = True
         arguments = list(args_list)
-        reset = any('machine.reset()' in arg for arg in arguments)
+        reset = 'exec' in arguments and any('machine.reset()' in arg for arg in arguments)
         if reset:
-            arguments = [arg.replace('machine.reset()', "print('LBJ_MANAGER_RESET_SENT'); machine.reset()")
-                         for arg in arguments]
+            self._reset_attempted = True
+            try:
+                result = reboot_receiver(port, timeout=timeout_sec)
+            except Exception as exc:
+                self._reset_warning = '重启状态检查异常：' + str(exc)
+                return False, self._reset_warning
+            self._reset_done = result.reconnected
+            self._reset_warning = '' if result.reconnected else result.message
+            return result.reconnected, result.message
         if getattr(sys, 'frozen', False):
             command = [sys.executable, 'mpremote_internal', 'connect', port] + arguments
         else:
@@ -4430,8 +4520,6 @@ class LBJManager(PicoUpdaterApp):
             success, output = run_command(command, timeout_sec, self.log if live_stream else None)
         except Exception as exc:
             return False, str(exc)
-        if reset and (success or 'LBJ_MANAGER_RESET_SENT' in output):
-            self._reset_done = True
         return success, output
 
     def _wipe_device_files(self, port, profile):
