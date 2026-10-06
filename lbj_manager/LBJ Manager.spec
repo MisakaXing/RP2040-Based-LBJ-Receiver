@@ -16,5 +16,5 @@ exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='LBJ Manager',
           target_arch='arm64', codesign_identity=None, entitlements_file=None)
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='LBJ Manager')
 app = BUNDLE(coll, name='LBJ Manager.app', bundle_identifier='com.misakaxing.lbj.manager',
-             version='3.0.4', info_plist={'NSHighResolutionCapable': True,
+             version='3.0.5', info_plist={'NSHighResolutionCapable': True,
                                         'LSMinimumSystemVersion': '11.0'})

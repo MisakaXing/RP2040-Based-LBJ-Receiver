@@ -291,7 +291,7 @@ FIRMWARE_BRANCHES = {
             "wireless_portal.py",
             "main.py",
         ),
-        "optional_runtime_files": ("pio_dma_rx.py", "device_protection.py"),
+        "optional_runtime_files": ("boot.py", "pio_dma_rx.py", "device_protection.py"),
     },
 }
 
@@ -3330,7 +3330,7 @@ import queue
 import time
 from dataclasses import dataclass
 
-MANAGER_VERSION = '3.0.4-preview'
+MANAGER_VERSION = '3.0.5-preview'
 PLACEHOLDER_PORT = '未选择 Pico'
 TrainLogApp = _HistoryViewBase  # Compatibility for engine regression tests.
 
@@ -3456,6 +3456,14 @@ def validate_firmware_bundle(profile, files):
                 tree = ast.parse(source.read(), filename=name)
         except (OSError, UnicodeError, SyntaxError) as exc:
             raise ValueError('无法验证固件文件 ' + name + '：' + str(exc)) from exc
+        # boot.py runs implicitly at power-on, not via a Python import.
+        # A main.py using its display hand-off must not silently lose the
+        # startup frame during a wipe-and-copy update. Older applications
+        # with no hand-off remain compatible without boot.py.
+        if (name == 'main.py' and 'boot.py' not in by_name
+                and any(isinstance(node, ast.Name) and node.id == '_boot_display'
+                        and isinstance(node.ctx, ast.Load) for node in ast.walk(tree))):
+            raise ValueError('main.py 使用早期开机画面，但固件包缺少 boot.py，已阻止刷入。')
         for node in ast.walk(tree):
             imported = ([alias.name.split('.')[0] for alias in node.names]
                         if isinstance(node, ast.Import) else

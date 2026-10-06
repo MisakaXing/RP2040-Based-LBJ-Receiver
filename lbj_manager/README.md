@@ -1,6 +1,6 @@
 # LBJ Manager
 
-PicoUpdater 与 LogViewer 的整合版，版本 `3.0.4-preview`。一个窗口、一个设备选择器，包含「设备管理」和「历史记录」两页。仓库内原来的两个工具目录已由本目录替代。
+PicoUpdater 与 LogViewer 的整合版，版本 `3.0.5-preview`。一个窗口、一个设备选择器，包含「设备管理」和「历史记录」两页。仓库内原来的两个工具目录已由本目录替代。
 
 ## 使用
 
@@ -33,6 +33,8 @@ Apple Silicon 版 `LBJ Manager.app` 内嵌 Python 和依赖，可直接双击。
 ## DMA / 新增文件
 
 两个分支的在线清单与离线 ZIP 都识别 `pio_dma_rx.py` 和 `device_protection.py`，依赖文件先写、`main.py` 最后写。W 版另含 `history_store.py`、`wireless_portal.py`。
+
+`3.0.5-preview` 修复 W 版遗漏 `boot.py` 的问题：两版的在线更新与 ZIP 都保留此文件，在 `main.py` 前写入，恢复 `STARTING... / LOADING FIRMWARE` 开机画面。主程序使用 `_boot_display` 交接时，包内缺少 `boot.py` 会在刷入确认之前被拒绝；开机文件同样接受语法和 UTF-8 校验。没有早期开机画面交接的旧固件仍可不带 `boot.py`。**旧 App / exe 不会自动获得这项工具修复，必须使用重新打包的工具。** 已丢失开机文件的设备不会因电脑源码修改自动恢复，需要补写匹配该硬件的 `boot.py`；无需为此清空历史或整机刷入。
 
 整合版额外解析包内 Python 文件的本地模块依赖：新固件如果导入 DMA / 保护模块，ZIP 或在线下载必须包含对应文件；语法错误、缺文件、无效 UTF-8 均在刷入前阻止。没有新增依赖的旧固件仍可使用。**这不是设备端逐字节刷写校验**：复制仍依赖 mpremote 的写入结果；历史导出则使用长度与 SHA-256 校验。
 

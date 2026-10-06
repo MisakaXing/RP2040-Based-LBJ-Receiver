@@ -243,7 +243,7 @@ class FirmwareSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(missing, [profile["runtime_files"][0]])
 
-    def test_optional_ordinary_boot_file_is_included_before_main(self):
+    def test_optional_boot_file_is_included_before_main_for_both_branches(self):
         standard = profile_for(updater.STANDARD_CHANNEL_LABEL)
         items = [{"name": name, "type": "file"} for name in standard["runtime_files"]]
         items.append({"name": "boot.py", "type": "file"})
@@ -253,7 +253,10 @@ class FirmwareSelectionTests(unittest.TestCase):
         wireless = profile_for(updater.WIRELESS_CHANNEL_LABEL)
         items += [{"name": name, "type": "file"} for name in wireless['runtime_files']]
         selected, missing = updater.select_runtime_files(wireless, items)
-        self.assertNotIn('boot.py', [item['name'] for item in selected])
+        names = [item['name'] for item in selected]
+        self.assertEqual(names.count('boot.py'), 1)
+        self.assertLess(names.index('boot.py'), names.index('main.py'))
+        self.assertEqual(missing, [])
 
     def test_optional_dma_and_protection_files_precede_main_on_both_profiles(self):
         for label in (updater.STANDARD_CHANNEL_LABEL, updater.WIRELESS_CHANNEL_LABEL):

@@ -756,6 +756,9 @@ class BundleTests(unittest.TestCase):
                 app.target_dir = manager.TARGET_DIR; app.log = mock.Mock()
                 files, info = app._extract_zip_firmware(archive_path, dest, profile)
                 self.assertEqual([item['name'] for item in files], expected)
+                self.assertIn('boot.py', expected)
+                self.assertLess(expected.index('boot.py'), expected.index('main.py'))
+                self.assertIn(b'LOADING FIRMWARE', (dest / 'boot.py').read_bytes())
                 for name in expected:
                     self.assertEqual((source / name).read_bytes(), (dest / name).read_bytes())
 
