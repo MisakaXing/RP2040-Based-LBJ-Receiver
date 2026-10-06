@@ -60,7 +60,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.14-W"
+Program_ver = "5.15-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 VSYS_USB_PRESENT_RAW = 28200  # GP46 reads VSYS/3; about 4.26 V at a 3.3 V ADC reference.
