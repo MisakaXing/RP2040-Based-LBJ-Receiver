@@ -4,9 +4,13 @@ import sdcard
 
 from device_protection import BATTERY_EMPTY_V
 
-def battery_voltage_from_raw(raw):
-    """Read VSYS through the W board's GP46 /3 divider; no battery gain."""
-    return (raw / 65535.0) * 3.3 * 3.0
+BATTERY_ADC_OFFSET_V = 0.10
+
+def battery_voltage_from_raw(raw, usb_power=False):
+    """GP41 battery /2 while on USB; otherwise GP46 VSYS /3."""
+    ratio = 2.0 if usb_power else 3.0
+    volts = (raw / 65535.0) * 3.3 * ratio
+    return volts + BATTERY_ADC_OFFSET_V if usb_power else volts
 
 class SystemPOST:
     BLACK = 0x0000
@@ -93,12 +97,21 @@ class SystemPOST:
         return self.wifi_ok
 
     # 电池电压三段式检查
-    def check_bat(self, bat_adc, bat_en):
-        self._check_start("VSYS")
-        readings = [bat_adc.read_u16() for _ in range(3)]
+    def check_bat(self, bat_adc, bat_en, vsys_adc=None, usb_power=False):
+        self._check_start("BATTERY" if usb_power else "VSYS")
+        adc = bat_adc if usb_power or vsys_adc is None else vsys_adc
+        if usb_power:
+            bat_en.value(0)
+        try:
+            if usb_power:
+                time.sleep_ms(5)
+            readings = [adc.read_u16() for _ in range(3)]
+        finally:
+            if usb_power:
+                bat_en.value(1)
         readings.sort()
         raw = readings[1]
-        volts = battery_voltage_from_raw(raw)
+        volts = battery_voltage_from_raw(raw, usb_power)
         self.low_battery = volts <= BATTERY_EMPTY_V
         if volts <= BATTERY_EMPTY_V:
             self._check_end("WARN_RED", f"{volts:.2f}V (EMPTY)")
@@ -143,14 +156,15 @@ class SystemPOST:
             self._check_end("OPTIONAL", "NOT INSERTED")
         finally: spi1.init(baudrate=40000000)
             
-    def run_all(self, bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, p_ver, is_es, wifi_portal):
+    def run_all(self, bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, p_ver, is_es, wifi_portal, vsys_adc=None, usb_detector=None):
         self.check_sys_ver(p_ver, is_es)
         radio_ok = self.check_sx1276()
         self.check_wifi(wifi_portal)
         self.check_temp(sensor_temp)
         self.check_rtc(rtc)
         self.check_sd(spi1, sd_cs)
-        self.check_bat(bat_adc, bat_en)
+        usb_power = bool(usb_detector()) if usb_detector is not None else False
+        self.check_bat(bat_adc, bat_en, vsys_adc, usb_power)
         
         footer_y = 218
         if self.low_battery:

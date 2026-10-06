@@ -58,7 +58,7 @@ class NonHardwarePOST(SystemPOST):
     def check_sx1276(self):
         return True
 
-    def check_bat(self, bat_adc, bat_en):
+    def check_bat(self, bat_adc, bat_en, vsys_adc=None, usb_power=False):
         pass
 
     def check_temp(self, sensor_temp):
@@ -95,7 +95,7 @@ class BootPostTests(unittest.TestCase):
         checks = []
 
         class EmptyBatteryPOST(NonHardwarePOST):
-            def check_bat(self, bat_adc, bat_en):
+            def check_bat(self, bat_adc, bat_en, vsys_adc=None, usb_power=False):
                 checks.append("battery")
                 self.low_battery = True
 

@@ -273,6 +273,8 @@ class DeviceSamplingTests(unittest.TestCase):
             "sensor_temp": SimpleNamespace(read_u16=Mock(return_value=13200)),
             "bat_en": SimpleNamespace(value=Mock()),
             "bat_adc": SimpleNamespace(read_u16=Mock(return_value=26500)),
+            "vsys_adc": SimpleNamespace(read_u16=Mock(return_value=26500)),
+            "BATTERY_ADC_OFFSET_V": 0.10,
             "BATTERY_EMPTY_V": 3.45, "BATTERY_FULL_V": 4.2,
             "wifi_portal": WirelessPortal("test-password"),
             "last_usb_power": False,
@@ -284,7 +286,7 @@ class DeviceSamplingTests(unittest.TestCase):
 
     def test_battery_zero_begins_at_3_45v(self):
         raw = int(3.45 / 9.9 * 65535)
-        self.ns["bat_adc"].read_u16.side_effect = [raw - 1000, raw, raw + 1000]
+        self.ns["vsys_adc"].read_u16.side_effect = [raw - 1000, raw, raw + 1000]
         shown_voltage, shown_percent = self.ns["get_battery_info"]()
         self.assertEqual(shown_voltage, "3.4V")
         self.assertEqual(shown_percent, "0%")
@@ -292,7 +294,7 @@ class DeviceSamplingTests(unittest.TestCase):
 
     def test_just_above_cutoff_remains_one_percent(self):
         raw = int(3.451 / 9.9 * 65535) + 1
-        self.ns["bat_adc"].read_u16.return_value = raw
+        self.ns["vsys_adc"].read_u16.return_value = raw
         self.assertEqual(self.ns["get_battery_info"]()[1], "1%")
 
     def test_sampling_usb_status_hides_web_percentage_and_keeps_voltage(self):
@@ -310,7 +312,7 @@ class DeviceSamplingTests(unittest.TestCase):
         self.ns["sample_device_status"](1200, force=True)
         self.assertIsNotNone(self.ns["wifi_portal"]._device_view()["battery_percent"])
 
-    def test_usb_changes_at_one_second_without_resampling_battery(self):
+    def test_usb_changes_at_one_second_resample_voltage_not_temperature(self):
         sample = self.ns["sample_device_status"]
         sample(100)
         self.ns["usb_power_present"].return_value = True
@@ -320,6 +322,7 @@ class DeviceSamplingTests(unittest.TestCase):
         self.assertTrue(self.ns["last_usb_power"])
         self.assertTrue(self.ns["wifi_portal"]._device_view()["usb_power"])
         self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 3)
+        self.assertEqual(self.ns["vsys_adc"].read_u16.call_count, 3)
         self.assertEqual(self.ns["sensor_temp"].read_u16.call_count, 1)
         self.ns["usb_power_present"].return_value = None
         sample(2100)
@@ -328,7 +331,7 @@ class DeviceSamplingTests(unittest.TestCase):
 
     def test_vsys_uses_three_to_one_divider_without_battery_gain(self):
         raw = 30535
-        self.ns["bat_adc"].read_u16.return_value = raw
+        self.ns["vsys_adc"].read_u16.return_value = raw
         shown_voltage, shown_percent = self.ns["get_battery_info"]()
         self.assertEqual(shown_voltage, "4.6V")
         self.assertGreaterEqual(int(shown_percent[:-1]), 90)
@@ -343,23 +346,23 @@ class DeviceSamplingTests(unittest.TestCase):
 
     def test_full_charge_is_based_on_corrected_voltage(self):
         raw = int(4.2 / 9.9 * 65535) + 1
-        self.ns["bat_adc"].read_u16.return_value = raw
+        self.ns["vsys_adc"].read_u16.return_value = raw
         self.assertEqual(self.ns["get_battery_info"](), ("4.2V", "100%"))
-        self.ns["bat_adc"].read_u16.return_value = int(4.125 / 9.9 * 65535)
+        self.ns["vsys_adc"].read_u16.return_value = int(4.125 / 9.9 * 65535)
         self.assertLess(int(self.ns["get_battery_info"]()[1][:-1]), 100)
 
     def test_cache_does_not_resample_during_lcd_redraw(self):
         sample = self.ns["sample_device_status"]
         sample(100, force=True)
         sample(105)
-        self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 3)
+        self.assertEqual(self.ns["vsys_adc"].read_u16.call_count, 3)
         sample(200, force=True)  # A second train refreshes immediately.
-        self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 6)
+        self.assertEqual(self.ns["vsys_adc"].read_u16.call_count, 6)
         sample(5200)  # Low-battery monitoring refreshes every five seconds.
-        self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 9)
+        self.assertEqual(self.ns["vsys_adc"].read_u16.call_count, 9)
 
     def test_failed_adc_is_unknown_and_gate_is_restored(self):
-        self.ns["bat_adc"].read_u16.side_effect = OSError("ADC failure")
+        self.ns["vsys_adc"].read_u16.side_effect = OSError("ADC failure")
         self.ns["sensor_temp"].read_u16.side_effect = OSError("ADC failure")
         self.ns["sample_device_status"](100, force=True)
         self.ns["bat_en"].value.assert_not_called()
@@ -369,7 +372,48 @@ class DeviceSamplingTests(unittest.TestCase):
         self.assertIsNone(device["battery_percent"])
         self.assertIsNone(device["core_temp_c"])
         self.ns["sample_device_status"](105)
-        self.assertEqual(self.ns["bat_adc"].read_u16.call_count, 1)
+        self.assertEqual(self.ns["vsys_adc"].read_u16.call_count, 1)
+
+    def test_charging_reads_battery_divider_with_fixed_offset(self):
+        self.ns["last_usb_power"] = True
+        raw = int((4.05 - .10) / 6.6 * 65535)
+        self.ns["bat_adc"].read_u16.side_effect = [raw + 100, raw, raw - 100]
+        self.assertEqual(self.ns["get_battery_info"]()[0], "4.0V")
+        self.ns["vsys_adc"].read_u16.assert_not_called()
+        self.assertEqual([call.args for call in self.ns["bat_en"].value.call_args_list],
+                         [(0,), (1,)])
+        self.ns["time"].sleep_ms.assert_called_once_with(5)
+
+    def test_unplug_immediately_replaces_cached_usb_voltage(self):
+        sample = self.ns["sample_device_status"]
+        self.ns["usb_power_present"].return_value = True
+        self.ns["bat_adc"].read_u16.return_value = int((4.2 - .10) / 6.6 * 65535) + 1
+        self.ns["vsys_adc"].read_u16.return_value = int(3.8 / 9.9 * 65535)
+        sample(100)
+        self.assertEqual(self.ns["last_battery_v"], "4.2V")
+        self.ns["usb_power_present"].return_value = False
+        sample(1100)
+        self.assertEqual(self.ns["last_battery_v"], "3.8V")
+        self.assertEqual(self.ns["wifi_portal"]._device_view()["battery_voltage"], 3.8)
+        self.assertFalse(self.ns["last_usb_power"])
+        self.assertEqual(self.ns["sensor_temp"].read_u16.call_count, 1)
+
+    def test_charging_adc_failure_restores_gate(self):
+        self.ns["usb_power_present"].return_value = True
+        self.ns["bat_adc"].read_u16.side_effect = OSError("ADC failure")
+        self.ns["sample_device_status"](100, force=True)
+        self.assertEqual([call.args for call in self.ns["bat_en"].value.call_args_list],
+                         [(0,), (1,)])
+        self.assertEqual(self.ns["last_battery_v"], "---")
+        self.assertIsNone(self.ns["wifi_portal"]._device_view()["battery_voltage"])
+        self.assertTrue(self.ns["last_usb_power"])
+
+    def test_charging_offset_is_fixed_across_voltage_range(self):
+        for raw in (0, 30000, 40000, 65535):
+            self.assertAlmostEqual(self.ns["battery_voltage_from_raw"](raw, True)
+                                   - raw / 65535.0 * 6.6, .10, places=8)
+            self.assertAlmostEqual(self.ns["battery_voltage_from_raw"](raw, False),
+                                   raw / 65535.0 * 9.9, places=8)
 
     def test_train_samples_before_snapshot_without_independent_loop_sampler(self):
         process = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)

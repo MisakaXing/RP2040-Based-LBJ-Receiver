@@ -60,7 +60,7 @@ try:
     print("BOOT_RESET_CAUSE", machine.reset_cause())
 except Exception:
     pass
-Program_ver = "5.15-W"
+Program_ver = "5.16-W"
 is_es_ver = 0 
 Author_Name = "MisakaXing"
 VSYS_USB_PRESENT_RAW = 28200  # GP46 reads VSYS/3; about 4.26 V at a 3.3 V ADC reference.
@@ -127,8 +127,7 @@ spi1.init(baudrate=TFT_SPI_BAUD, polarity=0, phase=0)
 sd_cs = Pin(7, Pin.OUT, value=1)
 bat_en = Pin(14, Pin.OUT, value=1)
 vsys_adc = ADC(Pin(46))
-# POST and runtime telemetry share the onboard VSYS /3 channel.
-bat_adc = vsys_adc
+bat_adc = ADC(Pin(41))
 buzzer = Pin(22, Pin.OUT, value=0)
 try:
     buzzer_timer = machine.Timer(-1)
@@ -545,10 +544,20 @@ def get_rtc_date_for_edit():
     return 26, 1, 1
 
 def get_battery_info():
-    readings = [bat_adc.read_u16() for _ in range(3)]
+    usb_power = last_usb_power
+    adc = bat_adc if usb_power else vsys_adc
+    if usb_power:
+        bat_en.value(0)
+    try:
+        if usb_power:
+            time.sleep_ms(5)
+        readings = [adc.read_u16() for _ in range(3)]
+    finally:
+        if usb_power:
+            bat_en.value(1)
     readings.sort()
     raw = readings[1]
-    volts = battery_voltage_from_raw(raw)
+    volts = battery_voltage_from_raw(raw, usb_power)
     percent = battery_percent(volts)
     return f"{volts:.1f}V", f"{percent}%"
 
@@ -565,16 +574,18 @@ def sample_device_status(now, force=False):
         last_usb_update = now
     sample_due = (force or last_battery_v is None
                   or time.ticks_diff(now, last_hw_update) >= HW_SAMPLE_INTERVAL_MS)
-    if not sample_due and previous_usb == last_usb_power:
+    source_changed = previous_usb != last_usb_power
+    if not sample_due and not source_changed:
         return
     battery_percent = None
     temp_c = None
     previous_percent = last_battery_p
-    if sample_due:
+    if sample_due or source_changed:
         try:
             last_battery_v, last_battery_p = get_battery_info()
         except Exception:
             last_battery_v, last_battery_p = "---", "---"
+    if sample_due:
         try:
             reading = sensor_temp.read_u16() * (3.3 / 65535.0)
             temp_c = round(27 - (reading - 0.706) / 0.001721, 1)
@@ -1581,7 +1592,7 @@ if boot_started_ms is not None:
     print('BOOT_UI_TIMING', 'first_frame_ms=', boot_first_frame_ms,
           'post_ms=', time.ticks_diff(time.ticks_ms(), boot_started_ms),
           'screen_reused=', True)
-boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver, wifi_portal)
+boot_status = post.run_all(bat_adc, bat_en, sensor_temp, rtc, spi1, sd_cs, buzzer, Program_ver, is_es_ver, wifi_portal, vsys_adc=vsys_adc, usb_detector=usb_power_present)
 wifi_module_ok = post.wifi_ok
 if not wifi_module_ok:
     menu_items[MENU_WIFI_INDEX] = "WIRELESS: UNAVAILABLE"
