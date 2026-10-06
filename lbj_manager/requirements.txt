@@ -1,0 +1,7 @@
+customtkinter==5.2.2
+tkintermapview==1.29
+Pillow==10.4.0
+requests==2.32.3
+pyserial==3.5
+mpremote==1.28.0
+tkinterdnd2==0.6.3

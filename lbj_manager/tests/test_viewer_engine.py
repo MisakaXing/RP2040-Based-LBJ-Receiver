@@ -5,8 +5,8 @@ from unittest import mock
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import jsondecode as viewer
-from pico_history import HistoryDownload, HistoryTransferError
+import lbj_manager as viewer
+from lbj_manager import HistoryDownload, HistoryTransferError
 
 
 class Widget:

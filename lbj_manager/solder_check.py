@@ -147,6 +147,22 @@ finally:
 
 BATTERY_SCRIPT = battery_script(27)
 
+# W firmware now measures onboard VSYS/3, rather than the external GP41 divider.
+VSYS_SCRIPT = '''
+try:
+ _battery_adc=machine.ADC(machine.Pin(46))
+ _battery_samples=sorted(_battery_adc.read_u16() for _ in range(3))
+ _battery_raw=_battery_samples[1]
+ _battery_voltage=_battery_raw/65535*3.3*3
+ test_results['Battery']=0<_battery_raw<65535 and 0.5<_battery_voltage<5.5
+ test_results['Battery_V']=round(_battery_voltage,3)
+ test_results['Battery_ADC']=_battery_raw
+ test_results['Voltage_Source']='VSYS'
+except Exception as _battery_error:
+ test_results['Battery']=False
+ test_results['Battery_Error']=str(_battery_error)
+'''
+
 WIRELESS_SCRIPT = '''
 _core_step('Wireless','running')
 _wireless_station=None
@@ -198,7 +214,7 @@ def core_script(legacy, wireless=False):
     return ("import machine,time,json\ndef _core_step(key,state,detail=''):\n print('LBJ_CORE_STEP:'+json.dumps({'key':key,'state':state,'detail':detail}))\ntest_results={}\ntry:\n" +
             "\n".join(" "+line for line in checks.splitlines()) +
             "\nexcept Exception as _core_error:\n test_results['Core_Error']=str(_core_error)\n" +
-            "\n_core_step('Battery','running')\n"+battery_script(41 if wireless else 27) +
+            "\n_core_step('Battery','running')\n"+(VSYS_SCRIPT if wireless else BATTERY_SCRIPT) +
             "\n_core_step('Battery','pass' if test_results.get('Battery') else 'fail',str(test_results.get('Battery_V','读取失败'))+' V')\n"+
             (WIRELESS_SCRIPT if wireless else "") +
             "\ntry: test_results['SN']=get_serial_number()\nexcept Exception: pass\n" +
@@ -759,9 +775,10 @@ class InspectionWindow(ctk.CTkFrame):
             if self.wireless: required.append(WIRELESS_ITEM[0])
             passed=not result.get('Core_Error') and all(result.get(k) is True for k in required)
             voltage=result.get('Battery_V','读取失败')
-            adc_pin=41 if self.wireless else 27
-            self.results[0]={"status":"pass" if passed else "fail","detail":f"电池电压（GP{adc_pin}）：{voltage} V（固件换算，需万用表核对）\n"+json.dumps(result,ensure_ascii=False)+"\n"+log}
-            self.subtitle.configure(text=f"{self.port}  ·  电池：{voltage} V")
+            adc_pin=46 if self.wireless else 27
+            voltage_source='VSYS' if self.wireless else '电池'
+            self.results[0]={"status":"pass" if passed else "fail","detail":f"{voltage_source}电压（GP{adc_pin}）：{voltage} V（换算需万用表核对）\n"+json.dumps(result,ensure_ascii=False)+"\n"+log}
+            self.subtitle.configure(text=f"{self.port}  ·  {voltage_source}：{voltage} V")
             # Keep checklist/log widgets mounted through final confirmation.
             self.step_labels[0].configure(text="1. 核心硬件\n"+("通过" if passed else "失败"),text_color="#45b97c" if passed else "#e46a6a")
             self.primary.configure(state="normal",text="重试本项",command=self.start_step)

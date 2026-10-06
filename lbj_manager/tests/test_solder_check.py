@@ -1,5 +1,4 @@
 import ast
-import importlib.util
 from pathlib import Path
 import queue
 import sys
@@ -8,9 +7,8 @@ from types import SimpleNamespace, MethodType
 from unittest.mock import Mock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
-spec=importlib.util.spec_from_file_location("solder_check",ROOT/"solder_check.py")
-check=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(check)
+sys.path.insert(0, str(ROOT))
+import solder_check as check
 
 
 class ButtonTests(unittest.TestCase):
@@ -65,7 +63,7 @@ class ReportTests(unittest.TestCase):
 
 class ScriptTests(unittest.TestCase):
     def test_core_builder_keeps_battery_even_on_radio_exception(self):
-        source=(ROOT/'pico_updater.py').read_text()
+        source=(ROOT/'lbj_manager.py').read_text()
         tree=ast.parse(source)
         legacy=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='HARDWARE_TEST_SCRIPT' for t in n.targets))
         built=check.core_script(legacy)
@@ -75,7 +73,7 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn('所有核心硬件模块均工作在最佳状态',built)
 
     def test_board_variants_select_distinct_adc_and_wireless_check(self):
-        source=(ROOT/'pico_updater.py').read_text()
+        source=(ROOT/'lbj_manager.py').read_text()
         tree=ast.parse(source)
         legacy=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='HARDWARE_TEST_SCRIPT' for t in n.targets))
         standard=check.core_script(legacy,False)
@@ -84,7 +82,8 @@ class ScriptTests(unittest.TestCase):
         ast.parse(wireless)
         self.assertIn('machine.ADC(machine.Pin(27))',standard)
         self.assertNotIn("_core_step('Wireless'",standard)
-        self.assertIn('machine.ADC(machine.Pin(41))',wireless)
+        self.assertIn('machine.ADC(machine.Pin(46))',wireless)
+        self.assertNotIn('machine.ADC(machine.Pin(41))',wireless)
         self.assertIn("_core_step('Wireless','running')",wireless)
         self.assertTrue(check.is_wireless_board('Waveshare RP2350B PLUS W with RP2350'))
         self.assertFalse(check.is_wireless_board('Raspberry Pi Pico with RP2040'))

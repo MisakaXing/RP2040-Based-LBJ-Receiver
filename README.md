@@ -56,24 +56,36 @@ PCB上不带锂电池保护电路，购买的锂电池必须**自带保护板**�
 通过操控SX1276的寄存器，调整其为FSK Direct模式，DIO1和DIO2分别输出1200hz时钟和采集到的bit，利用树莓派的PIO在时钟的上升沿采样DIO2的数字输出，寻找同步码并解码POCSAG，进行2bit BCH纠错后依上述解码方式解码，格式化成json返回给主函数，以上代码实现请见lbj_receiver.py
 
 
-## 3.1刷入及更新工具
+## 3.1 设备管理：LBJ Manager
 
-当完成PCB硬件焊接时，请从**Release**中下载好预打包的刷入/更新工具UpdaterApp
-打开后点击刷新，会自动选中pico，之后点击检查更新即可，系统会自动从Github下载最新版本刷入，同时当有新版本发出时，你也可通过此程序一键更新到最新版本
+原 PicoUpdater 和 LogViewer 已合并为 [LBJ Manager](lbj_manager/README.md)，源码统一在 `lbj_manager/`。固件更新、硬件检查单和历史查看共用一个窗口、一个设备选择器；接收器固件仍在 `rp2040-main-program/`。
+
+连接接收器的数据 USB，点击「扫描设备」。只发现一台 Pico 时会自动选中，顶部显示绿色「已自动选中 Pico」；多台时请手动选择。选择普通版 `main` 或 W 版 `Wireless-Enabled`，再点击「检查并更新固件」，或用「从 ZIP 刷入」离线更新。刷入前检查硬件兼容性及固件包依赖，包含 DMA 与设备保护模块。**刷入会删除历史，先导出备份。** 更新、自检和历史读取不能同时占用串口。
+
+固件 ZIP 可直接拖到刷入区域，先载入校验，再点击刷入并确认；拖入不会改写设备。历史页支持将 JSON / JSONL / TXT / LOG 文件拖到日志区域直接导入。
+
+源码运行：
+
+```sh
+python3 -m pip install -r lbj_manager/requirements.txt
+python3 lbj_manager/lbj_manager.py
+```
+
+预打包工具可在本项目 [Releases](https://github.com/MisakaXing/RP2040-Based-LBJ-Receiver/releases) 查找；旧 Release 中的两个独立工具不包含本次整合更新。Apple Silicon 的 `.app` 构建配置见 `lbj_manager/LBJ Manager.spec`。
 
 *如果要使用自动更新功能，请确保不要更改Main.py的版本变量*
 ```python
 Program_ver = 2.1
 ```
-## 4.1日志查看工具
+## 4.1 历史记录：LBJ Manager
 
-你可以从**Release**中下载TrainLogApp来实现日志的查看和导出。普通版机内历史最多保存2000条；实际剩余空间不足时会提前停止保存，并显示红色 MEM FULL，实时接收和显示不受存储满限制。固件预留16KB空间，并在每次写入前检查本次写入所需的整块空间。格式化机内历史后可恢复保存；历史不会自动覆盖。同时可外接SD卡扩展，SD卡必须格式化成FAT32格式才能被识别
+在 LBJ Manager 的「历史记录」页读取或导出设备历史，也可导入 SD 卡中的 JSONL 文件，按车次、车型和时间筛选，查看坐标与原始报文。设备读取采用分段传输和 SHA-256 校验；读取时暂停接收，结束后重启恢复，少量未落盘记录可能丢失。
+
+普通版机内历史最多保存2000条；实际剩余空间不足时会提前停止保存，并显示红色 MEM FULL，实时接收和显示不受存储满限制。固件预留16KB空间，并在每次写入前检查本次写入所需的整块空间。格式化机内历史后可恢复保存；历史不会自动覆盖。同时可外接SD卡扩展，SD卡必须格式化成FAT32格式才能被识别
 
 SD卡热插拔功能因影响屏幕刷新已被取消，在开机状态下插入SD卡需要在设置中手动Mount-SD
 
-下载后链接pico点击刷新，从pico提取历史数据，可提取机内保存的历史数据
-
-也可以点击导入JSON历史文件从SD卡中导入JSONL文件实现查看
+W 版机内历史最多保存9999条，桌面查看器分批加载，避免一次性插入全部记录导致界面长时间无响应。
 
 ## Known Issues
 当前代码理论上兼容RP2040（pico1）和RP2350（pico2）但是Pico2会出现各种不可预知的问题比如屏幕花屏，反色等，建议各位使用pico1  

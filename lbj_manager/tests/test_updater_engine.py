@@ -1,4 +1,4 @@
-import importlib.util
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -7,10 +7,8 @@ from unittest import mock
 from types import SimpleNamespace
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "pico_updater.py"
-SPEC = importlib.util.spec_from_file_location("pico_updater_module", MODULE_PATH)
-updater = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(updater)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import lbj_manager as updater
 
 STANDARD_RUNTIME_FILES = (
     "HZK16",
