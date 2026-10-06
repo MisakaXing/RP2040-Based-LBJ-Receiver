@@ -1,0 +1,2 @@
+# Private, local-only diagnostic tool. Never include in repository commits.
+/standalone_diagnostic/
