@@ -2,7 +2,7 @@
 import time
 
 BATTERY_EMPTY_V = 3.45
-BATTERY_FULL_V = 4.2
+BATTERY_FULL_V = 4.15
 TEMP_RED_C = 45.0
 TEMP_STOP_WIFI_C = 60.0
 TEMP_RESUME_WIFI_C = 55.0
@@ -12,6 +12,8 @@ WARNING_ALTERNATE_MS = 2000
 def battery_percent(volts):
     if volts <= BATTERY_EMPTY_V:
         return 0
+    if volts >= BATTERY_FULL_V:
+        return 100
     return max(1, min(100, int((volts - BATTERY_EMPTY_V)
                              * 100 / (BATTERY_FULL_V - BATTERY_EMPTY_V))))
 

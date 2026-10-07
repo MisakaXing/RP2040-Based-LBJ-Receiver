@@ -24,7 +24,9 @@ class ProtectionTests(unittest.TestCase):
         self.p = policy.DeviceProtection()
 
     def test_percent_boundary_and_clamp(self):
-        for voltage, expected in ((0,0),(3.44,0),(3.45,0),(3.45001,1),(4.2,100),(5,100)):
+        self.assertEqual(policy.BATTERY_FULL_V, 4.15)
+        for voltage, expected in ((0,0),(3.44,0),(3.45,0),(3.45001,1),
+                                  (4.1499,99),(4.15,100),(4.16,100),(4.2,100),(5,100)):
             self.assertEqual(policy.battery_percent(voltage), expected)
 
     def test_temp_red_boundary(self):

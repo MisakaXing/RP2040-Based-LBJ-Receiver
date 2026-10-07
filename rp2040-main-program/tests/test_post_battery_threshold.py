@@ -15,12 +15,12 @@ class PostBatteryThresholdTests(unittest.TestCase):
                       and node.name == 'check_bat')
         convert = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                        and node.name == 'battery_voltage_from_raw')
-        ns = {'BATTERY_EMPTY_V': 3.45, 'BATTERY_ADC_OFFSET_V': .10,
+        ns = {'BATTERY_EMPTY_V': 3.45, 'BATTERY_ADC_OFFSET_V': .15,
               'time': SimpleNamespace(sleep_ms=Mock())}
         exec(compile(ast.Module(body=[convert, method], type_ignores=[]),
                      'boot_post.py', 'exec'), ns)
         post = SimpleNamespace(_check_start=Mock(), _check_end=Mock())
-        battery = SimpleNamespace(read_u16=Mock(return_value=int((4.1 - .10) / 6.6 * 65535)))
+        battery = SimpleNamespace(read_u16=Mock(return_value=int((4.1 - .15) / 6.6 * 65535)))
         vsys = SimpleNamespace(read_u16=Mock(return_value=int(3.7 / 9.9 * 65535)))
         gate = SimpleNamespace(value=Mock())
         ns['check_bat'](post, battery, gate, vsys, True)

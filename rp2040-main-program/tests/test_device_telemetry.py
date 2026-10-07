@@ -274,8 +274,8 @@ class DeviceSamplingTests(unittest.TestCase):
             "bat_en": SimpleNamespace(value=Mock()),
             "bat_adc": SimpleNamespace(read_u16=Mock(return_value=26500)),
             "vsys_adc": SimpleNamespace(read_u16=Mock(return_value=26500)),
-            "BATTERY_ADC_OFFSET_V": 0.10,
-            "BATTERY_EMPTY_V": 3.45, "BATTERY_FULL_V": 4.2,
+            "BATTERY_ADC_OFFSET_V": 0.15,
+            "BATTERY_EMPTY_V": 3.45, "BATTERY_FULL_V": 4.15,
             "wifi_portal": WirelessPortal("test-password"),
             "last_usb_power": False,
             "usb_power_present": Mock(return_value=False),
@@ -376,7 +376,7 @@ class DeviceSamplingTests(unittest.TestCase):
 
     def test_charging_reads_battery_divider_with_fixed_offset(self):
         self.ns["last_usb_power"] = True
-        raw = int((4.05 - .10) / 6.6 * 65535)
+        raw = int((4.05 - .15) / 6.6 * 65535)
         self.ns["bat_adc"].read_u16.side_effect = [raw + 100, raw, raw - 100]
         self.assertEqual(self.ns["get_battery_info"]()[0], "4.0V")
         self.ns["vsys_adc"].read_u16.assert_not_called()
@@ -387,7 +387,7 @@ class DeviceSamplingTests(unittest.TestCase):
     def test_unplug_immediately_replaces_cached_usb_voltage(self):
         sample = self.ns["sample_device_status"]
         self.ns["usb_power_present"].return_value = True
-        self.ns["bat_adc"].read_u16.return_value = int((4.2 - .10) / 6.6 * 65535) + 1
+        self.ns["bat_adc"].read_u16.return_value = int((4.2 - .15) / 6.6 * 65535) + 1
         self.ns["vsys_adc"].read_u16.return_value = int(3.8 / 9.9 * 65535)
         sample(100)
         self.assertEqual(self.ns["last_battery_v"], "4.2V")
@@ -411,7 +411,7 @@ class DeviceSamplingTests(unittest.TestCase):
     def test_charging_offset_is_fixed_across_voltage_range(self):
         for raw in (0, 30000, 40000, 65535):
             self.assertAlmostEqual(self.ns["battery_voltage_from_raw"](raw, True)
-                                   - raw / 65535.0 * 6.6, .10, places=8)
+                                   - raw / 65535.0 * 6.6, .15, places=8)
             self.assertAlmostEqual(self.ns["battery_voltage_from_raw"](raw, False),
                                    raw / 65535.0 * 9.9, places=8)
 

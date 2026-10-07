@@ -4,7 +4,7 @@ import sdcard
 
 from device_protection import BATTERY_EMPTY_V
 
-BATTERY_ADC_OFFSET_V = 0.10
+BATTERY_ADC_OFFSET_V = 0.15
 
 def battery_voltage_from_raw(raw, usb_power=False):
     """GP41 battery /2 while on USB; otherwise GP46 VSYS /3."""
